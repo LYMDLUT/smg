@@ -28,24 +28,98 @@ use crate::{
 pub const POD_NAME_LABEL: &str = "smg.ai/pod-name";
 pub const POD_UID_LABEL: &str = "smg.ai/pod-uid";
 
-/// One worker the reconciler wants registered: a single engine server
-/// (pod IP + data port) plus the metadata needed to build its spec.
-#[derive(Debug, Clone)]
-pub(super) struct DesiredWorker {
-    /// The address to register: bare host:port, so DetectConnectionModeStep
-    /// dual-probes HTTP and gRPC.
-    pub(super) url: String,
-    /// Canonical identity of [`Self::url`], compared against the registry.
-    /// Parsed once by the provider so a bad address is reported against the
-    /// record that published it.
-    pub(super) key: EndpointKey,
+/// Which provider owns the worker: `kubernetes`, `file`, `slurm` or `consul`.
+pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
+/// The provider's stable identity for the worker.
+pub const DISCOVERY_ID_LABEL: &str = "smg.ai/discovery-id";
+/// BLAKE3 fingerprint of the worker's [`DiscoveredWorkerSpec`].
+pub const DISCOVERY_SPEC_HASH_LABEL: &str = "smg.ai/discovery-spec-hash";
+
+/// The one provider that exists today. A provider enum replaces this when the
+/// tagged configuration lands.
+const KUBERNETES_PROVIDER: &str = "kubernetes";
+
+/// The portable description of one discovered worker.
+///
+/// Every provider fills this the same way, and it is exactly what the
+/// desired-spec fingerprint covers: nothing provider-specific, and nothing the
+/// router injects afterwards (API key, ownership labels, retry budget) or the
+/// registration workflow discovers at runtime (connection mode, backend,
+/// served models, DP ranks). Keeping it that narrow is what makes a changed
+/// fingerprint mean "the source changed this worker" rather than noise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DiscoveredWorkerSpec {
+    /// Parsed once by the provider, so a bad address is reported against the
+    /// record that published it. Held parsed rather than as a `String` so the
+    /// derived `Debug` here goes through [`Endpoint`]'s credential masking.
+    pub(super) endpoint: Endpoint,
     pub(super) worker_type: WorkerType,
     pub(super) bootstrap_port: Option<u16>,
-    pub(super) pod_name: String,
-    pub(super) pod_uid: String,
     pub(super) model_id_override: Option<String>,
     pub(super) kv_connector: Option<String>,
+    pub(super) kv_role: Option<String>,
     pub(super) kv_engine_id: Option<String>,
+}
+
+impl DiscoveredWorkerSpec {
+    /// A deterministic BLAKE3 fingerprint of every field.
+    ///
+    /// The encoding is explicit rather than derived: versioned, with each field
+    /// written as present-or-absent plus a length prefix, so no value can forge
+    /// a field boundary and a later change to the projection cannot silently
+    /// collide with this one. Field order is fixed by this function, not by the
+    /// struct.
+    ///
+    /// The endpoint is hashed as rendered — scheme included — because the
+    /// spelling decides how the worker is registered (`h:p` dual-probes HTTP
+    /// and gRPC; `grpc://h:p` does not). Two spellings that parse to the same
+    /// endpoint render, and so hash, identically.
+    ///
+    /// Never log this next to the endpoint: the rendered form can carry
+    /// credentials, and the pair would let a reader test guesses offline.
+    pub(super) fn fingerprint(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"smg-discovered-worker-spec/v1");
+        hash_field(&mut hasher, Some(&self.endpoint.render()));
+        hash_field(&mut hasher, Some(&self.worker_type.to_string()));
+        hash_field(
+            &mut hasher,
+            self.bootstrap_port.map(|p| p.to_string()).as_deref(),
+        );
+        hash_field(&mut hasher, self.model_id_override.as_deref());
+        hash_field(&mut hasher, self.kv_connector.as_deref());
+        hash_field(&mut hasher, self.kv_role.as_deref());
+        hash_field(&mut hasher, self.kv_engine_id.as_deref());
+        hasher.finalize().to_hex().to_string()
+    }
+}
+
+fn hash_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(value) => {
+            hasher.update(&[1]);
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+}
+
+/// One worker the reconciler wants registered.
+#[derive(Debug, Clone)]
+pub(super) struct DesiredWorker {
+    /// The provider's stable identity for this worker. Unique within a
+    /// snapshot: Kubernetes uses `{pod_uid}:{port}`, because one Pod can
+    /// serve several ports and each is its own worker.
+    pub(super) id: String,
+    pub(super) spec: DiscoveredWorkerSpec,
+    /// Kubernetes compatibility labels, written as before so existing
+    /// selectors and dashboards keep working. Deliberately outside
+    /// [`DiscoveredWorkerSpec`]: they are neither portable nor fingerprinted.
+    pub(super) pod_name: String,
+    pub(super) pod_uid: String,
 }
 
 /// Desired view of the cluster derived from the store snapshot.
@@ -185,7 +259,7 @@ pub(super) fn compute_actions(
     }
 
     for worker in &desired.addable {
-        match registered_uid.get(&worker.key) {
+        match registered_uid.get(&worker.spec.endpoint.key()) {
             Some(uid) if *uid == worker.pod_uid => {}
             _ => actions.add.push(worker.clone()),
         }
@@ -194,20 +268,34 @@ pub(super) fn compute_actions(
 }
 
 fn build_worker_spec(desired: &DesiredWorker, app_context: &AppContext) -> WorkerSpec {
-    let mut spec = WorkerSpec::new(desired.url.clone());
-    spec.worker_type = desired.worker_type;
-    spec.bootstrap_port = desired.bootstrap_port;
+    let discovered = &desired.spec;
+    let mut spec = WorkerSpec::new(discovered.endpoint.render());
+    spec.worker_type = discovered.worker_type;
+    spec.bootstrap_port = discovered.bootstrap_port;
+    // Provenance first, from the spec alone: the fingerprint must not see the
+    // API key, retry budget or labels injected below.
+    spec.labels.insert(
+        DISCOVERY_PROVIDER_LABEL.to_string(),
+        KUBERNETES_PROVIDER.to_string(),
+    );
+    spec.labels
+        .insert(DISCOVERY_ID_LABEL.to_string(), desired.id.clone());
+    spec.labels.insert(
+        DISCOVERY_SPEC_HASH_LABEL.to_string(),
+        discovered.fingerprint(),
+    );
     spec.labels
         .insert(POD_NAME_LABEL.to_string(), desired.pod_name.clone());
     spec.labels
         .insert(POD_UID_LABEL.to_string(), desired.pod_uid.clone());
     // served_model_name is priority #2 in create_worker's model_id chain.
-    if let Some(ref model_id) = desired.model_id_override {
+    if let Some(ref model_id) = discovered.model_id_override {
         spec.labels
             .insert("served_model_name".to_string(), model_id.clone());
     }
-    spec.kv_connector.clone_from(&desired.kv_connector);
-    spec.kv_engine_id.clone_from(&desired.kv_engine_id);
+    spec.kv_connector.clone_from(&discovered.kv_connector);
+    spec.kv_role.clone_from(&discovered.kv_role);
+    spec.kv_engine_id.clone_from(&discovered.kv_engine_id);
     spec.api_key.clone_from(&app_context.router_config.api_key);
     spec.max_connection_attempts = app_context
         .router_config
@@ -268,7 +356,7 @@ pub(super) async fn reconcile(
     let additions: Vec<&DesiredWorker> = actions
         .add
         .iter()
-        .filter(|worker| !in_flight(&worker.url))
+        .filter(|worker| !in_flight(&worker.spec.endpoint.render()))
         .collect();
 
     if removals.is_empty() && additions.is_empty() {
@@ -324,7 +412,7 @@ pub(super) async fn reconcile(
     for worker in additions {
         info!(
             "Registering worker {} ({:?}) for pod {}",
-            worker.url, worker.worker_type, worker.pod_name
+            worker.spec.endpoint, worker.spec.worker_type, worker.pod_name
         );
         let job = Job::AddWorker {
             config: Box::new(build_worker_spec(worker, app_context)),
@@ -336,7 +424,10 @@ pub(super) async fn reconcile(
                 metrics_labels::REGISTRATION_SUCCESS,
             ),
             Err(e) => {
-                error!("Failed to submit worker addition for {}: {}", worker.url, e);
+                error!(
+                    "Failed to submit worker addition for {}: {}",
+                    worker.spec.endpoint, e
+                );
                 Metrics::record_discovery_registration(
                     metrics_labels::DISCOVERY_KUBERNETES,
                     metrics_labels::REGISTRATION_FAILED,
@@ -381,17 +472,133 @@ mod tests {
         assert_eq!(key("http://user@host:8080").as_str(), "user@host:8080");
     }
 
-    fn desired_worker(url: &str, uid: &str) -> DesiredWorker {
-        DesiredWorker {
-            url: url.to_string(),
-            key: key(url),
+    fn spec_of(url: &str) -> DiscoveredWorkerSpec {
+        DiscoveredWorkerSpec {
+            endpoint: Endpoint::parse_with_rank(url).expect(url).0,
             worker_type: WorkerType::Regular,
             bootstrap_port: None,
-            pod_name: "w".to_string(),
-            pod_uid: uid.to_string(),
             model_id_override: None,
             kv_connector: None,
+            kv_role: None,
             kv_engine_id: None,
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_and_spelling_insensitive() {
+        let a = spec_of("10.0.0.1:8080");
+        assert_eq!(a.fingerprint(), a.clone().fingerprint());
+        // Two spellings that parse to one endpoint register identically.
+        assert_eq!(
+            spec_of("[::1]:8080").fingerprint(),
+            spec_of("[0:0:0:0:0:0:0:1]:8080").fingerprint()
+        );
+    }
+
+    /// Every field is part of the fingerprint, so a change to any of them is a
+    /// change the source made to this worker and warrants a replacement.
+    #[test]
+    fn every_field_moves_the_fingerprint() {
+        let base = spec_of("10.0.0.1:8080");
+        let variants = [
+            DiscoveredWorkerSpec {
+                endpoint: Endpoint::parse("grpc://10.0.0.1:8080").unwrap(),
+                ..base.clone()
+            },
+            DiscoveredWorkerSpec {
+                worker_type: WorkerType::Prefill,
+                ..base.clone()
+            },
+            DiscoveredWorkerSpec {
+                bootstrap_port: Some(9000),
+                ..base.clone()
+            },
+            DiscoveredWorkerSpec {
+                model_id_override: Some("m".to_string()),
+                ..base.clone()
+            },
+            DiscoveredWorkerSpec {
+                kv_connector: Some("c".to_string()),
+                ..base.clone()
+            },
+            DiscoveredWorkerSpec {
+                kv_role: Some("r".to_string()),
+                ..base.clone()
+            },
+            DiscoveredWorkerSpec {
+                kv_engine_id: Some("e".to_string()),
+                ..base.clone()
+            },
+        ];
+        let mut seen = vec![base.fingerprint()];
+        for variant in &variants {
+            let hash = variant.fingerprint();
+            assert!(!seen.contains(&hash), "{variant:?} collided");
+            seen.push(hash);
+        }
+    }
+
+    /// The length prefix is what keeps a value from forging a field boundary.
+    /// The presence byte alone separates `"ab"|"c"` from `"a"|"bc"`, but not a
+    /// value that contains the presence byte itself: without lengths, both of
+    /// these encode as `\x01 a \x01 b \x01 c`. Provider input is operator-written
+    /// text, so a control byte in it is not hypothetical.
+    #[test]
+    fn a_value_cannot_forge_a_field_boundary() {
+        let left = DiscoveredWorkerSpec {
+            kv_connector: Some("a\u{1}b".to_string()),
+            kv_role: Some("c".to_string()),
+            ..spec_of("10.0.0.1:8080")
+        };
+        let right = DiscoveredWorkerSpec {
+            kv_connector: Some("a".to_string()),
+            kv_role: Some("b\u{1}c".to_string()),
+            ..spec_of("10.0.0.1:8080")
+        };
+        assert_ne!(left.fingerprint(), right.fingerprint());
+
+        // Absent and empty are different answers, which the presence byte
+        // (not the length) guarantees.
+        let absent = spec_of("10.0.0.1:8080");
+        let empty = DiscoveredWorkerSpec {
+            kv_role: Some(String::new()),
+            ..absent.clone()
+        };
+        assert_ne!(absent.fingerprint(), empty.fingerprint());
+    }
+
+    /// The hash is taken from the portable spec alone, so rotating the router's
+    /// API key or changing the retry budget cannot trigger a replacement.
+    #[test]
+    fn build_worker_spec_stamps_provenance_from_the_spec_alone() {
+        let app_context = create_test_app_context();
+        let desired = desired_worker("10.0.0.1:8080", "uid-1");
+        let spec = build_worker_spec(&desired, &app_context);
+
+        assert_eq!(
+            spec.labels
+                .get(DISCOVERY_PROVIDER_LABEL)
+                .map(String::as_str),
+            Some("kubernetes")
+        );
+        assert_eq!(spec.labels.get(DISCOVERY_ID_LABEL), Some(&desired.id));
+        assert_eq!(
+            spec.labels.get(DISCOVERY_SPEC_HASH_LABEL),
+            Some(&desired.spec.fingerprint())
+        );
+        // The compatibility labels are still written.
+        assert_eq!(
+            spec.labels.get(POD_UID_LABEL).map(String::as_str),
+            Some("uid-1")
+        );
+    }
+
+    fn desired_worker(url: &str, uid: &str) -> DesiredWorker {
+        DesiredWorker {
+            id: format!("{uid}:{url}"),
+            spec: spec_of(url),
+            pod_name: "w".to_string(),
+            pod_uid: uid.to_string(),
         }
     }
 
@@ -400,7 +607,7 @@ mod tests {
         for worker in workers {
             state
                 .uid_by_url
-                .insert(worker.key.clone(), worker.pod_uid.clone());
+                .insert(worker.spec.endpoint.key(), worker.pod_uid.clone());
             state.addable.push(worker.clone());
         }
         state
@@ -434,7 +641,7 @@ mod tests {
     #[test]
     fn test_compute_actions_same_uid_metadata_change_is_noop() {
         let mut worker = desired_worker("10.0.0.1:8080", "u1");
-        worker.kv_connector = Some("NixlConnector".to_string());
+        worker.spec.kv_connector = Some("NixlConnector".to_string());
         let desired = desired_state_of(&[worker]);
         let registered = [owned("10.0.0.1:8080", "u1")];
         let actions = compute_actions(&desired, &registered);
@@ -576,15 +783,17 @@ mod tests {
     fn test_build_worker_spec_stamps_ownership_labels() {
         let app_context = create_test_app_context();
         let desired = DesiredWorker {
-            url: "10.0.0.1:8081".to_string(),
-            key: key("10.0.0.1:8081"),
-            worker_type: WorkerType::Prefill,
-            bootstrap_port: Some(9080),
+            id: "uid-1:8081".to_string(),
+            spec: DiscoveredWorkerSpec {
+                worker_type: WorkerType::Prefill,
+                bootstrap_port: Some(9080),
+                model_id_override: Some("llama".to_string()),
+                kv_connector: Some("MooncakeConnector".to_string()),
+                kv_engine_id: Some("engine-1".to_string()),
+                ..spec_of("10.0.0.1:8081")
+            },
             pod_name: "prefill-0".to_string(),
             pod_uid: "uid-1".to_string(),
-            model_id_override: Some("llama".to_string()),
-            kv_connector: Some("MooncakeConnector".to_string()),
-            kv_engine_id: Some("engine-1".to_string()),
         };
         let spec = build_worker_spec(&desired, &app_context);
         assert_eq!(spec.url, "10.0.0.1:8081");

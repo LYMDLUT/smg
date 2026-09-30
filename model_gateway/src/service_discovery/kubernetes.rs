@@ -21,10 +21,10 @@ use rustls::crypto::ring;
 use tokio::{sync::Notify, task, time};
 use tracing::{debug, error, info, warn};
 
-use super::reconciler::{self, DesiredState, DesiredWorker};
+use super::reconciler::{self, DesiredState, DesiredWorker, DiscoveredWorkerSpec};
 use crate::{
     app_context::AppContext,
-    worker::{MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
+    worker::{endpoint::Endpoint, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
 };
 
 /// Source for per-worker model_id override during Kubernetes service discovery.
@@ -642,28 +642,37 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
             let url = SocketAddr::new(info.ip, *port).to_string();
             // A socket address always parses; the fallible form keeps the
             // provider honest if the address ever stops coming from one.
-            let Ok(key) = crate::worker::endpoint_key(&url) else {
+            let Ok(endpoint) = Endpoint::parse(&url) else {
                 warn!(
                     "Pod {} has an unusable worker address '{}', skipping",
                     info.name, url
                 );
                 continue;
             };
+            let key = endpoint.key();
             if state.uid_by_url.contains_key(&key) {
                 continue;
             }
-            state.uid_by_url.insert(key.clone(), info.uid.clone());
+            state.uid_by_url.insert(key, info.uid.clone());
             if info.is_healthy() {
                 state.addable.push(DesiredWorker {
-                    url,
-                    key,
-                    worker_type: worker_type_for(info.pod_type.as_ref(), config.disaggregated_mode),
-                    bootstrap_port: info.bootstrap_ports.get(index).copied().flatten(),
+                    id: format!("{}:{port}", info.uid),
+                    spec: DiscoveredWorkerSpec {
+                        endpoint,
+                        worker_type: worker_type_for(
+                            info.pod_type.as_ref(),
+                            config.disaggregated_mode,
+                        ),
+                        bootstrap_port: info.bootstrap_ports.get(index).copied().flatten(),
+                        model_id_override: info.model_id_override.clone(),
+                        kv_connector: info.kv_connector.clone(),
+                        // Kubernetes has no kv_role annotation; `None` keeps the
+                        // registration workflow's existing label fallback.
+                        kv_role: None,
+                        kv_engine_id: info.kv_engine_ids.get(index).cloned().flatten(),
+                    },
                     pod_name: info.name.clone(),
                     pod_uid: info.uid.clone(),
-                    model_id_override: info.model_id_override.clone(),
-                    kv_connector: info.kv_connector.clone(),
-                    kv_engine_id: info.kv_engine_ids.get(index).cloned().flatten(),
                 });
             }
         }
@@ -1299,7 +1308,7 @@ mod tests {
             desired
                 .addable
                 .iter()
-                .map(|w| w.url.as_str())
+                .map(|w| w.spec.endpoint.render())
                 .collect::<Vec<_>>(),
             vec!["[fd00::1]:8000"],
             "an IPv6 Pod IP must render as a bracketed authority"
@@ -1392,16 +1401,16 @@ mod tests {
 
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         assert_eq!(desired.addable.len(), 2);
-        let by_url: HashMap<&str, &DesiredWorker> = desired
+        let by_url: HashMap<String, &DesiredWorker> = desired
             .addable
             .iter()
-            .map(|w| (w.url.as_str(), w))
+            .map(|w| (w.spec.endpoint.render(), w))
             .collect();
         let first = by_url["10.0.0.1:8080"];
-        assert_eq!(first.worker_type, WorkerType::Prefill);
-        assert_eq!(first.bootstrap_port, Some(9080));
+        assert_eq!(first.spec.worker_type, WorkerType::Prefill);
+        assert_eq!(first.spec.bootstrap_port, Some(9080));
         let second = by_url["10.0.0.1:8081"];
-        assert_eq!(second.bootstrap_port, Some(9081));
+        assert_eq!(second.spec.bootstrap_port, Some(9081));
     }
 
     #[test]
@@ -1412,7 +1421,7 @@ mod tests {
         pod.metadata.namespace = Some("team-a".to_string());
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         assert_eq!(
-            desired.addable[0].model_id_override,
+            desired.addable[0].spec.model_id_override,
             Some("team-a".to_string())
         );
     }
