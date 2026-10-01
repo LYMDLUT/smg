@@ -15,6 +15,7 @@ use smg_grpc_client::vllm_engine::{
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use tonic::codec::Codec;
+use tool_parser::types::ToolCallItem;
 
 use super::*;
 use crate::{
@@ -681,5 +682,442 @@ async fn deepseek_does_not_emit_aggregate_usage_without_complete_frames() {
                 .all(|event| event.get("usage") == Some(&Value::Null)),
             "{events:?}"
         );
+    }
+}
+
+/// Reasoning for every chunk but "text"; `is_in_reasoning` reports `.0`.
+struct ReasoningButText(bool);
+
+impl ReasoningParser for ReasoningButText {
+    fn detect_and_parse_reasoning(
+        &mut self,
+        text: &str,
+    ) -> Result<ParserResult, reasoning_parser::ParseError> {
+        Ok(ParserResult::normal(text.to_string()))
+    }
+
+    fn parse_reasoning_streaming_incremental(
+        &mut self,
+        text: &str,
+    ) -> Result<ParserResult, reasoning_parser::ParseError> {
+        Ok(match text {
+            "text" => ParserResult::normal(text.to_string()),
+            _ => ParserResult::reasoning(text.to_string()),
+        })
+    }
+
+    fn reset(&mut self) {}
+
+    fn model_type(&self) -> &str {
+        "reasoning-but-text"
+    }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.0
+    }
+
+    fn mark_reasoning_started(&mut self) {}
+
+    fn mark_think_start_stripped(&mut self) {}
+}
+
+/// Returns the chunk as normal text and reports one whole `lookup` call on
+/// its first parse.
+#[derive(Default)]
+struct CallFirst {
+    called: bool,
+}
+
+#[async_trait::async_trait]
+impl ToolParser for CallFirst {
+    async fn parse_complete(
+        &self,
+        output: &str,
+    ) -> tool_parser::errors::ParserResult<(String, Vec<tool_parser::ToolCall>)> {
+        Ok((output.to_string(), Vec::new()))
+    }
+
+    async fn parse_incremental(
+        &mut self,
+        chunk: &str,
+        _tools: &[Tool],
+    ) -> tool_parser::errors::ParserResult<StreamingParseResult> {
+        let calls = (!std::mem::replace(&mut self.called, true)).then(|| ToolCallItem {
+            tool_index: 0,
+            name: Some("lookup".to_string()),
+            parameters: "{}".to_string(),
+        });
+        Ok(StreamingParseResult {
+            normal_text: chunk.to_string(),
+            calls: calls.into_iter().collect(),
+        })
+    }
+
+    fn has_tool_markers(&self, _text: &str) -> bool {
+        false
+    }
+}
+
+/// A processor with the stub parsers above.
+fn stub_processor(in_reasoning: bool) -> StreamingProcessor {
+    let reasoning = ReasoningParserFactory::new();
+    reasoning
+        .registry()
+        .register_parser("reasoning-but-text", move || {
+            Box::new(ReasoningButText(in_reasoning))
+        });
+    let tools = ToolParserFactory::new();
+    tools
+        .registry()
+        .register_parser("call-first", || Box::new(CallFirst::default()));
+    let resolver = utils::ParserResolver::new(
+        Arc::new(WorkerRegistry::new()),
+        Some("call-first".to_string()),
+        Some("reasoning-but-text".to_string()),
+    );
+    StreamingProcessor::new(tools, reasoning, resolver, "vllm")
+}
+
+/// The content block starts and stops from `messages_blocks_and_inputs`.
+async fn messages_blocks(
+    processor: StreamingProcessor,
+    tool_choice: Option<messages::ToolChoice>,
+    texts: &[&str],
+) -> Vec<String> {
+    messages_blocks_and_inputs(processor, tool_choice, texts)
+        .await
+        .0
+}
+
+/// The content block starts and stops of a Messages stream of `texts`, and
+/// the input of each `tool_use` block joined from its `input_json_delta`s as
+/// a client SDK builds it (the joined text if it is not complete JSON). A
+/// block starts only when none is open, and every delta goes to the open
+/// block and matches its type.
+async fn messages_blocks_and_inputs(
+    processor: StreamingProcessor,
+    tool_choice: Option<messages::ToolChoice>,
+    texts: &[&str],
+) -> (Vec<String>, Vec<Value>) {
+    let spec = MessagesResponseSpec {
+        thinking: Some(messages::ThinkingConfig::Enabled {
+            budget_tokens: 1024,
+            display: None,
+        }),
+        tool_choice,
+        has_tools: true,
+        history_tool_calls_count: 0,
+        chat_tools: chat_spec(true).tools.unwrap(),
+        stop_sequences: None,
+    };
+    let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
+    frames.push(complete(0, "stop"));
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let (tx, rx) = sse_channel();
+    let result = processor
+        .process_messages_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    let mut open = None;
+    let mut blocks = Vec::new();
+    let mut inputs = Vec::new();
+    for event in &events {
+        let index = &event["index"];
+        match event["type"].as_str() {
+            Some("content_block_start") => {
+                let kind = event["content_block"]["type"].as_str().unwrap_or_default();
+                blocks.push(format!("start {index} {kind:?}"));
+                assert!(open.replace((index, kind)).is_none(), "{blocks:?}");
+                if kind == "tool_use" {
+                    inputs.push(String::new());
+                }
+            }
+            Some("content_block_delta") => {
+                let delta = &event["delta"];
+                let kind = match delta["type"].as_str() {
+                    Some("text_delta") => "text",
+                    Some("input_json_delta") => "tool_use",
+                    Some("thinking_delta" | "signature_delta") => "thinking",
+                    other => panic!("unexpected delta {other:?}"),
+                };
+                assert_eq!(open, Some((index, kind)), "delta {delta} after {blocks:?}");
+                if let Some(json) = delta["partial_json"].as_str() {
+                    inputs.last_mut().expect("open tool_use").push_str(json);
+                }
+            }
+            Some("content_block_stop") => {
+                blocks.push(format!("stop {index}"));
+                assert_eq!(open.take().map(|open| open.0), Some(index), "{blocks:?}");
+            }
+            _ => {}
+        }
+    }
+    let inputs = inputs
+        .iter()
+        .map(|json| match json.as_str() {
+            "" => serde_json::json!({}),
+            json => serde_json::from_str(json).unwrap_or_else(|_| json.into()),
+        })
+        .collect();
+    (blocks, inputs)
+}
+
+#[tokio::test]
+async fn messages_blocks_do_not_overlap_when_reasoning_calls_and_text_alternate() {
+    // Reasoning, then a call with no text between; text; reasoning again.
+    assert_eq!(
+        messages_blocks(stub_processor(false), None, &["a", "text", "b"]).await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"tool_use\"",
+            "stop 1",
+            "start 2 \"text\"",
+            "stop 2",
+            "start 3 \"thinking\"",
+            "stop 3",
+        ]
+    );
+    // Text the reasoning parser returns while it stays in reasoning. Such text
+    // skips the tool parser and follows the chunk's reasoning, so a chunk like
+    // `</think>answer<think>more` still comes out in the wrong order; only the
+    // block boundaries are checked here.
+    assert_eq!(
+        messages_blocks(stub_processor(true), None, &["a", "text", "b"]).await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"text\"",
+            "stop 1",
+            "start 2 \"thinking\"",
+            "stop 2",
+        ]
+    );
+    // Reasoning right after a call.
+    assert_eq!(
+        messages_blocks(stub_processor(false), None, &["a", "b"]).await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"tool_use\"",
+            "stop 1",
+            "start 2 \"thinking\"",
+            "stop 2",
+        ]
+    );
+}
+
+/// A processor with the registered parsers `tool` and `reasoning`.
+fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
+    StreamingProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::new(
+            Arc::new(WorkerRegistry::new()),
+            Some(tool.to_string()),
+            Some(reasoning.to_string()),
+        ),
+        "vllm",
+    )
+}
+
+#[tokio::test]
+async fn messages_blocks_do_not_overlap_with_deepseek_parsers() {
+    // `</think>` ends reasoning without text, and the arguments of a specific
+    // tool follow in the next chunk.
+    let tool = messages::ToolChoice::Tool {
+        name: "lookup".to_string(),
+        disable_parallel_tool_use: None,
+    };
+    assert_eq!(
+        messages_blocks(
+            named_processor("deepseek", "deepseek_r1"),
+            Some(tool),
+            &["plan", "</think>", "{}"],
+        )
+        .await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"tool_use\"",
+            "stop 1",
+        ]
+    );
+    // A reasoning parser that enters reasoning again after text.
+    assert_eq!(
+        messages_blocks(
+            named_processor("deepseek_v41", "deepseek_v41"),
+            None,
+            &[
+                "<think>plan",
+                "</think>",
+                "answer",
+                "<think>",
+                "more",
+                "</think>",
+                "done"
+            ],
+        )
+        .await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"text\"",
+            "stop 1",
+            "start 2 \"thinking\"",
+            "stop 2",
+            "start 3 \"text\"",
+            "stop 3",
+        ]
+    );
+    // Reasoning again while the tool parser holds text that it releases at
+    // the end of the stream.
+    assert_eq!(
+        messages_blocks(
+            named_processor("json", "deepseek_v41"),
+            None,
+            &["<think>plan", "</think>", "{", "<think>", "more"],
+        )
+        .await,
+        [
+            "start 0 \"thinking\"",
+            "stop 0",
+            "start 1 \"thinking\"",
+            "stop 1",
+            "start 2 \"text\"",
+            "stop 2",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn messages_tool_arguments_precede_text_in_the_same_chunk() {
+    // With multi-token chunks, qwen_xml returns the arguments that finish a
+    // call together with the text after the call.
+    let (blocks, inputs) = messages_blocks_and_inputs(
+        named_processor("qwen_xml", "qwen3"),
+        None,
+        &[
+            "<tool_call>\n<function=lookup>\n<parameter=q>\n1",
+            "\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=lookup>\n",
+            "<parameter=q>\n2\n</parameter>\n</function>\n</tool_call>",
+        ],
+    )
+    .await;
+    assert_eq!(
+        blocks,
+        [
+            "start 0 \"tool_use\"",
+            "stop 0",
+            "start 1 \"text\"",
+            "stop 1",
+            "start 2 \"tool_use\"",
+            "stop 2",
+        ]
+    );
+    assert_eq!(
+        inputs,
+        [serde_json::json!({"q": 1}), serde_json::json!({"q": 2})]
+    );
+    for (texts, input) in [
+        (
+            [
+                "<tool_call>\n<function=lookup>\n<parameter=q>\nPar",
+                "is\n</parameter>\n</function>\n</tool_call>\nDone.",
+            ],
+            serde_json::json!({"q": "Paris"}),
+        ),
+        (
+            [
+                "<tool_call>\n<function=lookup>\n<parameter=a>\nx\n</parameter>\n",
+                "<parameter=b>\ny\n</parameter>\n</function>\n</tool_call>\n",
+            ],
+            serde_json::json!({"a": "x", "b": "y"}),
+        ),
+    ] {
+        let (blocks, inputs) =
+            messages_blocks_and_inputs(named_processor("qwen_xml", "qwen3"), None, &texts).await;
+        assert_eq!(
+            blocks,
+            [
+                "start 0 \"tool_use\"",
+                "stop 0",
+                "start 1 \"text\"",
+                "stop 1"
+            ]
+        );
+        assert_eq!(inputs, [input]);
+    }
+}
+
+#[tokio::test]
+async fn messages_tool_arguments_need_an_open_block() {
+    // Reasoning that starts only after the specific tool's block stops that
+    // block; the arguments after it have no block to go to and are dropped.
+    let tool = messages::ToolChoice::Tool {
+        name: "lookup".to_string(),
+        disable_parallel_tool_use: None,
+    };
+    let (blocks, inputs) = messages_blocks_and_inputs(
+        named_processor("qwen", "qwen3"),
+        Some(tool),
+        &["<thi", "nk>plan", "</think>", "{}"],
+    )
+    .await;
+    assert_eq!(
+        blocks,
+        [
+            "start 0 \"tool_use\"",
+            "stop 0",
+            "start 1 \"thinking\"",
+            "stop 1",
+        ]
+    );
+    assert_eq!(inputs, [serde_json::json!({})]);
+    // Until qwen3 strips a `<think>`, it takes the first one anywhere as the
+    // start of reasoning, so one inside an argument stops the call's block.
+    // The rest of the arguments are dropped, in the middle of the stream and
+    // at its end, where qwen_xml releases the closing brace.
+    for (texts, input) in [
+        (
+            [
+                "<tool_call>\n<function=lookup>\n<parameter=q>\nA ",
+                "<think>x</think> B\n</parameter>\n",
+                "</function>\n</tool_call>",
+            ],
+            serde_json::json!({}),
+        ),
+        (
+            [
+                "<tool_call>\n<function=lookup>\n<parameter=q>\nA\n</parameter>\n",
+                "<parameter=r>\nB ",
+                "<think>x",
+            ],
+            serde_json::json!("{\"q\": \"A\""),
+        ),
+    ] {
+        let (blocks, inputs) =
+            messages_blocks_and_inputs(named_processor("qwen_xml", "qwen3"), None, &texts).await;
+        assert_eq!(
+            blocks,
+            [
+                "start 0 \"tool_use\"",
+                "stop 0",
+                "start 1 \"thinking\"",
+                "stop 1",
+            ]
+        );
+        assert_eq!(inputs, [input]);
     }
 }
