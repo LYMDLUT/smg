@@ -1243,7 +1243,7 @@ mod tests {
     fn owned(url: &str, discovery_id: &str) -> reconciler::OwnedWorker {
         reconciler::OwnedWorker {
             worker_id: WorkerId::from_string(url.to_string()),
-            discovery_id: discovery_id.to_string(),
+            discovery_id: Some(discovery_id.to_string()),
             endpoint: Endpoint::parse_with_rank(url).expect(url).0,
             revision: 1,
         }
@@ -1272,8 +1272,14 @@ mod tests {
         let actions = reconciler::compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
         assert_eq!(actions.remove.len(), 2);
-        assert_eq!(actions.remove[0].discovery_id, "uid-w:8080");
-        assert_eq!(actions.remove[1].discovery_id, "uid-w:8081");
+        assert_eq!(
+            actions.remove[0].discovery_id.as_deref(),
+            Some("uid-w:8080")
+        );
+        assert_eq!(
+            actions.remove[1].discovery_id.as_deref(),
+            Some("uid-w:8081")
+        );
     }
 
     #[test]

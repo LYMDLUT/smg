@@ -76,7 +76,12 @@ pub(super) struct OwnedWorker {
     pub(super) worker_id: WorkerId,
     /// The provider's id for the instance, read back from
     /// [`DISCOVERY_ID_LABEL`]. Every rank of a DP group carries the same one.
-    pub(super) discovery_id: String,
+    ///
+    /// `None` when the label is missing. That is kept distinct from any string
+    /// rather than defaulted to `""`, because a provider is free to publish an
+    /// empty id and the two would then compare equal — leaving an unlabelled
+    /// worker matched forever instead of replaced.
+    pub(super) discovery_id: Option<String>,
     /// The registered address, parsed. Its [`Endpoint::key`] is the identity
     /// used for grouping; the endpoint itself is kept so a removal can submit
     /// a form that parses back (an IPC key is a bare socket path).
@@ -102,7 +107,7 @@ pub(super) struct RemovalTarget {
     /// may not: `grpc://h:p` and `http://h:p` canonicalize alike, so two
     /// registrations of different instances can land in one target. Logged
     /// only, never matched on — the removal is decided by [`Self::guards`].
-    pub(super) discovery_id: String,
+    pub(super) discovery_id: Option<String>,
     /// `(worker_id, revision)` as observed in this snapshot, one per rank.
     pub(super) guards: Vec<(WorkerId, u64)>,
 }
@@ -124,10 +129,10 @@ fn owned_workers(app_context: &AppContext, kind: DiscoveryKind) -> Vec<OwnedWork
             if labels.get(DISCOVERY_PROVIDER_LABEL).map(String::as_str) != Some(kind.as_label()) {
                 return None;
             }
-            // A missing id cannot match any published worker, so an owned
-            // worker without one is replaced on this pass and comes back
-            // labelled properly.
-            let discovery_id = labels.get(DISCOVERY_ID_LABEL).cloned().unwrap_or_default();
+            // A missing id stays `None`, which never equals a published id, so
+            // an owned worker without one is replaced on this pass and comes
+            // back labelled properly.
+            let discovery_id = labels.get(DISCOVERY_ID_LABEL).cloned();
             // A registered address the shared parser rejects is one this
             // reconciler cannot safely match against a published endpoint, so
             // it is left alone rather than guessed at.
@@ -165,22 +170,30 @@ pub(super) struct ReconcileActions {
     pub(super) remove: Vec<RemovalTarget>,
 }
 
+/// Diff what a provider publishes against what it owns, by canonical endpoint.
+///
+/// An endpoint is left alone when the owned worker there is the instance the
+/// provider describes (same `discovery_id`). It is removed when no longer
+/// published or held by a different instance, and added when the provider
+/// owns nothing there or owns a different instance. A DP group yields one
+/// removal per endpoint, carrying a guard for every rank.
 pub(super) fn compute_actions(
     desired: &DesiredState,
     registered: &[OwnedWorker],
 ) -> ReconcileActions {
     let mut actions = ReconcileActions::default();
 
-    let mut registered_id: HashMap<EndpointKey, &str> = HashMap::new();
+    let mut registered_id: HashMap<EndpointKey, Option<&str>> = HashMap::new();
     // DP-rank expansions share one canonical endpoint: remove it once, but keep
     // every rank's own `(worker_id, revision)` so the guard cannot drop the
     // ranks whose revision happens to differ from an arbitrarily chosen one.
     let mut remove_by_key: HashMap<EndpointKey, RemovalTarget> = HashMap::new();
     for worker in registered {
         let key = worker.endpoint.key();
-        registered_id.insert(key.clone(), worker.discovery_id.as_str());
+        registered_id.insert(key.clone(), worker.discovery_id.as_deref());
         match desired.workers.get(&key) {
-            Some(published) if published.discovery_id == worker.discovery_id => {}
+            Some(published)
+                if worker.discovery_id.as_deref() == Some(published.discovery_id.as_str()) => {}
             _ => remove_by_key
                 .entry(key)
                 .or_insert_with(|| RemovalTarget {
@@ -206,13 +219,19 @@ pub(super) fn compute_actions(
 
     for (key, worker) in &desired.workers {
         match registered_id.get(key) {
-            Some(id) if *id == worker.discovery_id => {}
+            Some(Some(id)) if *id == worker.discovery_id => {}
             _ => actions.add.push(worker.clone()),
         }
     }
     actions
 }
 
+/// Turn a published worker into the spec its registration job will carry.
+///
+/// Compatibility labels go in first, then provenance — so a provider cannot
+/// overwrite ownership — then the router-controlled settings. The fingerprint
+/// is taken from the record, never from this spec, so none of what is added
+/// here can move it.
 fn build_worker_spec(
     worker: &DiscoveredWorker,
     kind: DiscoveryKind,
@@ -330,7 +349,7 @@ pub(super) async fn reconcile(
              different instance now holds the address",
             target.endpoint.redacted(),
             target.guards.len(),
-            target.discovery_id
+            target.discovery_id.as_deref().unwrap_or("no discovery id")
         );
         // Scheme-less for a network address, so `find_workers_by_url` reaches
         // every spelling the group was registered under. An IPC endpoint keeps
@@ -429,7 +448,7 @@ mod tests {
     fn owned_rank(url: &str, discovery_id: &str, worker_id: &str, revision: u64) -> OwnedWorker {
         OwnedWorker {
             worker_id: WorkerId::from_string(worker_id.to_string()),
-            discovery_id: discovery_id.to_string(),
+            discovery_id: Some(discovery_id.to_string()),
             endpoint: Endpoint::parse_with_rank(url).expect(url).0,
             revision,
         }
@@ -498,7 +517,8 @@ mod tests {
     #[test]
     fn test_compute_actions_new_instance_at_same_endpoint_is_replaced() {
         // A new instance at an unchanged address — for Kubernetes, a Pod
-        // restarting on a stable IP — is removed and the new one registered.
+        // recreated at a stable IP, not a container restarting inside one — is
+        // removed and the new one registered.
         // The removal also covers a scheme-flipped sibling the Upsert cannot
         // replace.
         let desired = desired_state_of(&[published("10.0.0.1:8080", "new")]);
@@ -507,7 +527,7 @@ mod tests {
         assert_eq!(actions.add.len(), 1);
         assert_eq!(actions.add[0].discovery_id, "new");
         assert_eq!(actions.remove.len(), 1);
-        assert_eq!(actions.remove[0].discovery_id, "old");
+        assert_eq!(actions.remove[0].discovery_id.as_deref(), Some("old"));
     }
 
     #[test]
@@ -601,7 +621,7 @@ mod tests {
         let owned = owned_workers(&app_context, DiscoveryKind::Kubernetes);
         assert_eq!(owned.len(), 1);
         assert_eq!(owned[0].endpoint.key().as_str(), "10.0.0.1:8080");
-        assert_eq!(owned[0].discovery_id, "uid-1:8080");
+        assert_eq!(owned[0].discovery_id.as_deref(), Some("uid-1:8080"));
     }
 
     /// An owned worker missing its id label cannot match anything published,
@@ -615,11 +635,32 @@ mod tests {
             &[(DISCOVERY_PROVIDER_LABEL, "kubernetes")],
         );
         let owned = owned_workers(&app_context, DiscoveryKind::Kubernetes);
-        assert_eq!(owned[0].discovery_id, "");
+        assert_eq!(owned[0].discovery_id, None);
 
         let desired = desired_state_of(&[published("10.0.0.1:8080", "uid-1:8080")]);
         let actions = compute_actions(&desired, &owned);
         assert_eq!(actions.remove.len(), 1);
+        assert_eq!(actions.add.len(), 1);
+    }
+
+    /// The case a defaulted `""` got wrong. Kubernetes never publishes an empty
+    /// id, but a provider with an optional id field could, and `"" == ""` then
+    /// matched it to an owned worker whose label was missing — so that worker
+    /// was never replaced or relabelled. Snapshot validation will reject an
+    /// empty id outright; this keeps the diff correct even without it.
+    #[test]
+    fn an_empty_published_id_does_not_match_a_missing_label() {
+        let app_context = create_test_app_context();
+        register_with_labels(
+            &app_context,
+            "http://10.0.0.1:8080",
+            &[(DISCOVERY_PROVIDER_LABEL, "kubernetes")],
+        );
+        let owned = owned_workers(&app_context, DiscoveryKind::Kubernetes);
+
+        let desired = desired_state_of(&[published("10.0.0.1:8080", "")]);
+        let actions = compute_actions(&desired, &owned);
+        assert_eq!(actions.remove.len(), 1, "the unlabelled worker is replaced");
         assert_eq!(actions.add.len(), 1);
     }
 

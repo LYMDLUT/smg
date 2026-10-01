@@ -49,9 +49,14 @@ impl DiscoveryKind {
 pub(super) struct DiscoveredWorker {
     /// The provider's stable identity for this worker instance, unique within a
     /// snapshot. A different value at an endpoint means a different instance
-    /// there, which the reconciler replaces. Kubernetes uses `{pod_uid}:{port}`:
-    /// one Pod can serve several ports, and a Pod that restarts on the same IP
-    /// gets a new UID.
+    /// there, which the reconciler replaces.
+    ///
+    /// Kubernetes uses `{pod_uid}:{port}`: one Pod can serve several ports, and
+    /// a Pod *recreated* at the same address — a rescheduled StatefulSet Pod,
+    /// say — gets a new UID. A container restart inside one Pod (a crash, an
+    /// OOM kill, a failed liveness probe) keeps the UID and the IP, so it is
+    /// the same instance here and is not replaced; recovering from it is the
+    /// health checker's job.
     pub(super) discovery_id: String,
     /// Parsed once by the provider, so a bad address is reported against the
     /// record that published it — and held parsed so a derived `Debug` goes
@@ -115,6 +120,10 @@ impl DiscoveredWorker {
     }
 }
 
+/// Write one field of the fingerprint: a presence byte, then — when present —
+/// the value's length and bytes. The presence byte separates absent from
+/// empty; the length is what stops a value containing that byte from forging
+/// the boundary to the next field.
 fn hash_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
     match value {
         None => {
@@ -201,8 +210,8 @@ mod tests {
     }
 
     /// Identity and compatibility labels are set aside in the hash. Otherwise a
-    /// restart at the same address and an edit to the configuration would be
-    /// indistinguishable, and a provider's bookkeeping labels could force
+    /// new instance at the same address and an edit to the configuration would
+    /// be indistinguishable, and a provider's bookkeeping labels could force
     /// replacements.
     #[test]
     fn identity_and_compat_labels_do_not_move_the_fingerprint() {
