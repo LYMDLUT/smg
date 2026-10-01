@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -22,13 +22,19 @@ use tokio::{sync::Notify, task, time};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    provider::DiscoveryKind,
-    reconciler::{self, DesiredState, DesiredWorker, DiscoveredWorkerSpec},
+    provider::{DiscoveredWorker, DiscoveryKind},
+    reconciler::{self, DesiredState},
 };
 use crate::{
     app_context::AppContext,
     worker::{endpoint::Endpoint, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
 };
+
+/// Labels Kubernetes discovery has always stamped on the workers it registers,
+/// kept for existing selectors and dashboards. Ownership no longer depends on
+/// them: the shared reconciler decides it from the generic provider label.
+pub const POD_NAME_LABEL: &str = "smg.ai/pod-name";
+pub const POD_UID_LABEL: &str = "smg.ai/pod-uid";
 
 /// Source for per-worker model_id override during Kubernetes service discovery.
 #[derive(Debug, Clone)]
@@ -621,7 +627,7 @@ fn worker_type_for(pod_type: Option<&PodType>, disaggregated_mode: bool) -> Work
 }
 
 fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> DesiredState {
-    let mut state = DesiredState::default();
+    let mut workers = Vec::new();
     for pod in pods {
         if !PodInfo::should_include(pod, config) {
             continue;
@@ -634,11 +640,12 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
         let Some(info) = PodInfo::from_pod(pod, Some(config)) else {
             continue;
         };
-        // Pod readiness is Kubernetes' standard traffic-admission signal.
-        // Controllers can drive it through readiness gates; direct Pod-IP
-        // routing must honor the aggregate Ready condition just like a
-        // Service/EndpointSlice consumer would.
-        if !info.is_ready {
+        // Ready is Kubernetes' traffic-admission signal — controllers drive it
+        // through readiness gates, and direct Pod-IP routing honors it as a
+        // Service/EndpointSlice consumer would. Running is required too, so a
+        // Pod is either published or it is not: the shared reconciler has no
+        // "present but not yet addable" state to hold one in.
+        if !info.is_healthy() {
             continue;
         }
         for (index, port) in info.ports.iter().enumerate() {
@@ -652,35 +659,25 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
                 );
                 continue;
             };
-            let key = endpoint.key();
-            if state.uid_by_url.contains_key(&key) {
-                continue;
-            }
-            state.uid_by_url.insert(key, info.uid.clone());
-            if info.is_healthy() {
-                state.addable.push(DesiredWorker {
-                    id: format!("{}:{port}", info.uid),
-                    spec: DiscoveredWorkerSpec {
-                        endpoint,
-                        worker_type: worker_type_for(
-                            info.pod_type.as_ref(),
-                            config.disaggregated_mode,
-                        ),
-                        bootstrap_port: info.bootstrap_ports.get(index).copied().flatten(),
-                        model_id_override: info.model_id_override.clone(),
-                        kv_connector: info.kv_connector.clone(),
-                        // Kubernetes has no kv_role annotation; `None` keeps the
-                        // registration workflow's existing label fallback.
-                        kv_role: None,
-                        kv_engine_id: info.kv_engine_ids.get(index).cloned().flatten(),
-                    },
-                    pod_name: info.name.clone(),
-                    pod_uid: info.uid.clone(),
-                });
-            }
+            workers.push(DiscoveredWorker {
+                discovery_id: format!("{}:{port}", info.uid),
+                endpoint,
+                worker_type: worker_type_for(info.pod_type.as_ref(), config.disaggregated_mode),
+                bootstrap_port: info.bootstrap_ports.get(index).copied().flatten(),
+                model_id_override: info.model_id_override.clone(),
+                kv_connector: info.kv_connector.clone(),
+                // Kubernetes has no kv_role annotation; `None` keeps the
+                // registration workflow's existing label fallback.
+                kv_role: None,
+                kv_engine_id: info.kv_engine_ids.get(index).cloned().flatten(),
+                compat_labels: BTreeMap::from([
+                    (POD_NAME_LABEL.to_string(), info.name.clone()),
+                    (POD_UID_LABEL.to_string(), info.uid.clone()),
+                ]),
+            });
         }
     }
-    state
+    DesiredState::from_workers(workers)
 }
 
 /// Convert the current reflector store snapshot into desired workers and hand
@@ -751,11 +748,11 @@ mod tests {
     }
 
     fn create_pd_k8s_pod(name: &str, ip: &str, pod_type: &str, bootstrap_port: Option<u16>) -> Pod {
-        let mut labels = std::collections::BTreeMap::new();
+        let mut labels = BTreeMap::new();
         labels.insert("app".to_string(), "sglang".to_string());
         labels.insert("component".to_string(), pod_type.to_string());
 
-        let mut annotations = std::collections::BTreeMap::new();
+        let mut annotations = BTreeMap::new();
         if let Some(port) = bootstrap_port {
             annotations.insert("sglang.ai/bootstrap-port".to_string(), port.to_string());
         }
@@ -1243,11 +1240,11 @@ mod tests {
         crate::worker::endpoint_key(url).expect(url)
     }
 
-    fn owned(url: &str, uid: &str) -> reconciler::OwnedWorker {
+    fn owned(url: &str, discovery_id: &str) -> reconciler::OwnedWorker {
         reconciler::OwnedWorker {
-            id: WorkerId::from_string(url.to_string()),
+            worker_id: WorkerId::from_string(url.to_string()),
+            discovery_id: discovery_id.to_string(),
             endpoint: Endpoint::parse_with_rank(url).expect(url).0,
-            pod_uid: uid.to_string(),
             revision: 1,
         }
     }
@@ -1269,14 +1266,14 @@ mod tests {
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         let registered = [
-            owned("10.0.0.1:8080", "uid-w"),
-            owned("10.0.0.1:8081", "uid-w"),
+            owned("10.0.0.1:8080", "uid-w:8080"),
+            owned("10.0.0.1:8081", "uid-w:8081"),
         ];
         let actions = reconciler::compute_actions(&desired, &registered);
         assert!(actions.add.is_empty());
         assert_eq!(actions.remove.len(), 2);
-        assert_eq!(actions.remove[0].pod_uid, "uid-w");
-        assert_eq!(actions.remove[1].pod_uid, "uid-w");
+        assert_eq!(actions.remove[0].discovery_id, "uid-w:8080");
+        assert_eq!(actions.remove[1].discovery_id, "uid-w:8081");
     }
 
     #[test]
@@ -1285,18 +1282,21 @@ mod tests {
         let pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
 
-        assert_eq!(desired.uid_by_url.len(), 2);
-        assert_eq!(
-            desired.uid_by_url.get(&key("10.0.0.1:8080")),
-            Some(&"uid-w".to_string())
-        );
-        assert_eq!(
-            desired.uid_by_url.get(&key("10.0.0.1:8081")),
-            Some(&"uid-w".to_string())
-        );
-        assert_eq!(desired.addable.len(), 2);
-        assert!(desired.addable.iter().all(|w| w.pod_uid == "uid-w"));
-        assert!(desired.addable.iter().all(|w| w.pod_name == "w"));
+        // One worker per port, each its own instance, so the id carries the
+        // port: one Pod UID alone would not be unique within the snapshot.
+        assert_eq!(desired.workers.len(), 2);
+        for port in [8080, 8081] {
+            let worker = &desired.workers[&key(&format!("10.0.0.1:{port}"))];
+            assert_eq!(worker.discovery_id, format!("uid-w:{port}"));
+            assert_eq!(
+                worker.compat_labels.get(POD_UID_LABEL).map(String::as_str),
+                Some("uid-w")
+            );
+            assert_eq!(
+                worker.compat_labels.get(POD_NAME_LABEL).map(String::as_str),
+                Some("w")
+            );
+        }
     }
 
     #[test]
@@ -1309,9 +1309,9 @@ mod tests {
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         assert_eq!(
             desired
-                .addable
-                .iter()
-                .map(|w| w.spec.endpoint.render())
+                .workers
+                .values()
+                .map(|w| w.endpoint.render())
                 .collect::<Vec<_>>(),
             vec!["[fd00::1]:8000"],
             "an IPv6 Pod IP must render as a bracketed authority"
@@ -1338,8 +1338,7 @@ mod tests {
         let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
         pod.metadata.deletion_timestamp = Some(Time(k8s_openapi::jiff::Timestamp::now()));
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
-        assert!(desired.uid_by_url.is_empty());
-        assert!(desired.addable.is_empty());
+        assert!(desired.workers.is_empty());
     }
 
     #[test]
@@ -1358,8 +1357,7 @@ mod tests {
             }]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
-        assert!(desired.uid_by_url.is_empty());
-        assert!(desired.addable.is_empty());
+        assert!(desired.workers.is_empty());
     }
 
     #[test]
@@ -1378,8 +1376,27 @@ mod tests {
             }]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
-        assert!(desired.uid_by_url.is_empty());
-        assert!(desired.addable.is_empty());
+        assert!(desired.workers.is_empty());
+    }
+
+    /// A Ready Pod that is not Running used to sit in a hold state: protected
+    /// from removal, yet never added. The shared reconciler has no such state,
+    /// so the Pod is simply not published and a worker registered for it is
+    /// removed.
+    #[test]
+    fn test_ready_but_not_running_pod_is_not_published() {
+        let config = make_regular_config();
+        let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
+        if let Some(status) = pod.status.as_mut() {
+            status.phase = Some("Pending".to_string());
+        }
+        let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
+        assert!(desired.workers.is_empty());
+
+        let registered = [owned("10.0.0.1:8000", "uid-w:8000")];
+        let actions = reconciler::compute_actions(&desired, &registered);
+        assert_eq!(actions.remove.len(), 1);
+        assert!(actions.add.is_empty());
     }
 
     #[test]
@@ -1387,8 +1404,7 @@ mod tests {
         let config = make_regular_config();
         let pod = make_labeled_pod("w", "10.0.0.1", &[("app", "other")]);
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
-        assert!(desired.uid_by_url.is_empty());
-        assert!(desired.addable.is_empty());
+        assert!(desired.workers.is_empty());
     }
 
     #[test]
@@ -1403,17 +1419,17 @@ mod tests {
         );
 
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
-        assert_eq!(desired.addable.len(), 2);
-        let by_url: HashMap<String, &DesiredWorker> = desired
-            .addable
-            .iter()
-            .map(|w| (w.spec.endpoint.render(), w))
+        assert_eq!(desired.workers.len(), 2);
+        let by_url: HashMap<String, &DiscoveredWorker> = desired
+            .workers
+            .values()
+            .map(|w| (w.endpoint.render(), w))
             .collect();
         let first = by_url["10.0.0.1:8080"];
-        assert_eq!(first.spec.worker_type, WorkerType::Prefill);
-        assert_eq!(first.spec.bootstrap_port, Some(9080));
+        assert_eq!(first.worker_type, WorkerType::Prefill);
+        assert_eq!(first.bootstrap_port, Some(9080));
         let second = by_url["10.0.0.1:8081"];
-        assert_eq!(second.spec.bootstrap_port, Some(9081));
+        assert_eq!(second.bootstrap_port, Some(9081));
     }
 
     #[test]
@@ -1424,7 +1440,7 @@ mod tests {
         pod.metadata.namespace = Some("team-a".to_string());
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         assert_eq!(
-            desired.addable[0].spec.model_id_override,
+            desired.workers.values().next().unwrap().model_id_override,
             Some("team-a".to_string())
         );
     }
@@ -1439,7 +1455,7 @@ mod tests {
 
         let config = make_regular_config();
         let desired = compute_desired_state(&store.state(), &config);
-        assert_eq!(desired.uid_by_url.len(), 2);
+        assert_eq!(desired.workers.len(), 2);
     }
 
     // ========== ModelIdSource tests ==========
@@ -1525,7 +1541,7 @@ mod tests {
     #[test]
     fn test_model_id_source_extract_label() {
         let source = ModelIdSource::Label("model-name".to_string());
-        let mut labels = std::collections::BTreeMap::new();
+        let mut labels = BTreeMap::new();
         labels.insert("model-name".to_string(), "llama-70b".to_string());
         let pod = Pod {
             metadata: ObjectMeta {
@@ -1557,7 +1573,7 @@ mod tests {
     #[test]
     fn test_model_id_source_extract_annotation() {
         let source = ModelIdSource::Annotation("serving.example.com/model-id".to_string());
-        let mut annotations = std::collections::BTreeMap::new();
+        let mut annotations = BTreeMap::new();
         annotations.insert(
             "serving.example.com/model-id".to_string(),
             "my-model".to_string(),
@@ -1621,7 +1637,7 @@ mod tests {
     }
 
     fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
-        let mut label_map = std::collections::BTreeMap::new();
+        let mut label_map = BTreeMap::new();
         for &(k, v) in labels {
             label_map.insert(k.to_string(), v.to_string());
         }
