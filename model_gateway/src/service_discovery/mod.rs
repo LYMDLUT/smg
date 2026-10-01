@@ -12,6 +12,7 @@
 //! peers, not inference workers — and lives in [`crate::mesh_discovery`].
 
 mod kubernetes;
+mod provider;
 mod reconciler;
 #[cfg(test)]
 mod testing;

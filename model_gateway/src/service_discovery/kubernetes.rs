@@ -21,7 +21,10 @@ use rustls::crypto::ring;
 use tokio::{sync::Notify, task, time};
 use tracing::{debug, error, info, warn};
 
-use super::reconciler::{self, DesiredState, DesiredWorker, DiscoveredWorkerSpec};
+use super::{
+    provider::DiscoveryKind,
+    reconciler::{self, DesiredState, DesiredWorker, DiscoveredWorkerSpec},
+};
 use crate::{
     app_context::AppContext,
     worker::{endpoint::Endpoint, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
@@ -689,7 +692,7 @@ async fn reconcile_once(
 ) {
     let started_at = time::Instant::now();
     let desired = compute_desired_state(&store.state(), config);
-    reconciler::reconcile(&desired, app_context, started_at).await;
+    reconciler::reconcile(&desired, DiscoveryKind::Kubernetes, app_context, started_at).await;
 }
 
 #[cfg(test)]

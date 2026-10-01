@@ -16,6 +16,7 @@ use openai_protocol::worker::{WorkerSpec, WorkerType};
 use tokio::time;
 use tracing::{error, info, warn};
 
+use super::provider::DiscoveryKind;
 use crate::{
     app_context::AppContext,
     observability::metrics::{metrics_labels, Metrics},
@@ -34,10 +35,6 @@ pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
 pub const DISCOVERY_ID_LABEL: &str = "smg.ai/discovery-id";
 /// BLAKE3 fingerprint of the worker's [`DiscoveredWorkerSpec`].
 pub const DISCOVERY_SPEC_HASH_LABEL: &str = "smg.ai/discovery-spec-hash";
-
-/// The one provider that exists today. A provider enum replaces this when the
-/// tagged configuration lands.
-const KUBERNETES_PROVIDER: &str = "kubernetes";
 
 /// The portable description of one discovered worker.
 ///
@@ -267,7 +264,11 @@ pub(super) fn compute_actions(
     actions
 }
 
-fn build_worker_spec(desired: &DesiredWorker, app_context: &AppContext) -> WorkerSpec {
+fn build_worker_spec(
+    desired: &DesiredWorker,
+    kind: DiscoveryKind,
+    app_context: &AppContext,
+) -> WorkerSpec {
     let discovered = &desired.spec;
     let mut spec = WorkerSpec::new(discovered.endpoint.render());
     spec.worker_type = discovered.worker_type;
@@ -276,7 +277,7 @@ fn build_worker_spec(desired: &DesiredWorker, app_context: &AppContext) -> Worke
     // API key, retry budget or labels injected below.
     spec.labels.insert(
         DISCOVERY_PROVIDER_LABEL.to_string(),
-        KUBERNETES_PROVIDER.to_string(),
+        kind.as_label().to_string(),
     );
     spec.labels
         .insert(DISCOVERY_ID_LABEL.to_string(), desired.id.clone());
@@ -315,6 +316,7 @@ fn build_worker_spec(desired: &DesiredWorker, app_context: &AppContext) -> Worke
 /// function read the reflector store itself.
 pub(super) async fn reconcile(
     desired: &DesiredState,
+    kind: DiscoveryKind,
     app_context: &Arc<AppContext>,
     started_at: time::Instant,
 ) {
@@ -323,10 +325,7 @@ pub(super) async fn reconcile(
 
     let desired_count = desired.uid_by_url.len();
     if actions.add.is_empty() && actions.remove.is_empty() {
-        Metrics::set_discovery_workers_discovered(
-            metrics_labels::DISCOVERY_KUBERNETES,
-            desired_count,
-        );
+        Metrics::set_discovery_workers_discovered(kind.metric_label(), desired_count);
         return;
     }
 
@@ -360,10 +359,7 @@ pub(super) async fn reconcile(
         .collect();
 
     if removals.is_empty() && additions.is_empty() {
-        Metrics::set_discovery_workers_discovered(
-            metrics_labels::DISCOVERY_KUBERNETES,
-            desired_count,
-        );
+        Metrics::set_discovery_workers_discovered(kind.metric_label(), desired_count);
         return;
     }
 
@@ -398,7 +394,7 @@ pub(super) async fn reconcile(
         };
         match job_queue.submit(job).await {
             Ok(()) => Metrics::record_discovery_deregistration(
-                metrics_labels::DISCOVERY_KUBERNETES,
+                kind.metric_label(),
                 metrics_labels::DEREGISTRATION_RECONCILED,
             ),
             Err(e) => error!(
@@ -415,12 +411,12 @@ pub(super) async fn reconcile(
             worker.spec.endpoint, worker.spec.worker_type, worker.pod_name
         );
         let job = Job::AddWorker {
-            config: Box::new(build_worker_spec(worker, app_context)),
+            config: Box::new(build_worker_spec(worker, kind, app_context)),
             registration_mode: WorkerRegistrationMode::Upsert,
         };
         match job_queue.submit(job).await {
             Ok(()) => Metrics::record_discovery_registration(
-                metrics_labels::DISCOVERY_KUBERNETES,
+                kind.metric_label(),
                 metrics_labels::REGISTRATION_SUCCESS,
             ),
             Err(e) => {
@@ -429,18 +425,15 @@ pub(super) async fn reconcile(
                     worker.spec.endpoint, e
                 );
                 Metrics::record_discovery_registration(
-                    metrics_labels::DISCOVERY_KUBERNETES,
+                    kind.metric_label(),
                     metrics_labels::REGISTRATION_FAILED,
                 );
             }
         }
     }
 
-    Metrics::set_discovery_workers_discovered(metrics_labels::DISCOVERY_KUBERNETES, desired_count);
-    Metrics::record_discovery_sync_duration(
-        metrics_labels::DISCOVERY_KUBERNETES,
-        started_at.elapsed(),
-    );
+    Metrics::set_discovery_workers_discovered(kind.metric_label(), desired_count);
+    Metrics::record_discovery_sync_duration(kind.metric_label(), started_at.elapsed());
 }
 
 #[cfg(test)]
@@ -573,7 +566,7 @@ mod tests {
     fn build_worker_spec_stamps_provenance_from_the_spec_alone() {
         let app_context = create_test_app_context();
         let desired = desired_worker("10.0.0.1:8080", "uid-1");
-        let spec = build_worker_spec(&desired, &app_context);
+        let spec = build_worker_spec(&desired, DiscoveryKind::Kubernetes, &app_context);
 
         assert_eq!(
             spec.labels
@@ -795,7 +788,7 @@ mod tests {
             pod_name: "prefill-0".to_string(),
             pod_uid: "uid-1".to_string(),
         };
-        let spec = build_worker_spec(&desired, &app_context);
+        let spec = build_worker_spec(&desired, DiscoveryKind::Kubernetes, &app_context);
         assert_eq!(spec.url, "10.0.0.1:8081");
         assert_eq!(spec.worker_type, WorkerType::Prefill);
         assert_eq!(spec.bootstrap_port, Some(9080));
@@ -822,6 +815,12 @@ mod tests {
     async fn test_reconcile_without_job_queue_is_safe() {
         let app_context = create_test_app_context();
         let desired = desired_state_of(&[desired_worker("10.0.0.1:8080", "u1")]);
-        reconcile(&desired, &app_context, time::Instant::now()).await;
+        reconcile(
+            &desired,
+            DiscoveryKind::Kubernetes,
+            &app_context,
+            time::Instant::now(),
+        )
+        .await;
     }
 }
