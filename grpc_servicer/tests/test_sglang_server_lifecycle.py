@@ -199,7 +199,8 @@ def harness(monkeypatch):
         gracefully_exit=False,
         shutdown=AsyncMock(side_effect=lambda: events.append("manager-shutdown")),
     )
-    scheduler_procs = [object()]
+    # A scheduler that never exits: the real exit watchdog polls `exitcode`.
+    scheduler_procs = [SimpleNamespace(exitcode=None)]
 
     async def launch(**_kwargs):
         return {"status": "ready"}, object(), scheduler_procs, request_manager
