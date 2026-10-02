@@ -16,8 +16,8 @@ use crate::{
     routers::{
         common::{
             kv_transfer::{
-                connector_mode_for_worker, mooncake_decode_params, mooncake_prefill_params,
-                KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
+                connector_mode_for_worker, is_moriio_worker, mooncake_decode_params,
+                mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             pd_admission,
             retry::mark_non_retryable,
@@ -1047,10 +1047,15 @@ async fn execute_sequential_pd(
         )
     })?;
 
-    let mode = workers
-        .prefill_worker()
-        .map(|w| connector_mode_for_worker(w.as_ref()))
-        .unwrap_or(KvConnectorMode::Passthrough);
+    let mode = match workers.decode_worker() {
+        // A MoRI-IO decode engine never recomputes the prompt, whatever the
+        // prefill leg runs.
+        Some(decode) if is_moriio_worker(decode.as_ref()) => KvConnectorMode::MoriIo,
+        _ => workers
+            .prefill_worker()
+            .map(|w| connector_mode_for_worker(w.as_ref()))
+            .unwrap_or(KvConnectorMode::Passthrough),
+    };
 
     // Recorded on the success path (after decode established) so failed
     // requests don't pollute success metrics; captured here before use of mode.
@@ -1070,6 +1075,14 @@ async fn execute_sequential_pd(
             KvConnectorMode::Nixl => debug!(
                 "vLLM PD (NIXL): will tag prefill with do_remote_decode and relay returned kv_transfer_params to decode"
             ),
+            // Relaying nothing would let the decode engine compute over KV that
+            // never arrives, so refuse until this pipeline speaks the protocol.
+            KvConnectorMode::MoriIo => {
+                return Err(error::not_implemented(
+                    "moriio_grpc_pd_unsupported",
+                    "MoRIIOConnector PD is supported by the HTTP PD router only",
+                ));
+            }
             KvConnectorMode::Passthrough => {
                 // Warn once: PD without a discovered connector usually means GetServerInfo
                 // lacks kv fields or labels.kv_connector is missing in worker config

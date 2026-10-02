@@ -267,7 +267,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_pd_kv_connector_mode_total",
-        "KV connector mode decisions by mode (mooncake/nixl/passthrough)"
+        "KV connector mode decisions by mode (mooncake/nixl/moriio/passthrough)"
     );
     describe_counter!(
         "smg_pd_bootstrap_failures_total",
@@ -1190,7 +1190,7 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record a KV connector mode decision (mooncake/nixl/passthrough).
+    /// Record a KV connector mode decision (mooncake/nixl/moriio/passthrough).
     pub fn record_pd_kv_connector_mode(mode: &'static str) {
         counter!(
             "smg_pd_kv_connector_mode_total",

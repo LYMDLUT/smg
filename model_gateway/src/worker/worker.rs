@@ -133,6 +133,12 @@ pub const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 /// vLLM NIXL KV connector name
 pub const NIXL_CONNECTOR: &str = "NixlConnector";
 
+/// vLLM MoRI-IO KV connector name
+pub const MORIIO_CONNECTOR: &str = "MoRIIOConnector";
+
+/// Worker label naming a MoRI-IO engine's transfer mode, `read` or `write`.
+pub const MORIIO_MODE_LABEL: &str = "moriio_mode";
+
 /// POST an admin endpoint on an HTTP worker and map the outcome to a
 /// [`WorkerResult`].
 async fn admin_http_post(

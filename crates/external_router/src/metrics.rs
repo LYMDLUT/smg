@@ -155,6 +155,7 @@ pub mod metrics_labels {
 
     // PD KV connector modes (smg_pd_kv_connector_mode_total)
     pub const KV_CONNECTOR_MOONCAKE: &str = "mooncake";
+    pub const KV_CONNECTOR_MORIIO: &str = "moriio";
     pub const KV_CONNECTOR_NIXL: &str = "nixl";
     pub const KV_CONNECTOR_PASSTHROUGH: &str = "passthrough";
 
