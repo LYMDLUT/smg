@@ -44,7 +44,7 @@ use tonic_health::pb::{
 use zip::{CompressionMethod, ZipArchive};
 
 use super::*;
-use crate::ServicerError;
+use crate::{kv_events, tokenizer_bundle, ServicerError};
 
 fn model_info() -> VllmModelInfo {
     VllmModelInfo {
@@ -73,6 +73,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmS
         tokenizer_dir: None,
         model,
         media_processor: None,
+        engine_startup_timeout: Duration::from_secs(10),
     }
 }
 
@@ -253,11 +254,15 @@ fn start_rejects_malformed_config() {
         engine_count: 0,
         ..good.clone()
     };
+    let zero_timeout = VllmServicerConfig {
+        engine_startup_timeout: Duration::ZERO,
+        ..good.clone()
+    };
     let no_model = VllmServicerConfig {
         model: VllmModelInfo::default(),
         ..good
     };
-    for config in [bad_ipc, bad_handshake, no_engines, no_model] {
+    for config in [bad_ipc, bad_handshake, no_engines, zero_timeout, no_model] {
         assert!(matches!(
             VllmServicerServer::start(config),
             Err(ServicerError::InvalidConfig(_))
@@ -1308,7 +1313,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
         .map(|_| ())
         .unwrap_err();
     assert_eq!(status.code(), Code::Unimplemented);
-    assert_eq!(status.message(), kv_events::DISABLED_MESSAGE);
+    assert_eq!(status.message(), kv_events::VLLM_DISABLED_MESSAGE);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
     let port = pick_unused_port().expect("a free publisher port");
@@ -2213,6 +2218,24 @@ async fn a_pd_prefill_leg_returns_the_media_identity() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Device-side pixel normalization is a fact of the engine's config,
+/// advertised whether or not this worker processes media itself: the Router
+/// preprocessing for it needs it to send raw pixels.
+#[tokio::test]
+async fn server_info_advertises_device_side_normalization() {
+    let mut model = model_info();
+    model.mm_device_do_normalize = true;
+    let mut h = harness_with(model, None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.mm_device_do_normalize);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `GetServerInfo` advertises the processor only while it answers its probe
 /// and the engine takes multimodal input, as the Python servicer does.
 #[tokio::test]
@@ -2421,4 +2444,35 @@ async fn a_caller_leaving_an_admitted_decode_leg_sends_no_notice() {
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["mr21".to_string()]);
     assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// An engine that never dials in fails the link at the configured bound, the
+/// server stays up to report it, and `stop` releases the handshake port.
+#[tokio::test]
+async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address();
+    let server = VllmServicerServer::start(VllmServicerConfig {
+        engine_startup_timeout: Duration::from_millis(300),
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let error = loop {
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(error.contains("timed out"), "{error}");
+    assert!(!server.engine_ready());
+    assert!(
+        server.running(),
+        "the server keeps answering after the link failed"
+    );
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    let port = handshake.rsplit(':').next().unwrap();
+    std::net::TcpListener::bind(format!("127.0.0.1:{port}")).expect("handshake port released");
 }

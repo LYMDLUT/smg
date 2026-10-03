@@ -35,17 +35,26 @@ import asyncio
 import dataclasses
 import glob
 import importlib.util
+import json
 import logging
 import multiprocessing
 import os
-import signal
-import socket
-import subprocess
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
+from smg_grpc_servicer.rust_lifecycle import (
+    DEFAULT_DRAIN_SECS,
+    DEFAULT_STARTUP_TIMEOUT_SECS,
+    EngineProcess,
+    default_socket_dir,
+    free_port,
+    resolve_tokenizer_dir,
+    supervise,
+)
+from smg_grpc_servicer.rust_lifecycle import env_float as _env_float
 from smg_grpc_servicer.vllm.model_info import (
     eos_token_ids_with_generation_config,
+    mm_device_do_normalize,
     model_facts,
     server_facts,
 )
@@ -55,10 +64,8 @@ logger = logging.getLogger(__name__)
 SERVICER_IMPL_ENV = "SMG_VLLM_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_VLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_SECS"
+STARTUP_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS"
 IMPLS = ("python", "rust")
-DEFAULT_DRAIN_SECS = 5.0
-ENGINE_TERMINATE_SECS = 30.0
-_POLL_SECS = 0.5
 # What upstream's gRPC entrypoint references when it carries the switch.
 HOOK_SYMBOL = "resolve_servicer_impl"
 
@@ -109,6 +116,7 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
             bool(pooler_use_activation) if pooler_use_activation is not None else None
         ),
         "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
+        "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
     }
 
 
@@ -122,6 +130,10 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     An engine that normalizes pixels on device (vLLM's ``mm_device_do_normalize``,
     the default where the model supports it) takes raw ``uint8`` pixels and
     would normalize anything else twice; the pipeline writes raw pixels then.
+    The engine's ``mm_processor_kwargs`` go along as overrides of the
+    preprocessor config (less ``device``, which only says where vLLM's own
+    processor would run); a knob the pipeline has no field for is refused
+    at launch rather than silently ignored.
     """
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
@@ -135,55 +147,25 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         if os.path.isfile(os.path.join(model_path, "config.json"))
         else tokenizer_dir or model_path
     )
-    mm_config = getattr(model_config, "multimodal_config", None)
     dtype = str(getattr(model_config, "dtype", "") or "").removeprefix("torch.")
+    processor_kwargs = {
+        key: value
+        for key, value in (getattr(model_config, "mm_processor_kwargs", None) or {}).items()
+        if key != "device"
+    }
     return {
         "model_dir": model_dir,
         "model_id": model_path,
-        "raw_pixels": bool(getattr(mm_config, "mm_device_do_normalize", False)),
+        "raw_pixels": mm_device_do_normalize(vllm_config),
         "encoder_dtype": dtype or "float32",
+        "processor_kwargs_json": (
+            json.dumps(processor_kwargs, sort_keys=True) if processor_kwargs else None
+        ),
         "max_inflight": settings.max_inflight,
         "max_items": settings.max_items,
         "max_item_bytes": settings.max_item_bytes,
         "source": settings.source,
     }
-
-
-def resolve_tokenizer_dir(tokenizer: str, revision: str | None = None) -> str | None:
-    """A local directory holding ``tokenizer`` (a path, or a Hub id resolved
-    through the local cache first); ``None`` when none can be found, in which
-    case the Rust servicer refuses requests carrying string stops."""
-    if os.path.isdir(tokenizer):
-        return tokenizer
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        logger.warning("huggingface_hub is not installed; cannot resolve tokenizer %r", tokenizer)
-        return None
-    patterns = ["*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]
-    last_error: Exception | None = None
-    for local_files_only in (True, False):
-        try:
-            return snapshot_download(
-                tokenizer,
-                revision=revision,
-                allow_patterns=patterns,
-                local_files_only=local_files_only,
-            )
-        except Exception as error:  # cache miss, offline, or an unknown repo
-            last_error = error
-    logger.warning("Could not resolve tokenizer %r to a local directory: %s", tokenizer, last_error)
-    return None
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def default_socket_dir() -> str:
-    return os.environ.get("SMG_ZMQ_SOCKET_DIR") or f"/tmp/smg-zmq-{os.getuid()}"
 
 
 # ---------------------------------------------------------------------------
@@ -247,34 +229,6 @@ def _run_headless(ns: argparse.Namespace) -> None:
     run_headless(ns)
 
 
-class EngineProcess:
-    """A ``Popen``-shaped view of the spawned headless-engine process, so the
-    lifecycle loop and :func:`terminate_engine` need no second code path."""
-
-    def __init__(self, process: Any):
-        self._process = process
-
-    @property
-    def pid(self) -> int | None:
-        return self._process.pid
-
-    def poll(self) -> int | None:
-        return self._process.exitcode
-
-    def terminate(self) -> None:
-        self._process.terminate()
-
-    def kill(self) -> None:
-        self._process.kill()
-
-    def wait(self, timeout: float | None = None) -> int:
-        self._process.join(timeout)
-        code = self._process.exitcode
-        if code is None:
-            raise subprocess.TimeoutExpired("headless engine", timeout or 0)
-        return code
-
-
 def launch_headless_engine(ns: argparse.Namespace) -> EngineProcess:
     """Start the headless engine in a spawned child: a fresh interpreter that
     inherits no Rust thread and never consults the servicer switch again
@@ -285,80 +239,9 @@ def launch_headless_engine(ns: argparse.Namespace) -> EngineProcess:
     return EngineProcess(process)
 
 
-def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> None:
-    """SIGTERM the headless engine (it tears down its own workers), then kill."""
-    if engine.poll() is not None:
-        return
-    engine.terminate()
-    try:
-        engine.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        logger.warning("Headless engine did not exit within %.0fs; killing it", timeout)
-        engine.kill()
-        engine.wait()
-
-
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
-
-
-async def supervise(
-    server: Any,
-    engine: Any,
-    *,
-    drain_secs: float = DEFAULT_DRAIN_SECS,
-    stop_timeout: float = 5.0,
-    stop_event: asyncio.Event | None = None,
-    poll_secs: float = _POLL_SECS,
-) -> int:
-    """Run until a shutdown signal, an engine exit, or a server failure.
-
-    Signals drain: health flips to NOT_SERVING at once (the Router stops
-    routing here), in-flight streams get ``drain_secs`` to finish with the
-    engine still up, then the server stops and the engine is terminated.
-    Returns the process exit code.
-    """
-    loop = asyncio.get_running_loop()
-    if stop_event is None:
-        stop_event = asyncio.Event()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, stop_event.set)
-    exit_code = 0
-    announced_ready = False
-    try:
-        while not stop_event.is_set():
-            if not announced_ready and server.engine_ready:
-                announced_ready = True
-                logger.info("Engine connected; the servicer is SERVING")
-            error = server.last_error
-            if error or not server.running:
-                logger.error("Rust servicer cannot serve: %s", error or "server exited")
-                exit_code = 1
-                break
-            rc = engine.poll()
-            if rc is not None:
-                logger.error("Headless engine exited with code %s", rc)
-                exit_code = 1
-                break
-            try:
-                await asyncio.wait_for(stop_event.wait(), poll_secs)
-            except asyncio.TimeoutError:  # noqa: UP041 -- distinct from the builtin before 3.11
-                pass
-    finally:
-        try:
-            server.set_serving(False)
-        except Exception:
-            logger.exception("Failed to mark the servicer as draining")
-        if stop_event.is_set() and drain_secs > 0 and engine.poll() is None:
-            logger.info("Draining for %.1fs before stopping", drain_secs)
-            await asyncio.sleep(drain_secs)
-        try:
-            await asyncio.to_thread(server.stop, stop_timeout)
-        except Exception:
-            logger.exception("Failed to stop the Rust servicer cleanly")
-        terminate_engine(engine)
-    return exit_code
 
 
 async def serve_rust(args: argparse.Namespace) -> int:
@@ -413,6 +296,9 @@ async def serve_rust(args: argparse.Namespace) -> int:
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=data_parallel_size,
         tokenizer_dir=tokenizer_dir,
+        engine_startup_timeout_secs=_env_float(
+            STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS
+        ),
         media_processor=media,
         smg_media_processor=smg_media,
         **info,
@@ -523,11 +409,6 @@ def require_upstream_hook() -> None:
             "so its workers would silently run the Python servicer. Install a vLLM with "
             "the hook (see grpc_servicer/README.md) or select the python implementation."
         )
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    return float(value) if value else default
 
 
 def _env_int(name: str) -> int | None:

@@ -19,6 +19,7 @@ import types
 from types import SimpleNamespace
 
 import pytest
+from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.vllm import rust
 
 
@@ -149,6 +150,7 @@ def test_smg_media_options_follow_the_engine_config(tmp_path):
         "model_id": "org/m",
         "raw_pixels": True,
         "encoder_dtype": "bfloat16",
+        "processor_kwargs_json": None,
         "max_inflight": 3,
         "max_items": 2,
         "max_item_bytes": 10,
@@ -162,8 +164,23 @@ def test_smg_media_options_follow_the_engine_config(tmp_path):
     # An engine that normalizes on the CPU takes normalized pixels in its dtype.
     config.model_config.multimodal_config = SimpleNamespace(mm_device_do_normalize=False)
     assert rust.smg_media_options(config, settings, None)["raw_pixels"] is False
+    # The engine's processor kwargs ride along, less where its own processor runs.
+    config.model_config.mm_processor_kwargs = {"max_pixels": 1000, "device": "cuda"}
+    assert (
+        rust.smg_media_options(config, settings, None)["processor_kwargs_json"]
+        == '{"max_pixels": 1000}'
+    )
     # A text model takes no media: the mode is ignored, as the Python processors ignore it.
     assert rust.smg_media_options(_config(), settings, None) is None
+
+
+def test_model_info_advertises_device_side_normalization():
+    assert rust.model_info_from_config(_config())["mm_device_do_normalize"] is False
+    config = _config(
+        is_multimodal_model=True,
+        multimodal_config=SimpleNamespace(mm_device_do_normalize=True),
+    )
+    assert rust.model_info_from_config(config)["mm_device_do_normalize"] is True
 
 
 def test_model_info_mirrors_the_python_servicer(monkeypatch):
@@ -437,6 +454,9 @@ class FakeEngine:
     def kill(self) -> None:
         self.events.append("kill")
 
+    def kill_descendants(self) -> int:
+        return 0  # the straggler sweep finds nothing behind a fake
+
 
 def _run_supervise(server, engine, *, before, drain_secs=0.0):
     async def run():
@@ -582,6 +602,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert kwargs["handshake_address"] == "tcp://127.0.0.1:24321"
     assert kwargs["engine_count"] == 2
     assert kwargs["tokenizer_dir"] == str(tmp_path)
+    assert kwargs["engine_startup_timeout_secs"] == rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS
     assert kwargs["served_model_name"] == "served-a"
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
     assert kwargs["kv_connector"] == ""
