@@ -18,6 +18,15 @@ path = "../../model_gateway"
 default-features = false
 features = ["grpc-client", "jemalloc-stats", "providers"]
 
+[dependencies.engine-servicer]
+workspace = true
+
+[dependencies.bytes]
+workspace = true
+
+[dependencies.tracing]
+workspace = true
+
 [dependencies.smg-rl]
 workspace = true
 

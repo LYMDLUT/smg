@@ -121,6 +121,81 @@ cap is answered as a 400 `media_too_large` instead of being pushed, and a result
 Redis refuses is reported to the worker at once; a sidecar timeout is not
 retried by the router, since the worker already spent the whole budget on it.
 
+#### Rust request path (`SMG_VLLM_SERVICER_IMPL=rust`)
+
+The same `vllm.grpc.engine.VllmEngine` contract can be served from Rust, with
+Python keeping only the lifecycle. The switch is a flag inside this package,
+not a second server: upstream vLLM's gRPC entrypoint asks the package which
+implementation to run before it builds an AsyncLLM, and hands the process to
+`smg_grpc_servicer.vllm.serve_rust` when the answer is `rust`. That function
+launches the engine headless (`vllm serve --headless`), which dials a
+same-host ZMQ handshake, and serves the gRPC contract from
+`smg.servicer.VllmGrpcServer` on a Rust-owned thread. The Router cannot tell
+the two apart.
+
+```bash
+# Python (default): upstream's gRPC server, AsyncLLM in-process.
+python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
+
+# Rust request path, same entrypoint.
+SMG_VLLM_SERVICER_IMPL=rust python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
+```
+
+The upstream hook is the first thing in its `serve_grpc`:
+
+```python
+from smg_grpc_servicer.vllm import resolve_servicer_impl, serve_rust
+
+if resolve_servicer_impl(args) == "rust":
+    raise SystemExit(await serve_rust(args))
+```
+
+`smg serve --backend vllm --connection-mode grpc --servicer-impl rust` sets
+the flag in each worker's environment, after checking that the installed
+vLLM carries the hook (`smg_grpc_servicer.vllm.rust.upstream_hook_installed`);
+the Python servicer itself refuses to start when the flag asks for Rust, so a
+vLLM without the hook fails loudly instead of silently running Python. The
+headless engine is launched from the parsed namespace through vLLM's own
+`run_headless`, so both entrypoints above work unchanged.
+
+Rust mode needs the `smg` wheel (for the binding) and serves the whole
+contract the Python servicer serves: text generation, PD disaggregation
+(`--kv-transfer-config`: connector params pass through both ways and
+`GetServerInfo` carries the pairing identity), Router-preprocessed media
+(inline and `/dev/shm` tensors), worker-side media processing (`media_refs`,
+below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
+FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
+directory) and `SubscribeKvEvents` (`--kv-events-config` with the ZMQ
+publisher). Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
+`SMG_VLLM_SERVICER_DRAIN_SECS` (default 5), `SMG_ZMQ_SOCKET_DIR`,
+`SMG_SERVICER_WORKER_THREADS` (default 4).
+
+Worker-side media processing uses the same `--mm-processor` /
+`SMG_VLLM_MM_PROCESSOR` setting and backends as the Python servicer
+(`inprocess`: vLLM's MediaConnector and the engine's renderer; `redis`: the
+sidecar), so the media is fetched and processed by vLLM's own code on either
+servicer and the Rust path is never behind vLLM's processors. The Rust server
+hands a request's `media_refs` to the Python bridge
+(`smg_grpc_servicer.vllm.rust_media`), which runs the processor and vLLM's
+input processor on the launcher's asyncio loop and returns the expanded
+prompt and `mm_features` as vLLM's own encoder writes them; Rust relays the
+encoded features to the engine untouched and sends the tensor frames straight
+from the memory Python lent it, without a copy. The in-flight cap, the saturation refusal, the
+advertised `mm_processor` / `mm_media_ref_schemes` / `mm_processor_source` and
+the PD prefill leg's `media_identity` behave as on the Python servicer. A Rust
+processor (the Router's own multimodal pipeline, worker-side) can plug into
+the same seam later; the engine-side contract does not change.
+
+Known difference: under `--structured-outputs-config.backend auto` (the
+default) vLLM's frontend validates each constraint with xgrammar and falls
+back to guidance when xgrammar rejects it. Rust mode applies the same static
+rules (JSON-schema features xgrammar lacks go to guidance, a `choice` becomes
+the grammar xgrammar compiles), but it cannot run xgrammar's parser, so a regex
+or grammar that only guidance accepts fails that request at the engine's
+grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
+explicitly when that matters; the engine keeps the backend of its first
+structured request either way, as it does behind vLLM's own frontend.
+
 ### MLX
 
 ```bash
