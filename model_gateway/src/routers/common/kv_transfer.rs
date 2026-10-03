@@ -1,10 +1,10 @@
 //! vLLM PD KV-transfer connector handling, shared by both transports.
 //!
-//! vLLM disaggregation is sequential: the prefill leg is tagged with
-//! connector params, the engine returns (or the router mints) the handoff
-//! params, and the decode leg carries them. The gRPC pipeline and the HTTP
-//! PD router both implement that flow; the connector vocabulary lives here
-//! so the two stay in lockstep.
+//! The prefill leg is tagged with connector params, the engine returns (or
+//! the router mints) the handoff params, and the decode leg carries them;
+//! only a MoRI-IO WRITE decode leg can also go out first, with params minted
+//! up front. The gRPC pipeline and the HTTP PD router both implement that
+//! flow; the connector vocabulary lives here so the two stay in lockstep.
 
 use serde_json::{value::RawValue, Value};
 use tracing::warn;
@@ -36,7 +36,9 @@ pub(crate) enum KvConnectorMode {
     /// NixlConnector: tag prefill with do_remote_decode, relay returned params to decode.
     Nixl,
     /// MoRIIOConnector: mint a transfer_id, tag prefill with the decode peer
-    /// (see [`moriio_prefill_params`]), relay the validated handoff to decode.
+    /// (see [`moriio_prefill_params`]), relay the validated handoff to decode,
+    /// or, dispatched concurrently, tag decode with the prefill peer (see
+    /// [`moriio_decode_params`]).
     MoriIo,
     /// Unknown/absent connector: relay returned params opportunistically.
     Passthrough,
@@ -78,6 +80,10 @@ pub(crate) fn kv_connector_mode(
 pub(crate) const MORIIO_HOST_LABEL: &str = "moriio_host";
 pub(crate) const MORIIO_HANDSHAKE_PORT_LABEL: &str = "moriio_handshake_port";
 pub(crate) const MORIIO_NOTIFY_PORT_LABEL: &str = "moriio_notify_port";
+/// How the two WRITE legs are sent: `sequential` (default) or `concurrent`.
+/// Honoured on the decode worker; an invalid value on either worker refuses
+/// the pair.
+pub(crate) const MORIIO_WRITE_DISPATCH_LABEL: &str = "moriio_write_dispatch";
 /// vLLM `MoRIIOConstants.DEFAULT_HANDSHAKE_PORT` / `DEFAULT_NOTIFY_PORT`.
 const MORIIO_DEFAULT_HANDSHAKE_PORT: u16 = 6301;
 const MORIIO_DEFAULT_NOTIFY_PORT: u16 = 61005;
@@ -113,6 +119,9 @@ pub(crate) struct MoriIoEndpoint {
     /// From the `tp_size` label. Unset means the peer's TP is unknown, which
     /// the connector treats as equal to its own.
     pub(crate) tp_size: Option<usize>,
+    /// Send the WRITE legs at once. Opt-in: a decode request aborted before
+    /// the prefill pushes leaves its blocks allocated in the vLLM connector.
+    pub(crate) concurrent_write: bool,
 }
 
 pub(crate) fn is_moriio_worker(worker: &dyn Worker) -> bool {
@@ -177,12 +186,26 @@ pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, Str
             "{url}: no MoRI-IO host (set label {MORIIO_HOST_LABEL})"
         ));
     }
+    let concurrent_write = match label(MORIIO_WRITE_DISPATCH_LABEL)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("sequential") => false,
+        Some("concurrent") => true,
+        Some(other) => {
+            return Err(format!(
+                "{url}: label {MORIIO_WRITE_DISPATCH_LABEL} must be \"sequential\" or \
+                 \"concurrent\", got {other:?}"
+            ))
+        }
+    };
     Ok(MoriIoEndpoint {
         transfer,
         host: host.to_string(),
         handshake_port: port(MORIIO_HANDSHAKE_PORT_LABEL, MORIIO_DEFAULT_HANDSHAKE_PORT)?,
         notify_port: port(MORIIO_NOTIFY_PORT_LABEL, MORIIO_DEFAULT_NOTIFY_PORT)?,
         tp_size,
+        concurrent_write,
     })
 }
 
@@ -210,27 +233,58 @@ pub(crate) fn moriio_prefill_params(transfer_id: &str, decode: &MoriIoEndpoint) 
     params.to_string()
 }
 
+/// Decode-leg params for MoRI-IO WRITE, minted up front so both legs can go
+/// out at once: the decode engine allocates its blocks and tells the prefill
+/// engine where to push them, through the prefill's side channel.
+pub(crate) fn moriio_decode_params(transfer_id: &str, prefill: &MoriIoEndpoint) -> String {
+    let mut params = serde_json::json!({
+        "do_remote_decode": false,
+        "do_remote_prefill": true,
+        "remote_engine_id": null,
+        "remote_block_ids": null,
+        "transfer_id": transfer_id,
+        "remote_dp_size": 1,
+        "remote_host": prefill.host,
+        "remote_handshake_port": prefill.handshake_port,
+        "remote_notify_port": prefill.notify_port,
+    });
+    if let Some(tp_size) = prefill.tp_size {
+        params["remote_tp_size"] = Value::from(tp_size);
+    }
+    params.to_string()
+}
+
 /// Why a WRITE producer, told to push to `decode`, would not reach the
-/// decode engine. A loopback host reaches only the producer's own machine,
-/// and a side channel equal to the prefill's makes the producer its own peer.
+/// decode engine. A loopback or unspecified host reaches only the producer's
+/// own machine, and a side channel equal to the prefill's makes the producer
+/// its own peer. Under concurrent dispatch the decode engine also dials the
+/// prefill's side channel as named here, so the same holds the other way
+/// round.
 pub(crate) fn moriio_write_target_error(
     prefill: &MoriIoEndpoint,
     decode: &MoriIoEndpoint,
 ) -> Option<String> {
-    let loopback = |host: &str| {
+    let local_only = |host: &str| {
         host.eq_ignore_ascii_case("localhost")
             || host
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
+                .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
     };
-    let (prefill_local, decode_local) = (loopback(&prefill.host), loopback(&decode.host));
+    let (prefill_local, decode_local) = (local_only(&prefill.host), local_only(&decode.host));
     if decode_local && !prefill_local {
         return Some(format!(
-            "decode MoRI-IO host {} is loopback but the prefill is at {}; \
+            "decode MoRI-IO host {} is loopback or unspecified but the prefill is at {}; \
              set label {MORIIO_HOST_LABEL} on the decode worker",
             decode.host, prefill.host
+        ));
+    }
+    if decode.concurrent_write && prefill_local && !decode_local {
+        return Some(format!(
+            "prefill MoRI-IO host {} is loopback or unspecified but the decode, dispatched \
+             concurrently, is at {}; set label {MORIIO_HOST_LABEL} on the prefill worker",
+            prefill.host, decode.host
         ));
     }
     let same_host = prefill.host == decode.host || (prefill_local && decode_local);
@@ -252,9 +306,10 @@ pub(crate) fn moriio_write_target_error(
 }
 
 /// Check the prefill engine's MoRI-IO handoff before the decode leg goes
-/// out. A MoRI-IO decode engine without it computes over KV that never
-/// arrives (READ) or waits for a push that never comes (WRITE), so a
-/// missing or foreign handoff must fail the request instead.
+/// out, or before a concurrent decode leg's response is forwarded. A MoRI-IO
+/// decode engine without it computes over KV that never arrives (READ) or
+/// waits for a push that never comes (WRITE), so a missing or foreign
+/// handoff must fail the request instead.
 pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> Result<(), String> {
     let params: Value = serde_json::from_str(handoff.get())
         .map_err(|e| format!("unparsable kv_transfer_params: {e}"))?;
@@ -282,6 +337,40 @@ pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> 
         }
     }
     Ok(())
+}
+
+/// Why a valid handoff from `prefill` does not match the side channel a
+/// concurrent decode leg was sent to notify: that decode engine then waits for
+/// a push that never comes. The engine reports its configured base ports,
+/// as a string or a number.
+pub(crate) fn moriio_side_channel_error(
+    handoff: &RawValue,
+    prefill: &MoriIoEndpoint,
+) -> Option<String> {
+    let params: Value = serde_json::from_str(handoff.get()).ok()?;
+    let port = |key: &str| match params.get(key) {
+        Some(Value::String(port)) => port.trim().parse::<u16>().ok(),
+        Some(Value::Number(port)) => port.as_u64().and_then(|port| u16::try_from(port).ok()),
+        _ => None,
+    };
+    let reported = (port("remote_handshake_port"), port("remote_notify_port"));
+    if reported == (Some(prefill.handshake_port), Some(prefill.notify_port)) {
+        return None;
+    }
+    let shown = |key: &str| {
+        params
+            .get(key)
+            .map_or_else(|| "none".to_string(), Value::to_string)
+    };
+    Some(format!(
+        "prefill reports MoRI-IO side channel handshake {} / notify {}, but the decode leg \
+         was told {} / {}; set labels {MORIIO_HANDSHAKE_PORT_LABEL} / \
+         {MORIIO_NOTIFY_PORT_LABEL} on the prefill worker",
+        shown("remote_handshake_port"),
+        shown("remote_notify_port"),
+        prefill.handshake_port,
+        prefill.notify_port
+    ))
 }
 
 /// Connector id of the engine core serving the prefill leg. With DP the cores
@@ -436,6 +525,7 @@ mod tests {
                 handshake_port: 6301,
                 notify_port: 61005,
                 tp_size: None,
+                concurrent_write: false,
             })
         );
         let worker = moriio_worker(
@@ -446,6 +536,7 @@ mod tests {
                 ("moriio_handshake_port", "7301"),
                 ("moriio_notify_port", "62005"),
                 ("tp_size", "4"),
+                ("moriio_write_dispatch", "Concurrent"),
             ],
         );
         assert_eq!(
@@ -456,6 +547,7 @@ mod tests {
                 handshake_port: 7301,
                 notify_port: 62005,
                 tp_size: Some(4),
+                concurrent_write: true,
             })
         );
     }
@@ -470,6 +562,10 @@ mod tests {
             vec![("moriio_mode", "read"), ("moriio_notify_port", "abc")],
             vec![("moriio_mode", "read"), ("moriio_handshake_port", "0")],
             vec![("moriio_mode", "read"), ("tp_size", "0")],
+            vec![
+                ("moriio_mode", "write"),
+                ("moriio_write_dispatch", "parallel"),
+            ],
         ] {
             let worker = moriio_worker("http://decode:8200", &labels);
             assert!(
@@ -492,6 +588,7 @@ mod tests {
             handshake_port: 6301,
             notify_port: 61005,
             tp_size: Some(4),
+            concurrent_write: false,
         };
         let read: Value = serde_json::from_str(&moriio_prefill_params("tx-1", &decode)).unwrap();
         assert_eq!(
@@ -539,6 +636,7 @@ mod tests {
             handshake_port,
             notify_port,
             tp_size: None,
+            concurrent_write: false,
         };
         let remote = endpoint("10.0.0.1", 6301, 61005);
         for (prefill, decode, refused) in [
@@ -546,6 +644,8 @@ mod tests {
             (&remote, endpoint("127.0.0.1", 6301, 61005), true),
             (&remote, endpoint("localhost", 7301, 62005), true),
             (&remote, endpoint("[::1]", 7301, 62005), true),
+            (&remote, endpoint("0.0.0.0", 7301, 62005), true),
+            (&remote, endpoint("[::]", 7301, 62005), true),
             (&remote, endpoint("10.0.0.1", 6301, 62005), true),
             (&remote, endpoint("10.0.0.1", 7301, 61005), true),
             (&remote, endpoint("10.0.0.1", 7301, 62005), false),
@@ -559,11 +659,107 @@ mod tests {
                 endpoint("127.0.0.1", 6301, 62005),
                 true,
             ),
+            // A sequential decode leg reaches the prefill at the side channel
+            // the prefill reports in its handoff ...
+            (
+                &endpoint("127.0.0.1", 6301, 61005),
+                endpoint("10.0.0.2", 6301, 61005),
+                false,
+            ),
+            // ... a concurrent one at the side channel named here.
+            (
+                &endpoint("127.0.0.1", 6301, 61005),
+                MoriIoEndpoint {
+                    concurrent_write: true,
+                    ..endpoint("10.0.0.2", 6301, 61005)
+                },
+                true,
+            ),
+            (
+                &endpoint("0.0.0.0", 6301, 61005),
+                MoriIoEndpoint {
+                    concurrent_write: true,
+                    ..endpoint("10.0.0.2", 6301, 61005)
+                },
+                true,
+            ),
+            (
+                &endpoint("0.0.0.0", 6301, 61005),
+                endpoint("10.0.0.2", 6301, 61005),
+                false,
+            ),
         ] {
             assert_eq!(
                 moriio_write_target_error(prefill, &decode).is_some(),
                 refused,
                 "{prefill:?} -> {decode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn moriio_decode_params_name_the_prefill_side_channel() {
+        let mut prefill = MoriIoEndpoint {
+            transfer: MoriIoTransfer::Write,
+            host: "10.0.0.1".to_string(),
+            handshake_port: 7301,
+            notify_port: 62005,
+            tp_size: None,
+            concurrent_write: false,
+        };
+        let params: Value = serde_json::from_str(&moriio_decode_params("tx-1", &prefill)).unwrap();
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "do_remote_decode": false,
+                "do_remote_prefill": true,
+                "remote_engine_id": null,
+                "remote_block_ids": null,
+                "transfer_id": "tx-1",
+                "remote_dp_size": 1,
+                "remote_host": "10.0.0.1",
+                "remote_handshake_port": 7301,
+                "remote_notify_port": 62005,
+            })
+        );
+        prefill.tp_size = Some(8);
+        let labeled: Value = serde_json::from_str(&moriio_decode_params("tx-2", &prefill)).unwrap();
+        assert_eq!(labeled.get("remote_tp_size"), Some(&Value::from(8)));
+    }
+
+    #[test]
+    fn moriio_handoff_must_name_the_side_channel_the_decode_was_told() {
+        let prefill = MoriIoEndpoint {
+            transfer: MoriIoTransfer::Write,
+            host: "10.0.0.1".to_string(),
+            handshake_port: 6301,
+            notify_port: 61005,
+            tp_size: None,
+            concurrent_write: false,
+        };
+        let handoff = |handshake: Value, notify: Value| {
+            let params = serde_json::json!({
+                "do_remote_prefill": true, "remote_host": "10.0.0.1",
+                "remote_handshake_port": handshake, "remote_notify_port": notify,
+            });
+            RawValue::from_string(params.to_string()).unwrap()
+        };
+        for (handshake, notify, mismatch) in [
+            // A vLLM 0.30.1rc1 producer reports its configured ports as strings,
+            // the same at TP1 and TP8.
+            (Value::from("6301"), Value::from("61005"), false),
+            (Value::from(6301), Value::from(61005), false),
+            (Value::from("6301"), Value::from("61006"), true),
+            (Value::from("7301"), Value::from("61005"), true),
+            (Value::from("6301"), Value::from("abc"), true),
+            (Value::from("6301"), Value::Null, true),
+        ] {
+            let error =
+                moriio_side_channel_error(&handoff(handshake.clone(), notify.clone()), &prefill);
+            assert_eq!(
+                error.is_some(),
+                mismatch,
+                "{handshake} / {notify}: {error:?}"
             );
         }
     }
