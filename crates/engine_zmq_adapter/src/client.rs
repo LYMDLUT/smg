@@ -36,8 +36,9 @@ use crate::{
     },
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
-        translate_media, translate_request_with_media, translated_from_processed, ProcessedMedia,
-        StructuredOutputsBackendConfig, TranslatedMedia, VllmGenerateStream,
+        refuse_greedy_choices, translate_media, translate_request_with_media,
+        translated_from_processed, ProcessedMedia, StructuredOutputsBackendConfig, TranslatedMedia,
+        VllmGenerateStream,
     },
 };
 
@@ -431,7 +432,21 @@ impl ZmqEngineClient {
         // and the dtype casts of multi-megabyte tensors would otherwise hold a
         // worker thread per request, starving token forwarding and health.
         let media = if let Some(processed) = processed {
-            translated_from_processed(&req, processed).map_err(tonic::Status::invalid_argument)?
+            if processed.is_batches() {
+                let (returned, media) = tokio::task::spawn_blocking(move || {
+                    let media = translated_from_processed(&req, processed, model_dtype);
+                    (req, media)
+                })
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!("multimodal translation failed: {error}"))
+                })?;
+                req = returned;
+                media.map_err(tonic::Status::invalid_argument)?
+            } else {
+                translated_from_processed(&req, processed, model_dtype)
+                    .map_err(tonic::Status::invalid_argument)?
+            }
         } else if has_media(&req) {
             let (returned, media) = tokio::task::spawn_blocking(move || {
                 let media = translate_media(&mut req, model_dtype);
@@ -447,6 +462,10 @@ impl ZmqEngineClient {
             TranslatedMedia::default()
         };
         let structured_backend = self.meta.structured_outputs_backend.get().copied();
+        // On the request's own `n`: every sub below carries `n = 1`.
+        if let Some(sp) = req.sampling_params.as_ref() {
+            refuse_greedy_choices(sp).map_err(tonic::Status::invalid_argument)?;
+        }
         let subs = fan_out_requests(req);
         let last = subs.len().saturating_sub(1);
         let mut media = Some(media);

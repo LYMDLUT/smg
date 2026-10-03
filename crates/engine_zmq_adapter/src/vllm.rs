@@ -488,33 +488,91 @@ pub(crate) struct TranslatedMedia {
     pub(crate) cache_salt: Option<String>,
 }
 
-/// Media processed worker-side by vLLM's own input processor (the servicer's
-/// `media_refs` path): the request's `mm_features` as vLLM's `MsgpackEncoder`
-/// wrote them, relayed to the engine as is.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ProcessedMedia {
-    /// The encoder's primary buffer for `mm_features`; `None` when the
-    /// processed request carries no features.
-    pub mm_features: Option<Bytes>,
-    /// The encoder's aux buffers in order: tensors over the zero-copy
-    /// threshold, referenced from the primary buffer by index (1-based).
-    pub aux_frames: Vec<Bytes>,
-    pub cache_salt: Option<String>,
+/// Media processed worker-side (the servicer's `media_refs` path), in the
+/// shape the processor's pipeline makes it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProcessedMedia {
+    /// vLLM's own input processor ran: the request's `mm_features` as vLLM's
+    /// `MsgpackEncoder` wrote them, relayed to the engine as is.
+    Encoded {
+        /// The encoder's primary buffer; `None` when the processed request
+        /// carries no features.
+        mm_features: Option<Bytes>,
+        /// The encoder's aux buffers in order: tensors over the zero-copy
+        /// threshold, referenced from the primary buffer by index (1-based).
+        aux_frames: Vec<Bytes>,
+        cache_salt: Option<String>,
+    },
+    /// smg's own pipeline ran: the batches a Router request would carry,
+    /// translated for the engine the same way.
+    Batches(Vec<vllm::MultimodalInputs>),
+}
+
+impl Default for ProcessedMedia {
+    fn default() -> Self {
+        Self::Encoded {
+            mm_features: None,
+            aux_frames: Vec::new(),
+            cache_salt: None,
+        }
+    }
 }
 
 impl ProcessedMedia {
-    fn into_translated(self) -> Result<TranslatedMedia, String> {
-        let mm_features = self
-            .mm_features
-            .map(|bytes| decode_value(&bytes).map(MmFeaturesPayload::Raw))
-            .transpose()
-            .map_err(|error| format!("processed mm_features are not msgpack: {error}"))?;
-        Ok(TranslatedMedia {
-            mm_features,
-            aux_frames: self.aux_frames,
-            cache_salt: self.cache_salt,
-        })
+    /// Whether translating this means casting and splitting tensors, work
+    /// for a blocking thread.
+    pub fn is_batches(&self) -> bool {
+        matches!(self, Self::Batches(_))
     }
+
+    fn into_translated(
+        self,
+        req: &vllm::GenerateRequest,
+        model_dtype: ModelDtype,
+    ) -> Result<TranslatedMedia, String> {
+        match self {
+            Self::Encoded {
+                mm_features,
+                aux_frames,
+                cache_salt,
+            } => {
+                let mm_features = mm_features
+                    .map(|bytes| decode_value(&bytes).map(MmFeaturesPayload::Raw))
+                    .transpose()
+                    .map_err(|error| format!("processed mm_features are not msgpack: {error}"))?;
+                Ok(TranslatedMedia {
+                    mm_features,
+                    aux_frames,
+                    cache_salt,
+                })
+            }
+            Self::Batches(batches) => translate_batches_for(req, batches, model_dtype),
+        }
+    }
+}
+
+/// The per-item split and dtype cast of Router-shaped batches, for a request
+/// whose prompt already carries the expanded placeholders.
+fn translate_batches_for(
+    req: &vllm::GenerateRequest,
+    batches: Vec<vllm::MultimodalInputs>,
+    model_dtype: ModelDtype,
+) -> Result<TranslatedMedia, String> {
+    if batches.is_empty() {
+        return Ok(TranslatedMedia::default());
+    }
+    let has_kv_transfer = kv_transfer_params(req)?.is_some();
+    let (mm_features, cache_salt) = multimodal::translate_batches(
+        batches,
+        prompt_token_ids(req)?,
+        model_dtype,
+        has_kv_transfer,
+    )?;
+    Ok(TranslatedMedia {
+        mm_features: mm_features.map(MmFeaturesPayload::Typed),
+        aux_frames: Vec::new(),
+        cache_salt,
+    })
 }
 
 /// Whether the request carries multimodal batches to translate.
@@ -551,18 +609,7 @@ pub(crate) fn translate_media(
     if batches.is_empty() {
         return Ok(TranslatedMedia::default());
     }
-    let has_kv_transfer = kv_transfer_params(req)?.is_some();
-    let (mm_features, cache_salt) = multimodal::translate_batches(
-        batches,
-        prompt_token_ids(req)?,
-        model_dtype,
-        has_kv_transfer,
-    )?;
-    Ok(TranslatedMedia {
-        mm_features: mm_features.map(MmFeaturesPayload::Typed),
-        aux_frames: Vec::new(),
-        cache_salt,
-    })
+    translate_batches_for(req, batches, model_dtype)
 }
 
 /// The media of a request whose `media_refs` a worker-side processor already
@@ -570,6 +617,7 @@ pub(crate) fn translate_media(
 pub(crate) fn translated_from_processed(
     req: &vllm::GenerateRequest,
     processed: ProcessedMedia,
+    model_dtype: ModelDtype,
 ) -> Result<TranslatedMedia, String> {
     if has_media(req) {
         return Err(
@@ -578,7 +626,7 @@ pub(crate) fn translated_from_processed(
                 .to_string(),
         );
     }
-    processed.into_translated()
+    processed.into_translated(req, model_dtype)
 }
 
 /// [`translate_request`] with the grammar backend configured for the engine
@@ -767,6 +815,19 @@ pub(crate) fn translate_sampling(
 /// checks run here, and a bad request is an `invalid_argument` to its caller
 /// rather than an outage. Zero `top_p`/`repetition_penalty` are the proto's
 /// "unset" and are normalized to 1.0 by the translation, so they pass.
+/// vLLM's `_verify_greedy_sampling`: greedy decoding (temperature below its
+/// sampling epsilon) cannot yield distinct choices. Checked on the request's
+/// own `n`, before the fan-out hands each choice `n = 1`.
+pub(crate) fn refuse_greedy_choices(sp: &vllm::SamplingParams) -> Result<(), String> {
+    if sp.temperature.is_some_and(|temperature| temperature < 1e-5) && sp.n > 1 {
+        return Err(format!(
+            "n must be 1 when using greedy sampling, got {}.",
+            sp.n
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> Result<(), String> {
     if let Some(temperature) = sp.temperature {
         if !temperature.is_finite() || temperature < 0.0 {
@@ -774,14 +835,7 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
                 "temperature must be a finite non-negative number, got {temperature}"
             ));
         }
-        // vLLM's `_verify_greedy_sampling`: greedy decoding (temperature
-        // below its sampling epsilon) cannot yield distinct choices.
-        if temperature < 1e-5 && sp.n > 1 {
-            return Err(format!(
-                "n must be 1 when using greedy sampling, got {}.",
-                sp.n
-            ));
-        }
+        refuse_greedy_choices(sp)?;
     }
     if sp.top_p != 0.0 && !(sp.top_p > 0.0 && sp.top_p <= 1.0) {
         return Err(format!("top_p must be in (0, 1], got {}", sp.top_p));
