@@ -81,17 +81,20 @@ pub(crate) async fn prepare_chat_like(
 
         // Resolve media-part ordering from the model registry so it stays owned
         // by the per-model spec. Falls back to vLLM-compatible media-first when
-        // the model has no multimodal components or matches no spec. A request
-        // without media parts has nothing to order, so it skips the tokenizer
-        // and model-config lookups the resolution needs.
+        // the model has no multimodal components or matches no spec. The
+        // resolution needs the tokenizer and model-config lookups, so it is
+        // skipped when no message carries a part the ordering could move
+        // (media parts in any role; the plan alone misses assistant turns).
         let model_id = ctx.input.model_id.as_str();
-        let tokenizer_entry = if media_plan.is_empty() {
-            None
-        } else {
+        let needs_media_order =
+            !media_plan.is_empty() || utils::chat_has_media_parts(&request.messages);
+        let tokenizer_entry = if needs_media_order {
             ctx.components
                 .tokenizer_registry
                 .get_by_name(model_id)
                 .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id))
+        } else {
+            None
         };
         let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
             (Some(mm_components), Some(entry)) => {
