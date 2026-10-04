@@ -7,9 +7,13 @@ use tracing_appender::{
     non_blocking::WorkerGuard,
     rolling::{RollingFileAppender, Rotation},
 };
-use tracing_log::LogTracer;
+use tracing_log::{AsLog, LogTracer};
 use tracing_subscriber::{
-    fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    filter::{LevelFilter, Targets},
+    fmt::time::ChronoUtc,
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    EnvFilter, Layer, Registry,
 };
 
 use super::otel_trace::get_otel_layer;
@@ -121,24 +125,85 @@ fn build_workspace_filter(level_filter: &str) -> String {
     filter
 }
 
-pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig>) -> LogGuard {
-    let _ = LogTracer::init();
+/// The global log filter layer: [`Targets`] when the directives allow it, else [`EnvFilter`].
+type FilterLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 
+/// `Targets` for `directives` (`target=level,...`) when it reads them exactly as
+/// `EnvFilter` would, else `None`.
+///
+/// Callers validate the string with `EnvFilter` first, so this only has to rule
+/// out the forms the two parsers read differently: `EnvFilter` drops empty
+/// items where `Targets` makes an empty target at TRACE that matches everything;
+/// span and field syntax (`target[span]=level`, `target[{field}]=level`) is a
+/// literal target to `Targets`; and an empty level (`target=`) is TRACE to
+/// `EnvFilter` but ERROR to `Targets`.
+fn targets_for(directives: &str) -> Option<Targets> {
+    let items: Vec<&str> = directives
+        .split(',')
+        .filter(|item| !item.is_empty())
+        .collect();
+    if items.is_empty()
+        || items
+            .iter()
+            .any(|item| item.contains(['[', '{']) || item.ends_with('='))
+    {
+        return None;
+    }
+    items.join(",").parse::<Targets>().ok()
+}
+
+/// Parse `directives` into the cheapest filter that can express them.
+///
+/// `EnvFilter` decides whether the string is valid, exactly as before: a string
+/// it rejects yields `None` and the caller falls back to the configured level.
+/// When it accepts, `Targets` is preferred whenever it reads the string the same
+/// way (see [`targets_for`]): it is a static lookup with no per-span state, while
+/// `EnvFilter` keeps a `RwLock<HashMap<span::Id, _>>` that it reads on *every*
+/// span enter and exit, even when no span-matching directive exists. An enabled
+/// request span is entered once per polled response-body frame, so under
+/// streaming load that single lock becomes a cross-core cache-line ping-pong
+/// (61% of gateway CPU in `perf`, ~3.5x the CPU per streamed request).
+fn build_filter_layer(directives: &str) -> Option<FilterLayer> {
+    let env_filter = EnvFilter::try_new(directives).ok()?;
+    if let Some(targets) = targets_for(directives) {
+        return Some(Box::new(targets));
+    }
+    Some(Box::new(env_filter))
+}
+
+pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig>) -> LogGuard {
     let level_filter = level_to_str(config.level);
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        let filter_string = match &config.log_targets {
-            Some(targets) if !targets.is_empty() => build_filter_string(targets, level_filter),
-            _ => {
-                // Default: external deps at WARN, all workspace crates at configured level.
-                // This ensures logs from imported crates (tool_parser, kv_index, etc.)
-                // are visible while suppressing noisy external deps (hyper, h2, tonic, etc.).
-                build_workspace_filter(level_filter)
-            }
-        };
+    // RUST_LOG takes precedence (as `EnvFilter::try_from_default_env` did); an unset,
+    // empty, or invalid value falls through to the configured level/targets.
+    let filter_layer = std::env::var(EnvFilter::DEFAULT_ENV)
+        .ok()
+        .filter(|directives| !directives.trim().is_empty())
+        .and_then(|directives| build_filter_layer(&directives))
+        .unwrap_or_else(|| {
+            let filter_string = match &config.log_targets {
+                Some(targets) if !targets.is_empty() => build_filter_string(targets, level_filter),
+                _ => {
+                    // Default: external deps at WARN, all workspace crates at configured level.
+                    // This ensures logs from imported crates (tool_parser, kv_index, etc.)
+                    // are visible while suppressing noisy external deps (hyper, h2, tonic, etc.).
+                    build_workspace_filter(level_filter)
+                }
+            };
+            build_filter_layer(&filter_string)
+                .unwrap_or_else(|| Box::new(EnvFilter::new(filter_string)))
+        });
 
-        EnvFilter::new(filter_string)
-    });
+    // Cap the `log` facade at the filter's most verbose level. A bare
+    // `LogTracer::init()` leaves `log::max_level()` at TRACE, so every
+    // `log::trace!`/`debug!` in a dependency (the `tokenizers` normalizer and
+    // pre-tokenizer emit them on each encode) builds a record and round-trips
+    // through the tracing dispatcher only to be dropped there.
+    let log_max_level = filter_layer
+        .max_level_hint()
+        .unwrap_or(LevelFilter::TRACE)
+        .as_log();
+    let _ = LogTracer::builder().with_max_level(log_max_level).init();
 
     let mut layers = Vec::with_capacity(3);
 
@@ -212,11 +277,94 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
     }
 
     let _ = tracing_subscriber::registry()
-        .with(env_filter)
+        .with(filter_layer)
         .with(layers)
         .try_init();
 
     LogGuard {
         _file_guard: file_guard,
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use tracing::Level;
+
+    use super::*;
+
+    fn targets(directives: &str) -> Targets {
+        targets_for(directives).unwrap_or_else(|| panic!("{directives:?} must use Targets"))
+    }
+
+    fn hint(directives: &str) -> Option<LevelFilter> {
+        build_filter_layer(directives).and_then(|layer| layer.max_level_hint())
+    }
+
+    #[test]
+    fn plain_target_levels_use_targets() {
+        let targets = targets("warn,smg=info");
+        assert!(targets.would_enable("smg", &Level::INFO));
+        assert!(!targets.would_enable("smg", &Level::DEBUG));
+        assert!(targets.would_enable("hyper", &Level::WARN));
+        assert!(!targets.would_enable("hyper", &Level::INFO));
+        assert_eq!(targets.default_level(), Some(LevelFilter::WARN));
+    }
+
+    #[test]
+    fn env_filter_decides_validity() {
+        // Whatever `EnvFilter` rejected before this change is still rejected,
+        // whether or not `Targets` would have taken it (`*smg=debug`, ` smg=debug`).
+        for directives in [
+            "warn,smg=info",
+            "warn,",
+            "warn, smg=debug",
+            "*smg=debug",
+            " , ",
+            "info",
+            "smg[request]=debug",
+            "warn,smg=",
+        ] {
+            assert_eq!(
+                build_filter_layer(directives).is_some(),
+                EnvFilter::try_new(directives).is_ok(),
+                "{directives:?}"
+            );
+        }
+        assert!(targets_for("*smg=debug").is_none() || build_filter_layer("*smg=debug").is_none());
+    }
+
+    #[test]
+    fn forms_the_parsers_read_differently_stay_with_env_filter() {
+        for directives in ["smg[request]=debug", "warn,smg[{model}]=trace", "warn,smg="] {
+            assert!(
+                targets_for(directives).is_none(),
+                "{directives:?} must not be parsed as Targets"
+            );
+            assert!(
+                build_filter_layer(directives).is_some(),
+                "{directives:?} must still produce an EnvFilter"
+            );
+        }
+        // `EnvFilter` reads an empty level as TRACE; `Targets` would have read ERROR.
+        assert_eq!(hint("warn,smg="), Some(LevelFilter::TRACE));
+    }
+
+    #[test]
+    fn a_trailing_comma_is_not_an_empty_target() {
+        let trailing = targets("warn,");
+        assert_eq!(trailing.default_level(), Some(LevelFilter::WARN));
+        assert_eq!(
+            trailing.iter().count(),
+            0,
+            "no per-target directive, let alone an empty one"
+        );
+        assert!(!trailing.would_enable("hyper", &Level::INFO));
+    }
+
+    #[test]
+    fn log_cap_follows_the_most_verbose_directive() {
+        assert_eq!(hint("warn,smg=info"), Some(LevelFilter::INFO));
+        assert_eq!(hint("warn,smg=debug,"), Some(LevelFilter::DEBUG));
+        assert_eq!(hint("error"), Some(LevelFilter::ERROR));
     }
 }
