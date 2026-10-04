@@ -394,7 +394,6 @@ impl StreamingProcessor {
 
         // Phase 1: Initialize state tracking (per-index for n>1 support)
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
-        let mut stream_buffers: HashMap<u32, String> = HashMap::new();
         let mut finish_reasons: HashMap<u32, String> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<Value>> = HashMap::new();
         // Indices whose local stop decoder fired: their finish reason is pinned
@@ -650,9 +649,6 @@ impl StreamingProcessor {
                 continue;
             };
 
-            // Initialize stream buffer if first time
-            let stream_buffer = stream_buffers.entry(index).or_default();
-
             // Send first chunk with role
             if is_firsts.get(&index).copied().unwrap_or(true) {
                 let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
@@ -670,7 +666,6 @@ impl StreamingProcessor {
 
             // Calculate delta
             let mut delta = text;
-            stream_buffer.push_str(&delta);
 
             // Reasoning content handling
             let in_reasoning = if separate_reasoning && reasoning_parser_available {
