@@ -1370,8 +1370,21 @@ async fn execute_sequential_pd(
     // path for the same invariant).
     let decode_stream = decode_stream.defer_abort_until_first_item();
 
-    Ok(ExecutionResult::Single {
-        stream: decode_stream,
+    // Surface the PD shape (not `Single`) so the streaming layer anchors TTFT
+    // at prefill dispatch. Without this, the decode stream is established only
+    // after prefill completes, and — because the servicer flushes response
+    // headers lazily with the first message — the first decode chunk is
+    // already buffered when the stream task starts, so a task-local timer
+    // measures ~0. The prefill stream is fully drained and its load guard
+    // already released, so the prefill leg carries no live guard.
+    Ok(ExecutionResult::PrefillDecode {
+        prefill: prefill_stream,
+        decode: Box::new(decode_stream),
+        prefill_guards: vec![None],
+        pd_timing: PdTiming {
+            prefill_start,
+            runtime,
+        },
     })
 }
 
