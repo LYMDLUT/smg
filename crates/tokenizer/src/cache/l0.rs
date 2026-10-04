@@ -21,7 +21,7 @@
 
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc,
+    Arc, PoisonError, RwLock,
 };
 
 use dashmap::DashMap;
@@ -61,6 +61,11 @@ pub struct L0Cache {
     /// capacity check runs on every insert.
     len_plain: AtomicUsize,
     len_special: AtomicUsize,
+    /// Keeps each map mutation and its counter update atomic with respect to
+    /// `clear()`: inserts and evictions hold it shared, `clear()` exclusive.
+    /// Uncontended in steady state; only `clear()` (tests, benches) takes it
+    /// exclusively.
+    mutation: RwLock<()>,
     /// Cache hit counter
     hits: AtomicU64,
     /// Cache miss counter
@@ -79,6 +84,7 @@ impl L0Cache {
             max_entries,
             len_plain: AtomicUsize::new(0),
             len_special: AtomicUsize::new(0),
+            mutation: RwLock::new(()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             access_counter: AtomicU64::new(0),
@@ -165,13 +171,7 @@ impl L0Cache {
 
             if let Some(k) = key_to_remove {
                 if victim_map.remove(&k).is_some() {
-                    // Saturating: `clear()` may have zeroed the counter between
-                    // the removal above and this decrement.
-                    let _ = self.len_for(victim_special).fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |len| Some(len.saturating_sub(1)),
-                    );
+                    self.len_for(victim_special).fetch_sub(1, Ordering::Relaxed);
                     L0.evict();
                 }
             }
@@ -180,6 +180,7 @@ impl L0Cache {
 
     /// Insert an encoding into the cache
     pub fn insert(&self, key: String, add_special_tokens: bool, value: Encoding) {
+        let _mutation = self.mutation.read().unwrap_or_else(PoisonError::into_inner);
         self.maybe_evict();
         let ts = self.next_timestamp();
         let entry = CachedEntry {
@@ -196,14 +197,9 @@ impl L0Cache {
         }
     }
 
-    /// Get the current number of entries in the cache
-    /// Number of cached entries. The counters are maintained by `insert`,
-    /// eviction and `clear`; an insert racing with `clear` can leave them a
-    /// few entries off, which only moves the point where eviction starts.
+    /// Number of cached entries, maintained by `insert`, eviction and `clear`.
     pub fn len(&self) -> usize {
-        self.len_plain
-            .load(Ordering::Relaxed)
-            .saturating_add(self.len_special.load(Ordering::Relaxed))
+        self.len_plain.load(Ordering::Relaxed) + self.len_special.load(Ordering::Relaxed)
     }
 
     /// Check if the cache is empty
@@ -231,6 +227,10 @@ impl L0Cache {
 
     /// Clear the cache
     pub fn clear(&self) {
+        let _mutation = self
+            .mutation
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         self.map_plain.clear();
         self.map_special.clear();
         self.len_plain.store(0, Ordering::Relaxed);
