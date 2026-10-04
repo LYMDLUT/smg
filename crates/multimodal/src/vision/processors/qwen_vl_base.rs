@@ -1110,6 +1110,18 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         images: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        let borrowed: Vec<&DynamicImage> = images.iter().collect();
+        self.preprocess_borrowed(&borrowed, config)
+    }
+
+    /// The image pipeline proper. It only reads the images (plan, resize into
+    /// a new buffer, patchify), so callers that already own decoded pixels
+    /// lend them instead of copying.
+    fn preprocess_borrowed(
+        &self,
+        images: &[&DynamicImage],
+        config: &PreProcessorConfig,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
@@ -1205,6 +1217,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
                 .zip(errors.iter_mut())
             {
                 scope.spawn(move |_| {
+                    let image: &DynamicImage = image;
                     // BICUBIC (Qwen default) uses the PIL-compatible path; other
                     // filters keep the SIMD path.
                     let resized;
