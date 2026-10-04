@@ -20,7 +20,7 @@
 //! On eviction, we sample a few entries and remove the least-recently-used one.
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -57,6 +57,10 @@ pub struct L0Cache {
     map_special: Arc<DashMap<String, CachedEntry>>,
     /// Maximum number of entries (across both maps) before eviction
     max_entries: usize,
+    /// Entry counts per map. `DashMap::len()` read-locks every shard, and the
+    /// capacity check runs on every insert.
+    len_plain: AtomicUsize,
+    len_special: AtomicUsize,
     /// Cache hit counter
     hits: AtomicU64,
     /// Cache miss counter
@@ -73,6 +77,8 @@ impl L0Cache {
             map_plain: Arc::new(DashMap::with_capacity(per_map)),
             map_special: Arc::new(DashMap::with_capacity(per_map)),
             max_entries,
+            len_plain: AtomicUsize::new(0),
+            len_special: AtomicUsize::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             access_counter: AtomicU64::new(0),
@@ -89,6 +95,15 @@ impl L0Cache {
     }
 
     /// Get the next monotonic timestamp for access tracking.
+    #[inline]
+    fn len_for(&self, add_special_tokens: bool) -> &AtomicUsize {
+        if add_special_tokens {
+            &self.len_special
+        } else {
+            &self.len_plain
+        }
+    }
+
     #[inline]
     fn next_timestamp(&self) -> u64 {
         self.access_counter.fetch_add(1, Ordering::Relaxed)
@@ -124,11 +139,9 @@ impl L0Cache {
     /// behavior in practice.
     fn maybe_evict(&self) {
         if self.len() >= self.max_entries {
-            let victim_map = if self.map_plain.len() >= self.map_special.len() {
-                &self.map_plain
-            } else {
-                &self.map_special
-            };
+            let victim_special =
+                self.len_special.load(Ordering::Relaxed) > self.len_plain.load(Ordering::Relaxed);
+            let victim_map = self.map_for(victim_special);
 
             // Sample up to EVICTION_SAMPLE_SIZE entries and find the oldest.
             // Scope the iterator so all DashMap shard read-locks are released
@@ -152,6 +165,7 @@ impl L0Cache {
 
             if let Some(k) = key_to_remove {
                 if victim_map.remove(&k).is_some() {
+                    self.len_for(victim_special).fetch_sub(1, Ordering::Relaxed);
                     L0.evict();
                 }
             }
@@ -166,17 +180,24 @@ impl L0Cache {
             encoding: Arc::new(value),
             last_accessed: AtomicU64::new(ts),
         };
-        self.map_for(add_special_tokens).insert(key, entry);
+        if self
+            .map_for(add_special_tokens)
+            .insert(key, entry)
+            .is_none()
+        {
+            self.len_for(add_special_tokens)
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Get the current number of entries in the cache
     pub fn len(&self) -> usize {
-        self.map_plain.len() + self.map_special.len()
+        self.len_plain.load(Ordering::Relaxed) + self.len_special.load(Ordering::Relaxed)
     }
 
     /// Check if the cache is empty
     pub fn is_empty(&self) -> bool {
-        self.map_plain.is_empty() && self.map_special.is_empty()
+        self.len() == 0
     }
 
     /// Get cache statistics
@@ -201,6 +222,8 @@ impl L0Cache {
     pub fn clear(&self) {
         self.map_plain.clear();
         self.map_special.clear();
+        self.len_plain.store(0, Ordering::Relaxed);
+        self.len_special.store(0, Ordering::Relaxed);
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
         self.access_counter.store(0, Ordering::Relaxed);
