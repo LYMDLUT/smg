@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex, PoisonError},
 };
 
 use anyhow::{Error, Result};
@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use tiktoken_rs::{
     cl100k_base, o200k_base, p50k_base, p50k_edit, r50k_base,
     tokenizer::{get_tokenizer, Tokenizer},
-    CoreBPE, DecodeKeyError,
+    CoreBPE,
 };
 
 use crate::{
@@ -182,6 +182,11 @@ pub struct TiktokenTokenizer {
     /// Shared so a deferred chat encode can own a handle and run on another
     /// thread after the render call returned.
     tokenizer: Arc<CoreBPE>,
+    /// Every special token, as the allowed set `CoreBPE::encode` takes.
+    /// `encode_with_special_tokens` rebuilds this set from the vocabulary on
+    /// every call (hundreds of entries for Kimi), so it is built once per
+    /// tokenizer from the strings in [`SPECIAL_TOKEN_STRINGS`].
+    allowed_special: HashSet<&'static str>,
     special_tokens: SpecialTokens,
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
@@ -244,6 +249,7 @@ impl TiktokenTokenizer {
         };
 
         Ok(TiktokenTokenizer {
+            allowed_special: allowed_special_set(&tokenizer),
             tokenizer,
             special_tokens,
             vocab: HashMap::new(),
@@ -358,6 +364,7 @@ impl TiktokenTokenizer {
         let renderer = detect_renderer_from_config(dir);
 
         Ok(TiktokenTokenizer {
+            allowed_special: allowed_special_set(&tokenizer),
             tokenizer,
             special_tokens: config.special_tokens,
             vocab,
@@ -539,13 +546,47 @@ fn encode_segments(bpe: &CoreBPE, segments: &[PromptSegment]) -> Result<Vec<Toke
     Ok(ids)
 }
 
+/// Special-token strings shared by every tiktoken tokenizer in the process.
+///
+/// `CoreBPE::encode` takes its allowed set as `HashSet<&str>` and the set has
+/// to outlive every encode, so the strings are leaked. Tokenizers are loaded
+/// again under a fresh id on every worker registration, so a per-load leak
+/// would grow with worker churn; instead each distinct string is leaked once
+/// and later loads look it up here. The total is bounded by the number of
+/// distinct special-token strings ever loaded (a few hundred per
+/// vocabulary), not by the number of loads.
+static SPECIAL_TOKEN_STRINGS: LazyLock<Mutex<HashSet<&'static str>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// The allowed-special set for `bpe`: its special tokens, as the interned
+/// `&'static str`s of [`SPECIAL_TOKEN_STRINGS`].
+fn allowed_special_set(bpe: &CoreBPE) -> HashSet<&'static str> {
+    let mut interned = SPECIAL_TOKEN_STRINGS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    bpe.special_tokens()
+        .into_iter()
+        .map(|token| match interned.get(token) {
+            Some(&existing) => existing,
+            None => {
+                let leaked: &'static str = Box::leak(token.to_owned().into_boxed_str());
+                interned.insert(leaked);
+                leaked
+            }
+        })
+        .collect()
+}
+
 impl Encoder for TiktokenTokenizer {
     fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
         // tiktoken ignores `add_special_tokens` (it means BOS/EOS prepend on HF
         // backends, which tiktoken has no concept of) and always recognizes
         // special-token patterns, so chat-template tokens like <|media_pad|> stay
         // atomic instead of splitting into BPE sub-tokens.
-        let tokens = self.tokenizer.encode_with_special_tokens(input);
+        let (tokens, _) = self
+            .tokenizer
+            .encode(input, &self.allowed_special)
+            .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
         Ok(Encoding::Tiktoken(tokens))
     }
 
@@ -570,37 +611,26 @@ impl Decoder for TiktokenTokenizer {
         } else {
             token_ids
         };
-        match self.tokenizer.decode(token_ids) {
-            Ok(text) => Ok(text),
-            Err(err) if is_unknown_tiktoken_decode_error(&err) => Err(Error::msg(format!(
+        let bytes = self.tokenizer.decode_bytes(token_ids).map_err(|err| {
+            Error::msg(format!(
                 "tiktoken decode failed for unknown token id: {err}"
-            ))),
+            ))
+        })?;
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            // A multi-byte character split across tokens. Routine while
+            // streaming (every CJK character or emoji whose bytes span two
+            // tokens), so no warning and no second decode: the same bytes go
+            // through the lossy conversion.
             Err(err) => {
-                // Fallback to lossy decoding for incomplete UTF-8 sequences
-                let bytes: Vec<u8> = self
-                    .tokenizer
-                    ._decode_native_and_split(token_ids.to_vec())
-                    .flatten()
-                    .collect();
-                tracing::warn!(
-                    error = %err,
+                tracing::debug!(
                     token_count = token_ids.len(),
-                    "tiktoken decode failed; returning lossy UTF-8 fallback"
+                    "tiktoken decode: incomplete UTF-8 sequence, lossy fallback"
                 );
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
+                Ok(String::from_utf8_lossy(err.as_bytes()).into_owned())
             }
         }
     }
-}
-
-/// Detect tiktoken's "unknown token id" error so we can surface a clean error
-/// instead of letting the lossy-decode fallback panic on a missing key.
-///
-/// `CoreBPE::decode` surfaces a missing-token id as a `DecodeKeyError` (now
-/// re-exported as of tiktoken-rs 0.12), while UTF-8 failures arrive as a plain
-/// string error — so a typed `downcast_ref` cleanly separates the two cases.
-fn is_unknown_tiktoken_decode_error(err: &Error) -> bool {
-    err.downcast_ref::<DecodeKeyError>().is_some()
 }
 
 impl TokenizerTrait for TiktokenTokenizer {
@@ -807,6 +837,23 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn special_token_strings_are_interned_across_loads() {
+        let first = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("load");
+        let second = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("load again");
+        assert!(!first.allowed_special.is_empty());
+        assert_eq!(first.allowed_special, second.allowed_special);
+        assert_eq!(
+            first.allowed_special.len(),
+            first.tokenizer.special_tokens().len()
+        );
+        // The second load reuses the first load's leaked strings.
+        for token in &first.allowed_special {
+            let again = second.allowed_special.get(token).expect("same token");
+            assert!(std::ptr::eq(*token, *again), "{token:?} was leaked twice");
+        }
+    }
+
     use super::*;
     use crate::traits::{Decoder, Encoder, Tokenizer};
 
