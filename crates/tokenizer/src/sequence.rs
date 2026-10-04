@@ -158,10 +158,13 @@ impl Sequence {
 
     /// Append a single token to the sequence and return newly decoded text.
     ///
-    /// Delegates to `Decoder::decode_step` on the tokenizer trait. For HuggingFace
-    /// tokenizers this uses the native `step_decode_stream`; other backends use the
-    /// default double-decode fallback. Both paths handle token draining and prefix
-    /// caching internally.
+    /// When the tokenizer provides an [`IncrementalDecoder`] (HuggingFace
+    /// tokenizers with a plain `ByteLevel` decoder: Qwen, Llama 3, GPT-2 style
+    /// vocabularies), the token goes through it and `token_ids()` / `text()`
+    /// do not track a decode window. Otherwise this delegates to
+    /// `Decoder::decode_step`: HuggingFace's native `step_decode_stream` for
+    /// its other decoders, the default double-decode algorithm for the rest;
+    /// both drain the retained ids and cache the prefix internally.
     #[inline]
     pub fn append_token(&mut self, token_id: TokenIdType) -> Result<String> {
         if let Some(decoder) = self.incremental.as_mut() {
@@ -189,7 +192,9 @@ impl Sequence {
         &self.tokenizer
     }
 
-    /// Get the current token ids in the buffer (sliding window, not full history)
+    /// Get the current token ids in the buffer (sliding window, not full history).
+    /// Empty, apart from any seed tokens, when the tokenizer provides its own
+    /// incremental decoder (see [`append_token`](Self::append_token)).
     #[inline]
     pub fn token_ids(&self) -> &[TokenIdType] {
         &self.token_ids
@@ -198,7 +203,8 @@ impl Sequence {
     /// Decode the current buffer to text.
     ///
     /// WARNING: after `append_token()` calls, this only decodes the sliding
-    /// window (retained tokens), not the full sequence history. Use the
+    /// window (retained tokens), not the full sequence history, and nothing
+    /// at all when the tokenizer provides its own incremental decoder. Use the
     /// incremental return values from `append_token()` to build the full text.
     pub fn text(&self) -> Result<String> {
         self.tokenizer

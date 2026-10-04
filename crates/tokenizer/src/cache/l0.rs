@@ -94,7 +94,6 @@ impl L0Cache {
         }
     }
 
-    /// Get the next monotonic timestamp for access tracking.
     #[inline]
     fn len_for(&self, add_special_tokens: bool) -> &AtomicUsize {
         if add_special_tokens {
@@ -104,6 +103,7 @@ impl L0Cache {
         }
     }
 
+    /// Get the next monotonic timestamp for access tracking.
     #[inline]
     fn next_timestamp(&self) -> u64 {
         self.access_counter.fetch_add(1, Ordering::Relaxed)
@@ -165,7 +165,13 @@ impl L0Cache {
 
             if let Some(k) = key_to_remove {
                 if victim_map.remove(&k).is_some() {
-                    self.len_for(victim_special).fetch_sub(1, Ordering::Relaxed);
+                    // Saturating: `clear()` may have zeroed the counter between
+                    // the removal above and this decrement.
+                    let _ = self.len_for(victim_special).fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |len| Some(len.saturating_sub(1)),
+                    );
                     L0.evict();
                 }
             }
@@ -191,8 +197,13 @@ impl L0Cache {
     }
 
     /// Get the current number of entries in the cache
+    /// Number of cached entries. The counters are maintained by `insert`,
+    /// eviction and `clear`; an insert racing with `clear` can leave them a
+    /// few entries off, which only moves the point where eviction starts.
     pub fn len(&self) -> usize {
-        self.len_plain.load(Ordering::Relaxed) + self.len_special.load(Ordering::Relaxed)
+        self.len_plain
+            .load(Ordering::Relaxed)
+            .saturating_add(self.len_special.load(Ordering::Relaxed))
     }
 
     /// Check if the cache is empty
