@@ -83,14 +83,21 @@ impl MessagePreparationStage {
             Some(filtered_tools.as_slice())
         };
 
+        // Resolve multimodal context once (see chat/preparation.rs for details).
+        let media_plan = multimodal::media_plan_messages(&request.messages);
+
         // Resolve media-part ordering from the model registry so /v1/messages
-        // renders each model consistently with /v1/chat/completions.
+        // renders each model consistently with /v1/chat/completions. Without
+        // media parts there is nothing to order, so the lookups are skipped.
         let model_id = ctx.input.model_id.as_str();
-        let tokenizer_entry = ctx
-            .components
-            .tokenizer_registry
-            .get_by_name(model_id)
-            .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
+        let tokenizer_entry = if media_plan.is_empty() {
+            None
+        } else {
+            ctx.components
+                .tokenizer_registry
+                .get_by_name(model_id)
+                .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id))
+        };
         let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
             (Some(mm_components), Some(entry)) => {
                 multimodal::resolve_media_part_order(
@@ -105,8 +112,6 @@ impl MessagePreparationStage {
             _ => llm_multimodal::MediaPartOrder::MediaFirst,
         };
 
-        // Resolve multimodal context once (see chat/preparation.rs for details).
-        let media_plan = multimodal::media_plan_messages(&request.messages);
         let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
             (None, None)
         } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
