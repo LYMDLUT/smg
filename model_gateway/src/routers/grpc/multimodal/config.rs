@@ -1,7 +1,12 @@
 //! Multimodal model configuration: the shared config-file registry and the
 //! per-router component bundle (media connector + processor/model registries).
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -36,12 +41,28 @@ pub(crate) struct MultimodalModelConfig {
 /// 2. Lazy-loaded from local disk / HF on first multimodal request.
 pub struct MultimodalConfigRegistry {
     configs: DashMap<String, Arc<MultimodalModelConfig>>,
+    /// Tokenizers whose last load failed, and when. A load is a directory
+    /// probe plus file reads, or a HuggingFace download attempt; without this
+    /// a model that has no config would pay for one on every request that
+    /// asks (text-only chat asks for the media-part order, for instance).
+    failed_loads: DashMap<String, Instant>,
+    /// How long a failed load is held before it is tried again.
+    failure_ttl: Duration,
 }
+
+/// How long `get_or_load` reports a failed load instead of retrying it.
+const LOAD_FAILURE_TTL: Duration = Duration::from_secs(30);
 
 impl MultimodalConfigRegistry {
     pub(crate) fn new() -> Self {
+        Self::with_failure_ttl(LOAD_FAILURE_TTL)
+    }
+
+    fn with_failure_ttl(failure_ttl: Duration) -> Self {
         Self {
             configs: DashMap::new(),
+            failed_loads: DashMap::new(),
+            failure_ttl,
         }
     }
 
@@ -50,6 +71,7 @@ impl MultimodalConfigRegistry {
     }
 
     pub(crate) fn insert(&self, tokenizer_id: String, config: Arc<MultimodalModelConfig>) {
+        self.failed_loads.remove(&tokenizer_id);
         self.configs.insert(tokenizer_id, config);
     }
 
@@ -57,12 +79,16 @@ impl MultimodalConfigRegistry {
     /// removed so stale entries don't accumulate across re-registrations
     /// (tokenizer IDs are regenerated on each registration via `Uuid::now_v7`).
     pub(crate) fn remove(&self, tokenizer_id: &str) -> Option<Arc<MultimodalModelConfig>> {
+        self.failed_loads.remove(tokenizer_id);
         self.configs.remove(tokenizer_id).map(|(_, v)| v)
     }
 
     /// Return a cached config if present; otherwise load from `tokenizer_source`
     /// (local dir or HF cache/download via `llm_multimodal::hub`), cache under
     /// `tokenizer_id`, and return it.
+    ///
+    /// A load that fails is not retried for [`LOAD_FAILURE_TTL`]; until then
+    /// this returns an error naming the earlier failure.
     pub(crate) async fn get_or_load(
         &self,
         tokenizer_id: &str,
@@ -73,52 +99,80 @@ impl MultimodalConfigRegistry {
             return Ok(cached);
         }
 
+        if let Some(failed_at) = self
+            .failed_loads
+            .get(tokenizer_id)
+            .map(|entry| *entry.value())
+        {
+            let since = failed_at.elapsed();
+            if since < self.failure_ttl {
+                debug!(%tokenizer_id, ?since, "multimodal config load failed recently; not retried");
+                anyhow::bail!(
+                    "multimodal config for tokenizer '{tokenizer_id}' failed to load {since:?} ago \
+                     and is not retried for {:?}",
+                    self.failure_ttl
+                );
+            }
+        }
+
         debug!(
             %tokenizer_id,
             %tokenizer_source,
             "multimodal config cache miss, loading"
         );
 
-        let base_dir = llm_multimodal::hub::resolve_model_config_dir(tokenizer_source)
-            .await
-            .with_context(|| {
-                format!("Failed to resolve model config directory for '{tokenizer_source}'")
-            })?;
+        let model_config = match load_model_config(tokenizer_source).await {
+            Ok(config) => config,
+            Err(error) => {
+                self.failed_loads
+                    .insert(tokenizer_id.to_string(), Instant::now());
+                return Err(error);
+            }
+        };
 
-        let config_path = base_dir.join("config.json");
-        let config: serde_json::Value = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config.json at {}", config_path.display()))
-            .and_then(|s| {
-                serde_json::from_str(&s).with_context(|| {
-                    format!("Failed to parse config.json at {}", config_path.display())
-                })
-            })?;
-
-        // preprocessor_config.json is optional — each vision processor supplies
-        // its own model-specific defaults, so missing/unparsable files fall
-        // back to `PreProcessorConfig::default()`. This matches the bundle
-        // preload path in `try_load_multimodal_config`.
-        let preprocessor_config = load_image_preprocessor_config(&base_dir).unwrap_or_else(|| {
-            debug!(
-                path = %base_dir.display(),
-                "No image preprocessor config found; using PreProcessorConfig defaults"
-            );
-            PreProcessorConfig::default()
-        });
-        let video_preprocessor_config = load_video_preprocessor_config(&base_dir);
-
-        let model_config = Arc::new(MultimodalModelConfig {
-            config,
-            preprocessor_config,
-            video_preprocessor_config,
-        });
-
-        self.configs
-            .insert(tokenizer_id.to_string(), model_config.clone());
+        self.insert(tokenizer_id.to_string(), model_config.clone());
 
         debug!(%tokenizer_id, "multimodal config loaded and cached");
         Ok(model_config)
     }
+}
+
+/// Load a model's multimodal configuration files from `tokenizer_source`
+/// (a local directory, or a HuggingFace repo resolved through the hub cache).
+async fn load_model_config(tokenizer_source: &str) -> Result<Arc<MultimodalModelConfig>> {
+    let base_dir = llm_multimodal::hub::resolve_model_config_dir(tokenizer_source)
+        .await
+        .with_context(|| {
+            format!("Failed to resolve model config directory for '{tokenizer_source}'")
+        })?;
+
+    let config_path = base_dir.join("config.json");
+    let config: serde_json::Value = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config.json at {}", config_path.display()))
+        .and_then(|s| {
+            serde_json::from_str(&s).with_context(|| {
+                format!("Failed to parse config.json at {}", config_path.display())
+            })
+        })?;
+
+    // preprocessor_config.json is optional — each vision processor supplies
+    // its own model-specific defaults, so missing/unparsable files fall
+    // back to `PreProcessorConfig::default()`. This matches the bundle
+    // preload path in `try_load_multimodal_config`.
+    let preprocessor_config = load_image_preprocessor_config(&base_dir).unwrap_or_else(|| {
+        debug!(
+            path = %base_dir.display(),
+            "No image preprocessor config found; using PreProcessorConfig defaults"
+        );
+        PreProcessorConfig::default()
+    });
+    let video_preprocessor_config = load_video_preprocessor_config(&base_dir);
+
+    Ok(Arc::new(MultimodalModelConfig {
+        config,
+        preprocessor_config,
+        video_preprocessor_config,
+    }))
 }
 
 impl Default for MultimodalConfigRegistry {
@@ -265,7 +319,7 @@ impl MultimodalComponents {
         settings: &MultimodalSettings,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to create reqwest client")?;
         let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
@@ -342,6 +396,51 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "second call must hit cache and return same Arc"
         );
+    }
+
+    #[tokio::test]
+    async fn registry_get_or_load_does_not_retry_a_failed_load_within_the_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.json");
+        fs::write(&config_path, "{not json").unwrap();
+        let source = tmp.path().to_string_lossy().into_owned();
+
+        let reg = MultimodalConfigRegistry::new();
+        let first = reg.get_or_load("tok-bad", &source).await.unwrap_err();
+        assert!(
+            first.to_string().contains("Failed to parse config.json"),
+            "first failure must be the load error, got: {first:#}"
+        );
+
+        // Even once the file is fixed, the recent failure is reported
+        // without another load until the TTL passes.
+        fs::write(&config_path, r#"{"model_type":"phi3_v"}"#).unwrap();
+        let second = reg.get_or_load("tok-bad", &source).await.unwrap_err();
+        assert!(
+            second.to_string().contains("not retried"),
+            "second call must report the held failure, got: {second:#}"
+        );
+        assert!(reg.get("tok-bad").is_none());
+
+        // A fresh registration (insert or remove) forgets the failure.
+        reg.remove("tok-bad");
+        let loaded = reg.get_or_load("tok-bad", &source).await.unwrap();
+        assert_eq!(loaded.config["model_type"].as_str(), Some("phi3_v"));
+    }
+
+    #[tokio::test]
+    async fn registry_get_or_load_retries_a_failed_load_after_the_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.json");
+        fs::write(&config_path, "{not json").unwrap();
+        let source = tmp.path().to_string_lossy().into_owned();
+
+        let reg = MultimodalConfigRegistry::with_failure_ttl(Duration::from_millis(20));
+        reg.get_or_load("tok-ttl", &source).await.unwrap_err();
+        fs::write(&config_path, r#"{"model_type":"phi3_v"}"#).unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let loaded = reg.get_or_load("tok-ttl", &source).await.unwrap();
+        assert_eq!(loaded.config["model_type"].as_str(), Some("phi3_v"));
     }
 
     #[tokio::test]
