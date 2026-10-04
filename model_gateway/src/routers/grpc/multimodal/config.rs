@@ -41,17 +41,21 @@ pub(crate) struct MultimodalModelConfig {
 /// 2. Lazy-loaded from local disk / HF on first multimodal request.
 pub struct MultimodalConfigRegistry {
     configs: DashMap<String, Arc<MultimodalModelConfig>>,
-    /// Tokenizers whose last load failed, and when. A load is a directory
-    /// probe plus file reads, or a HuggingFace download attempt; without this
-    /// a model that has no config would pay for one on every request that
-    /// asks (text-only chat asks for the media-part order, for instance).
-    failed_loads: DashMap<String, Instant>,
+    /// Tokenizers whose last load failed: when, and the formatted cause. A
+    /// load is a directory probe plus file reads, or a HuggingFace download
+    /// attempt; without this a model that has no config would pay for one on
+    /// every request that asks (the media-part order, then the placeholder
+    /// tokens). The cause travels with the hold so every caller in the window
+    /// still sees why, not just the first one.
+    failed_loads: DashMap<String, (Instant, Arc<str>)>,
     /// How long a failed load is held before it is tried again.
     failure_ttl: Duration,
 }
 
-/// How long `get_or_load` reports a failed load instead of retrying it.
-const LOAD_FAILURE_TTL: Duration = Duration::from_secs(30);
+/// How long `get_or_load` reports a failed load instead of retrying it: long
+/// enough to stop per-request probing, short enough that a transient failure
+/// (a HuggingFace timeout, say) clears on its own.
+const LOAD_FAILURE_TTL: Duration = Duration::from_secs(5);
 
 impl MultimodalConfigRegistry {
     pub(crate) fn new() -> Self {
@@ -88,7 +92,7 @@ impl MultimodalConfigRegistry {
     /// `tokenizer_id`, and return it.
     ///
     /// A load that fails is not retried for [`LOAD_FAILURE_TTL`]; until then
-    /// this returns an error naming the earlier failure.
+    /// this returns an error carrying the earlier failure's cause.
     pub(crate) async fn get_or_load(
         &self,
         tokenizer_id: &str,
@@ -99,17 +103,17 @@ impl MultimodalConfigRegistry {
             return Ok(cached);
         }
 
-        if let Some(failed_at) = self
+        if let Some((failed_at, cause)) = self
             .failed_loads
             .get(tokenizer_id)
-            .map(|entry| *entry.value())
+            .map(|entry| entry.value().clone())
         {
             let since = failed_at.elapsed();
             if since < self.failure_ttl {
-                debug!(%tokenizer_id, ?since, "multimodal config load failed recently; not retried");
+                debug!(%tokenizer_id, ?since, %cause, "multimodal config load failed recently; not retried");
                 anyhow::bail!(
-                    "multimodal config for tokenizer '{tokenizer_id}' failed to load {since:?} ago \
-                     and is not retried for {:?}",
+                    "multimodal config for tokenizer '{tokenizer_id}' failed to load {since:?} ago: \
+                     {cause}; not retried for {:?}",
                     self.failure_ttl
                 );
             }
@@ -124,8 +128,19 @@ impl MultimodalConfigRegistry {
         let model_config = match load_model_config(tokenizer_source).await {
             Ok(config) => config,
             Err(error) => {
+                // The first caller may swallow this error (the media-part
+                // order resolution falls back silently), so the cause is
+                // logged here, once per hold, as well as kept for later callers.
+                let cause: Arc<str> = Arc::from(format!("{error:#}"));
+                warn!(
+                    %tokenizer_id,
+                    %tokenizer_source,
+                    %cause,
+                    hold = ?self.failure_ttl,
+                    "multimodal config load failed; not retried until the hold expires"
+                );
                 self.failed_loads
-                    .insert(tokenizer_id.to_string(), Instant::now());
+                    .insert(tokenizer_id.to_string(), (Instant::now(), cause));
                 return Err(error);
             }
         };
@@ -426,6 +441,28 @@ mod tests {
         reg.remove("tok-bad");
         let loaded = reg.get_or_load("tok-bad", &source).await.unwrap();
         assert_eq!(loaded.config["model_type"].as_str(), Some("phi3_v"));
+    }
+
+    #[tokio::test]
+    async fn registry_held_failure_names_the_original_cause() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("config.json"), "{not json").unwrap();
+        let source = tmp.path().to_string_lossy().into_owned();
+        let reg = MultimodalConfigRegistry::new();
+        let first = reg.get_or_load("tok-cause", &source).await.unwrap_err();
+        let first_text = format!("{first:#}");
+        assert!(
+            first_text.contains("Failed to parse config.json"),
+            "first failure must be the load error, got: {first_text}"
+        );
+
+        // Every caller within the hold sees that same cause, not just "held".
+        let held = reg.get_or_load("tok-cause", &source).await.unwrap_err();
+        let held_text = held.to_string();
+        assert!(
+            held_text.contains("not retried") && held_text.contains(&first.to_string()),
+            "held failure must carry the original cause, got: {held_text}"
+        );
     }
 
     #[tokio::test]
