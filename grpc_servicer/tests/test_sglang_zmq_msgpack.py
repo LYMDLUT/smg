@@ -3,6 +3,7 @@ shapes SMG relies on, and a loopback through a fake SMG that binds the three
 sockets. Needs an SGLang install (its io_struct and sampling params)."""
 
 import array
+import logging
 import os
 import struct
 import tempfile
@@ -520,3 +521,61 @@ def test_sender_handles_scalar_and_sparse_embeddings_and_never_raises():
     (abort,) = sink.sent
     assert abort[0] == "BatchTokenIDSlimOutput" and abort[1] == ["b1"] and abort[3] == ["abort"]
     assert "could not be relayed" in abort[4][0]
+
+
+class _Idle:
+    """A request socket with nothing to read."""
+
+    def recv_multipart(self, *args, **kwargs):
+        raise zmq.Again()
+
+
+def test_relay_failures_abort_in_the_scheduler_too(caplog, monkeypatch):
+    """An output this side cannot relay ends its requests for SMG; the
+    scheduler must stop them as well, or they keep decoding (and keep failing
+    every step) for clients that already got an error."""
+    from sglang.srt.managers.io_struct import BatchTokenIDOutput
+
+    sender = wire.MsgpackSendSocket()
+    sink = _Sink()
+    sender.attach(sink, 0, None)
+    recv = wire.MsgpackRecvSocket(
+        _Idle(), VOCAB, sender.send_terminal_abort, pending_aborts=sender.pending_aborts
+    )
+
+    def broken(rids):
+        return BatchTokenIDOutput(
+            **{name: None for name in BatchTokenIDOutput.__struct_fields__} | dict(rids=rids)
+        )
+
+    with caplog.at_level(logging.WARNING, logger=wire.logger.name):
+        sender.send_output(broken(["b1", "b2"]))
+        sender.send_output(broken(["b3"]))
+    # SMG heard a terminal abort per request...
+    assert [sent[1] for sent in sink.sent] == [["b1"], ["b2"], ["b3"]]
+    # ...and the scheduler frees them on its next drains, within the poll's limit.
+    aborts = recv.drain(2)
+    assert [(type(a).__name__, a.rid) for a in aborts] == [("AbortReq", "b1"), ("AbortReq", "b2")]
+    assert [a.rid for a in recv.drain(16)] == ["b3"]
+    assert not recv.drain(16) and not sender.pending_aborts
+    # One traceback per (output type, exception type); the repeat is a single line.
+    failures = [r for r in caplog.records if "could not relay" in r.getMessage()]
+    assert len(failures) == 2 and [bool(r.exc_info) for r in failures] == [True, False]
+
+    # A different cause for the same output type gets its own traceback.
+    def missing_field(*args, **kwargs):
+        raise KeyError("num_running_reqs")
+
+    monkeypatch.setattr(wire.BatchTokenIDSlimOutput, "from_full", classmethod(missing_field))
+    with caplog.at_level(logging.WARNING, logger=wire.logger.name):
+        sender.send_output(broken(["b4"]))
+    failures = [r for r in caplog.records if "could not relay" in r.getMessage()]
+    assert len(failures) == 3 and bool(failures[-1].exc_info)
+    assert [a.rid for a in recv.drain(16)] == ["b4"]
+    monkeypatch.undo()
+    # A load probe that breaks costs the output its load tail, not the output.
+    sink.sent.clear()
+    sender.attach(sink, 0, lambda: object())
+    sender.send_output(_full_output())
+    (batch,) = sink.sent
+    assert batch[1] == ["a", "b"] and batch[11:15] == [0, 0, 0, 0] and not sender.pending_aborts
