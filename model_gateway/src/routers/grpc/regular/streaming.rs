@@ -914,13 +914,22 @@ impl StreamingProcessor {
                     .await;
             }
         }
+        // In PD mode this task only starts once the decode stream exists —
+        // for sequential PD that is after prefill completes, with the first
+        // decode chunk already buffered — so `start_time` would report a
+        // near-zero TTFT. Anchor at the prefill dispatch instant instead;
+        // generation duration must share the base or TPOT underflows.
+        let stream_base = pd_timing
+            .as_ref()
+            .map(|timing| timing.prefill_start)
+            .unwrap_or(start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
-            ttft: first_token_time.map(|t| t.duration_since(start_time)),
-            generation_duration: start_time.elapsed(),
+            ttft: first_token_time.map(|t| t.duration_since(stream_base)),
+            generation_duration: stream_base.elapsed(),
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
         });
@@ -1214,7 +1223,7 @@ impl StreamingProcessor {
                 handle.close_reserved_only().await;
             }
         }
-        Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+        Self::record_generate_metrics(start_time, first_token_time, total_completion, None, &ctx);
 
         Ok(())
     }
@@ -1453,7 +1462,13 @@ impl StreamingProcessor {
                 handle.close_reserved_only().await;
             }
         }
-        Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+        Self::record_generate_metrics(
+            start_time,
+            first_token_time,
+            total_completion,
+            pd_timing.as_ref(),
+            &ctx,
+        );
 
         Ok(())
     }
@@ -1467,15 +1482,23 @@ impl StreamingProcessor {
         start_time: Instant,
         first_token_time: Option<Instant>,
         total_completion: u32,
+        pd_timing: Option<&context::PdTiming>,
         ctx: &GenerateStreamContext,
     ) {
+        // PD mode: the stream task starts after the prefill leg was dispatched
+        // (sequential PD: after it completes, with the first decode chunk
+        // already buffered), so anchor TTFT at prefill dispatch. Generation
+        // duration shares the base or TPOT underflows.
+        let stream_base = pd_timing
+            .map(|timing| timing.prefill_start)
+            .unwrap_or(start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: ctx.backend_type,
             model_id: &ctx.model,
             endpoint: metrics_labels::ENDPOINT_GENERATE,
-            ttft: first_token_time.map(|t| t.duration_since(start_time)),
-            generation_duration: start_time.elapsed(),
+            ttft: first_token_time.map(|t| t.duration_since(stream_base)),
+            generation_duration: stream_base.elapsed(),
             input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
             output_tokens: total_completion as u64,
         });
