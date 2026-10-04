@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::traits::{TokenIdType, Tokenizer as TokenizerTrait};
+use crate::traits::{IncrementalDecoder, TokenIdType, Tokenizer as TokenizerTrait};
 
 /// Maintains state for an ongoing sequence of tokens and their decoded text.
 ///
@@ -37,6 +37,9 @@ pub struct Sequence {
 
     /// Whether to skip special tokens when decoding
     skip_special_tokens: bool,
+    /// The backend's own per-stream decoder, when it has one. Then
+    /// `token_ids`, `prefix_index` and `cached_prefix` stay unused.
+    incremental: Option<Box<dyn IncrementalDecoder>>,
 }
 
 impl std::fmt::Debug for Sequence {
@@ -72,6 +75,7 @@ impl Sequence {
     /// Create a new empty sequence with skip_special_tokens option
     pub fn new_with_options(tokenizer: Arc<dyn TokenizerTrait>, skip_special_tokens: bool) -> Self {
         Self {
+            incremental: tokenizer.incremental_decoder(skip_special_tokens),
             tokenizer,
             token_ids: Vec::new(),
             total_tokens: 0,
@@ -93,7 +97,16 @@ impl Sequence {
         skip_special_tokens: bool,
     ) -> Self {
         let len = token_ids.len();
+        let mut incremental = tokenizer.incremental_decoder(skip_special_tokens);
+        if let Some(decoder) = incremental.as_mut() {
+            // Position the decoder after the seed tokens; their text is not
+            // emitted. Fall back to the generic path if the backend objects.
+            if token_ids.iter().any(|&id| decoder.step(id).is_err()) {
+                incremental = None;
+            }
+        }
         Self {
+            incremental,
             tokenizer,
             token_ids,
             total_tokens: len,
@@ -121,6 +134,9 @@ impl Sequence {
         self.total_tokens = 0;
         self.prefix_index = 0;
         self.cached_prefix.clear();
+        if let Some(decoder) = self.incremental.as_mut() {
+            decoder.reset();
+        }
     }
 
     /// Append text to the sequence by encoding it.
@@ -148,6 +164,11 @@ impl Sequence {
     /// caching internally.
     #[inline]
     pub fn append_token(&mut self, token_id: TokenIdType) -> Result<String> {
+        if let Some(decoder) = self.incremental.as_mut() {
+            let text = decoder.step(token_id)?;
+            self.total_tokens += 1;
+            return Ok(text);
+        }
         let result = self.tokenizer.decode_step(
             token_id,
             &mut self.token_ids,
