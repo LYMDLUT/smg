@@ -738,6 +738,10 @@ jobs:
             timeout: 60
             test_timeout: 48
             min_selected: 109 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          - engine: sglang
+            timeout: 60
+            test_timeout: 48
+            min_selected: 204 # floor ≈ 95% of measured effective (215 of 223 selected ran; audit 2026-10-03)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -749,6 +753,9 @@ jobs:
       connection_mode: zmq
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      # The SGLang wire pins (grpc_servicer/tests/test_sglang_zmq_*) need a
+      # real SGLang plus pyzmq and msgspec; this is the lane that has them.
+      servicer_unit_tests: ${{ matrix.engine == 'sglang' }}
     secrets: inherit
 
   e2e-2gpu-chat-zmq-dp:
