@@ -1634,15 +1634,13 @@ impl RunIndex {
                 > 0
     }
 
-    /// Distinct-block accounting around a change to `run_id` (and the suffix it may have split
-    /// off): the delta of blocks held by anybody, attributed to `worker`.
-    fn settle_distinct(&self, worker: u32, before: usize, run_id: u32, suffix: Option<u32>) {
-        let mut after = self.held_len(run_id);
-        if let Some(suffix) = suffix {
-            if suffix != GONE {
-                after += self.held_len(suffix);
-            }
-        }
+    /// Distinct-block accounting around a change to `run_id` (locked by the caller): the delta
+    /// of blocks held by anybody, attributed to `worker`. A split changes nothing in total (the
+    /// prefix and the suffix hold between them what the run held), so callers take `before`
+    /// after any split; the suffix is published by then and other lanes account for their own
+    /// changes to it.
+    fn settle_distinct(&self, worker: u32, before: usize, run_id: u32) {
+        let after = self.held_len(run_id);
         if after > before {
             self.distinct_add(worker, after - before);
         } else {
@@ -2203,19 +2201,17 @@ impl RunIndex {
             .count();
         let available = len - offset;
         let reach = offset + matched;
-        let before = self.held_len(run_id);
-        let suffix = if matched < available && matched < remaining.len() {
+        if matched < available && matched < remaining.len() {
             // A divergence inside the run: both branches stay held, the run ends here.
             self.count_split(LockKind::Root);
-            Some(self.split_locked(run_id, meta, reach))
-        } else {
-            None
-        };
+            self.split_locked(run_id, meta, reach);
+        }
+        let before = self.held_len(run_id);
         if reach > held {
             self.set_holding(run_id, worker, reach);
             self.credit(worker, reach - held);
         }
-        self.settle_distinct(worker, before, run_id, suffix);
+        self.settle_distinct(worker, before, run_id);
         pending.push(Placed {
             run: run_id,
             offset: offset as u32,
@@ -2432,16 +2428,16 @@ impl RunIndex {
             }
         }
         for (low, high) in ranges.into_iter().rev() {
-            let before = self.held_len(run_id);
             // Blocks after the range stay held by this worker too: a hole, so the tail becomes
             // its own run. A range reaching the worker's end only lowers its cutoff.
-            let tail = (high + 1 < held).then(|| {
+            if high + 1 < held {
                 self.count_split(LockKind::Own);
-                self.split_locked(run_id, meta, high + 1)
-            });
+                self.split_locked(run_id, meta, high + 1);
+            }
+            let before = self.held_len(run_id);
             self.set_holding(run_id, worker, low);
             self.debit(worker, high + 1 - low);
-            self.settle_distinct(worker, before, run_id, tail);
+            self.settle_distinct(worker, before, run_id);
             held = low;
         }
     }
@@ -2493,7 +2489,7 @@ impl RunIndex {
                 let before = self.held_len(run_id);
                 self.set_holding(run_id, worker, 0);
                 self.debit(worker, held);
-                self.settle_distinct(worker, before, run_id, None);
+                self.settle_distinct(worker, before, run_id);
                 if !self.has_holders(run_id) && run.children.load(Ordering::Relaxed) == NONE {
                     self.unlink_locked(run_id, &mut meta, &mut freed);
                 }
