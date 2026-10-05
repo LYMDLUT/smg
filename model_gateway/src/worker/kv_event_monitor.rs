@@ -815,6 +815,7 @@ mod tests {
             block_size: 4,
             lora_id: None,
             cache_level: None,
+            ..Default::default()
         };
         let stored = convert_kv_block(&block);
         assert_eq!(stored.seq_hash, SequenceHash::from(42i64));
@@ -829,6 +830,7 @@ mod tests {
             block_size: 2,
             lora_id: None,
             cache_level: None,
+            ..Default::default()
         };
         let stored = convert_kv_block(&block);
         assert_eq!(stored.seq_hash, SequenceHash(u64::MAX));
@@ -842,6 +844,7 @@ mod tests {
             block_size: 0,
             lora_id: None,
             cache_level: None,
+            ..Default::default()
         };
         let stored = convert_kv_block(&block);
         assert_eq!(stored.seq_hash, SequenceHash::from(100i64));
@@ -865,6 +868,7 @@ mod tests {
                     block_size: 4,
                     lora_id: None,
                     cache_level: None,
+                    ..Default::default()
                 },
                 KvBlock {
                     block_hash: 2,
@@ -872,9 +876,11 @@ mod tests {
                     block_size: 4,
                     lora_id: None,
                     cache_level: None,
+                    ..Default::default()
                 },
             ],
             parent_block_hash: None,
+            ..Default::default()
         };
 
         KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
@@ -894,8 +900,10 @@ mod tests {
                 block_size: 4,
                 lora_id: None,
                 cache_level: None,
+                ..Default::default()
             }],
             parent_block_hash: None,
+            ..Default::default()
         };
         KvEventMonitor::apply_stored(&stored1, w1, &indexer, &mut wb);
 
@@ -906,8 +914,10 @@ mod tests {
                 block_size: 4,
                 lora_id: None,
                 cache_level: None,
+                ..Default::default()
             }],
             parent_block_hash: Some(1),
+            ..Default::default()
         };
         KvEventMonitor::apply_stored(&stored2, w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 2);
@@ -927,8 +937,10 @@ mod tests {
                 block_size: 4,
                 lora_id: None,
                 cache_level: None,
+                ..Default::default()
             }],
             parent_block_hash: Some(999),
+            ..Default::default()
         };
         KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 1);
@@ -948,6 +960,7 @@ mod tests {
                     block_size: 4,
                     lora_id: None,
                     cache_level: None,
+                    ..Default::default()
                 },
                 KvBlock {
                     block_hash: 2,
@@ -955,15 +968,18 @@ mod tests {
                     block_size: 4,
                     lora_id: None,
                     cache_level: None,
+                    ..Default::default()
                 },
             ],
             parent_block_hash: None,
+            ..Default::default()
         };
         KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
 
         let removed = KvBlocksRemoved {
             block_hashes: vec![2],
             cache_level: None,
+            ..Default::default()
         };
         KvEventMonitor::apply_removed(&removed, w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 1);
@@ -982,8 +998,10 @@ mod tests {
                 block_size: 4,
                 lora_id: None,
                 cache_level: None,
+                ..Default::default()
             }],
             parent_block_hash: None,
+            ..Default::default()
         };
         KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 1);
@@ -1006,8 +1024,10 @@ mod tests {
                     block_size: 4,
                     lora_id: None,
                     cache_level: None,
+                    ..Default::default()
                 }],
                 parent_block_hash: None,
+                ..Default::default()
             })),
         };
 
@@ -1030,8 +1050,10 @@ mod tests {
                     block_size: 4,
                     lora_id: None,
                     cache_level: None,
+                    ..Default::default()
                 }],
                 parent_block_hash: None,
+                ..Default::default()
             })),
         };
         KvEventMonitor::apply_event(&stored_event, w1, &indexer, &mut wb);
@@ -1041,6 +1063,7 @@ mod tests {
             data: Some(kv_cache_event::Data::Removed(KvBlocksRemoved {
                 block_hashes: vec![1],
                 cache_level: None,
+                ..Default::default()
             })),
         };
         KvEventMonitor::apply_event(&removed_event, w1, &indexer, &mut wb);
@@ -1063,8 +1086,10 @@ mod tests {
                         block_size: 4,
                         lora_id: None,
                         cache_level: None,
+                        ..Default::default()
                     }],
                     parent_block_hash: None,
+                    ..Default::default()
                 })),
             },
             w1,
@@ -1077,7 +1102,7 @@ mod tests {
             &KvCacheEvent {
                 event_id: 2,
                 data: Some(kv_cache_event::Data::Cleared(
-                    smg_grpc_client::common_proto::KvCacheCleared {},
+                    smg_grpc_client::common_proto::KvCacheCleared::default(),
                 )),
             },
             w1,

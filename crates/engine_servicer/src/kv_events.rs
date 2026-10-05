@@ -334,20 +334,25 @@ fn convert_event(event: WireEvent, event_id: u64) -> Option<common::KvCacheEvent
                     block_size: i32::try_from(width).unwrap_or(i32::MAX),
                     lora_id,
                     cache_level: None,
+                    ..Default::default()
                 })
                 .collect();
             kv_cache_event::Data::Stored(common::KvBlocksStored {
                 blocks,
                 parent_block_hash: parent_block_hash.map(|hash| hash.0),
+                ..Default::default()
             })
         }
         WireEvent::BlockRemoved { block_hashes } => {
             kv_cache_event::Data::Removed(common::KvBlocksRemoved {
                 block_hashes: block_hashes.into_iter().map(|hash| hash.0).collect(),
                 cache_level: None,
+                ..Default::default()
             })
         }
-        WireEvent::AllBlocksCleared => kv_cache_event::Data::Cleared(common::KvCacheCleared {}),
+        WireEvent::AllBlocksCleared => {
+            kv_cache_event::Data::Cleared(common::KvCacheCleared::default())
+        }
         WireEvent::Unknown => {
             debug!(
                 event_id,
@@ -428,6 +433,7 @@ mod tests {
             token_ids,
             lora_id,
             cache_level: None,
+            ..Default::default()
         }
     }
 
@@ -484,11 +490,14 @@ mod tests {
             Some(kv_cache_event::Data::Removed(common::KvBlocksRemoved {
                 block_hashes: vec![0x1234, -1],
                 cache_level: None,
+                ..Default::default()
             }))
         );
         assert_eq!(
             batch.events[3].data,
-            Some(kv_cache_event::Data::Cleared(common::KvCacheCleared {}))
+            Some(kv_cache_event::Data::Cleared(
+                common::KvCacheCleared::default()
+            ))
         );
 
         let batch = convert_batch(decode(golden::BATCH2), 10, &mut event_id);

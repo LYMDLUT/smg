@@ -713,6 +713,7 @@ impl SchedulerState {
                     common::KvBlocksRemoved {
                         block_hashes: removed,
                         cache_level: None,
+                        ..Default::default()
                     },
                 )),
             });
@@ -737,8 +738,10 @@ impl SchedulerState {
                         block_size: block_size as i32,
                         lora_id: None,
                         cache_level: None,
+                        ..Default::default()
                     }],
                     parent_block_hash: parent.map(|k| k as i64),
+                    ..Default::default()
                 },
             )),
         }
