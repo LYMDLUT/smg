@@ -1020,9 +1020,9 @@ impl PositionalIndexer {
 
     /// Find overlap scores for a request's content hash sequence.
     ///
-    /// Uses jump search: strides by `jump_size` positions, only scanning
-    /// intermediate positions when workers drain (stop matching).
-    /// Complexity: amortized O(D/J + W) where D=depth, J=jump_size, W=workers.
+    /// Verifies every position of the request in order (O(D) probes, D = depth), draining
+    /// workers as they stop matching; a worker's score is the length of the prefix it holds
+    /// contiguously, so an evicted middle block ends it exactly as it does in the engine.
     ///
     /// When `early_exit` is true, returns immediately after finding any match
     /// at position 0 (score = 1 for all matching workers). Useful when the caller
@@ -1128,33 +1128,6 @@ impl PositionalIndexer {
             active.extend(workers.iter());
         }
         true
-    }
-
-    /// Whether every worker in `active` still holds the request's exact block at `position`
-    /// (content hash and prefix hash). When it does, every position in between is held too
-    /// (chains have no holes: a block is only reachable through its predecessors), so the jump
-    /// search may skip to `position`. A matching worker count is not enough: a worker that
-    /// dropped out earlier and another that holds this block without the request's start would
-    /// cancel out, and the first would be credited for blocks it does not have.
-    fn landing_holds_all(
-        index: &PosIndex,
-        position: usize,
-        content_hash: ContentHash,
-        seq_hashes: &mut Vec<SequenceHash>,
-        sequence: &[ContentHash],
-        now: u32,
-        active: &[u32],
-    ) -> bool {
-        let Some(entry) = index.get(&(position, content_hash)) else {
-            return false;
-        };
-        entry.value().touch(now);
-        Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
-        entry
-            .value()
-            .seq
-            .get(seq_hashes[position])
-            .is_some_and(|workers| active.iter().all(|&w| workers.contains(w)))
     }
 
     /// Scan positions sequentially, draining workers that stop matching.
@@ -1272,38 +1245,22 @@ impl PositionalIndexer {
             return scores;
         }
 
-        let mut current_pos = 0;
-
-        while current_pos < len - 1 && !active.is_empty() {
-            let next_pos = (current_pos + self.jump_size).min(len - 1);
-
-            // Every active worker holds the exact block at the landing, so it holds the
-            // positions in between as well: skip them. Otherwise scan to find where each stops.
-            if Self::landing_holds_all(
-                &self.index,
-                next_pos,
-                content_hashes[next_pos],
-                seq_hashes,
-                content_hashes,
-                now,
-                active,
-            ) {
-                current_pos = next_pos;
-            } else {
-                Self::linear_scan_drain(
-                    &self.index,
-                    content_hashes,
-                    seq_hashes,
-                    active,
-                    &mut internal_scores,
-                    current_pos + 1,
-                    next_pos + 1,
-                    false,
-                    now,
-                );
-                current_pos = next_pos;
-            }
-        }
+        // Every position is verified in order. A worker's score is the length of the prefix it
+        // holds contiguously, so an evicted middle block (a hole) must stop it, and a landing
+        // check alone cannot see holes: the prefix hash stored at a later position was computed
+        // when the chain was intact. The jump shortcut is therefore not taken; exactness
+        // (guardrail 1) over the probe count. `jump_size` is kept for API compatibility.
+        Self::linear_scan_drain(
+            &self.index,
+            content_hashes,
+            seq_hashes,
+            active,
+            &mut internal_scores,
+            1,
+            len,
+            false,
+            now,
+        );
 
         let final_score = len as u32;
         for &w in active.iter() {
