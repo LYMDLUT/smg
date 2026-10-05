@@ -146,7 +146,7 @@ prefix_repetition` from the vLLM image; `scripts/bench_prefix.py` = the same sha
 | one plain vLLM HTTP instance, same 16 req/s | bench_prefix.py | 28.5 / 44.1 / 56.9 | 1.99 / 4.06 | 155 | 17.0 |
 | one plain vLLM HTTP instance, all-unique prompts, 2 req/s | vllm bench | 23.5 / - / 33.5 | 1.68 / 2.08 | 129 | 2.0 |
 
-Read with `~/smg-perf/gpu/results/gateway-stream-anomaly.md`: the direct gRPC path to any of the eight
+Starvation was tested and ruled out afterwards (gateway and clients on the idle cores 64-71, scheduler wait time 0 ms, 8 or 72 runtime workers, round robin and cache_aware, HTTP and gRPC workers all show the same stall; details and a syscall timeline in `~/smg-perf/gpu/results/gateway-stream-anomaly.md`). The gateway and the load clients now run on cores 64-71 for every GPU-side run (`launch-gateway.sh`, `GATEWAY_CPUS`), engines and builds on 72-143. Read with that note: the direct gRPC path to any of the eight
 servicers answers a 2048-token prompt in 15-41 ms and streams at 1.4 ms/token, while the gateway's HTTP path
 adds 30-600 ms and often delivers the whole response as one burst (`smg_router_request_duration_seconds` mean
 3.6 ms vs `smg_http_request_duration_seconds` mean 140 ms over the same requests). The first cache_aware run is
