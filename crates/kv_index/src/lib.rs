@@ -14,6 +14,7 @@
 mod common;
 mod event_tree;
 mod path_hash;
+pub mod reference;
 pub mod snapshot;
 mod string_tree;
 mod token_tree;
@@ -25,6 +26,7 @@ pub use event_tree::{
     WorkerBlockMap, WorkerId, WorkerIdExhausted, XXH3_SEED,
 };
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
+pub use reference::{request_prefix_hashes, ReferenceIndexer};
 // Re-export under names matching old tree.rs API for easier migration
 pub use string_tree::Tree;
 pub use string_tree::{
