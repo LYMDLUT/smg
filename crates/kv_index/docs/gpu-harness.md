@@ -249,7 +249,18 @@ binding wheel from the same tree (`scripts/build-head.sh`, maturin `--compatibil
    `gpu-harness-replay-8b-kv12k.md`. Both policies lose half their goodput; cache_aware collapses run over run when the
    gateway is not restarted between runs (index credit outlives the engine's lazy block removals), round robin does not.
 
-## 8. What is running / where things are
+7. Loop head 2d37b25a (logging fix, hardened run index): restricted-pool replay `gpu-harness-replay-8b-kv12k-2d37b25a.md`
+   (round robin goodput 12.8-14.2 req/s vs cache_aware 5.0-8.6 at the same prefix reuse: with pools at 7 % of the working
+   set the credited worker queues while its blocks are already evicted; the full pool is where cache_aware leads), and the
+   info-level check in `gpu-harness-stream-anomaly.md` (info logging to a file at 16 req/s: goodput 14.26 req/s, TTFT p50
+   198 ms, same as warn, so the stall is fixed on hardware; `GATEWAY_LOG_LEVEL=warn` stays the harness default only for log size).
+8. Mock calibration additions: `gpu-harness-scheduler-settings.json` (max_num_seqs 128, max_num_batched_tokens 16384,
+   chunked prefill on, long_prefill_token_threshold 0, block 16, pools 42 258 / 29 669 / 12 000 blocks) and
+   `gpu-harness-prefill-batch-sweep.json` (over the gRPC servicer a 4x1024 burst prefills in one ~78 ms pass, 8x1024 in
+   ~113 ms, 16x1024 in ~200 ms, 8x4096 in two passes ~335 ms; the HTTP front end admits one request per engine step and
+   must not be used to calibrate batching).
+
+## 9. What is running / where things are
 
 As of the end of round 3: host processes `8b-w0..w3` (kept up for the policy comparison, 40 960 context) (gRPC 20061-20064, logs `logs/host-8b-w*.log`, pids `logs/host-8b-w*.pid`), `http-8b` (:8104), `drill-w0..w3` (gRPC 20071-20074), `sgl-dp2` (:8201), `sgl-hicache` (:8202); the podman containers were killed by pid and podman itself is still wedged. `kill $(cat logs/host-*.pid)` stops the host processes.
 
