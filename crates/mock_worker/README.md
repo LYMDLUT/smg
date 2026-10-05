@@ -128,6 +128,29 @@ label, e.g. `"labels":{"tokenizer_path":"gpt2"}`, and a `"kv_block_size":16`, an
 do **not** pass `--disable-tokenizer-autoload`. (HTTP workers need no tokenizer
 but cannot drive event-driven `cache_aware`, which requires token ids.)
 
+### Fault hooks (recovery drills)
+
+All under the admin API; `{worker}` is a worker name (`grpc:<port>`) or `all`.
+A hook applies to every KV-event transport of the worker (gRPC
+`SubscribeKvEvents` and the ZMQ publisher alike) and reports the state it set.
+
+| Hook | Effect |
+|------|--------|
+| `POST /admin/fault/{worker}/drop?batches=N` | the next N event batches are not published (lost on the wire; they stay in the replay buffer, so a gap replay recovers them) |
+| `POST /admin/fault/{worker}/delay?ms=D` | every batch is published D ms after its pass ends (0 clears) |
+| `POST /admin/fault/{worker}/restart-publisher` | the publisher restarts: sequence numbers start over from the first value, the replay buffer is emptied, the cache is kept (no `AllBlocksCleared`) |
+| `POST /admin/fault/{worker}/pause` | the engine freezes: no passes, no tokens, no events; requests queue; health and `GetLoads` keep answering |
+| `POST /admin/fault/{worker}/resume` | the engine runs again |
+| `GET /admin/fault/{worker}` | the hooks' current state (pending drops, delay, restarts, paused, generation) |
+| `POST /admin/reset/{worker}` | (already there) clear the cache and publish `AllBlocksCleared` |
+
+### Truth endpoints (guardrail 7: engine truth)
+
+| Endpoint | Answer |
+|----------|--------|
+| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `block_size` (the engine's own prefix match, last-block rule included) |
+| `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, so a gateway's hit-rate claim can be checked against what the engines actually served |
+
 ## Scale-test rig (gateway CPU)
 
 `scripts/scale_test.sh` launches an IGW gateway, starts a canned mock fleet,
