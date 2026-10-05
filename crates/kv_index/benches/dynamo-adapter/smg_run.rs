@@ -281,15 +281,14 @@ impl SyncIndexer for SmgRun {
     }
 
     fn find_matches(&self, sequence: &[LocalBlockHash], early_exit: bool) -> OverlapScores {
-        let hashes: Vec<ContentHash> = sequence.iter().map(|hash| ContentHash(hash.0)).collect();
-        let smg = self.inner.find_matches(&hashes, early_exit);
         let mut scores = OverlapScores::new();
         let table = self.workers.read().unwrap_or_else(|e| e.into_inner());
-        for (smg_id, score) in smg.scores {
-            if let Some(Some(worker)) = table.get(smg_id as usize) {
-                scores.scores.insert(*worker, score);
-            }
-        }
+        self.inner
+            .score_into(sequence, |hash| hash.0, early_exit, |smg_id, score| {
+                if let Some(Some(worker)) = table.get(smg_id as usize) {
+                    scores.scores.insert(*worker, score);
+                }
+            });
         scores
     }
 

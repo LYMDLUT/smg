@@ -1529,17 +1529,39 @@ impl RunIndex {
     /// report the workers holding the first block, each scored 1.
     pub fn find_matches(&self, content_hashes: &[ContentHash], early_exit: bool) -> OverlapScores {
         let mut out = OverlapScores::default();
-        let Some(&first) = content_hashes.first() else {
-            return out;
+        self.score_into(
+            content_hashes,
+            |content| content.0,
+            early_exit,
+            |worker, score| {
+                out.scores.insert(worker, score);
+            },
+        );
+        out
+    }
+
+    /// The lookup behind [`find_matches`](Self::find_matches), for callers that keep their own
+    /// hash type and result shape: `hash_of` reads a block's content hash, `report` receives
+    /// every `(worker, score)` with a non-empty prefix (once each). Nothing is allocated.
+    pub fn score_into<T>(
+        &self,
+        content_hashes: &[T],
+        hash_of: impl Fn(&T) -> u64,
+        early_exit: bool,
+        mut report: impl FnMut(u32, u32),
+    ) {
+        let Some(first) = content_hashes.first() else {
+            return;
         };
+        let first = hash_of(first);
         let root = self.slab.run(ROOT);
         let (mut run_id, mut expected) = loop {
             let (window, version) = root.snapshot();
-            let found = self.arena.table_find(window.children, first.0);
+            let found = self.arena.table_find(window.children, first);
             if root.confirm(version) {
                 match found {
                     Some(entry) => break entry,
-                    None => return out,
+                    None => return,
                 }
             }
         };
@@ -1558,7 +1580,7 @@ impl RunIndex {
             let matched = content_hashes[position..position + available]
                 .iter()
                 .zip(hashes)
-                .take_while(|(content, slot)| content.0 == slot.load(Ordering::Relaxed))
+                .take_while(|(content, slot)| hash_of(content) == slot.load(Ordering::Relaxed))
                 .count();
             let coverage = self.slab.coverage(run_id);
             let mut held = [0u64; MAX_WORDS];
@@ -1566,8 +1588,10 @@ impl RunIndex {
                 *word = slot.load(Ordering::Relaxed);
             }
             let next = if matched == len && position + matched < content_hashes.len() {
-                self.arena
-                    .table_find(window.children, content_hashes[position + matched].0)
+                self.arena.table_find(
+                    window.children,
+                    hash_of(&content_hashes[position + matched]),
+                )
             } else {
                 None
             };
@@ -1580,20 +1604,20 @@ impl RunIndex {
             if position == 0 {
                 alive = held;
                 if early_exit {
-                    emit(&alive[..words], 1, &mut out);
-                    return out;
+                    emit(&alive[..words], 1, &mut report);
+                    return;
                 }
             } else {
                 for (index, word) in alive[..words].iter_mut().enumerate() {
                     let dropped = *word & !held[index];
                     if dropped != 0 {
-                        emit_word(index, dropped, position as u32, &mut out);
+                        emit_word(index, dropped, position as u32, &mut report);
                     }
                     *word &= held[index];
                 }
             }
             if alive[..words].iter().all(|word| *word == 0) {
-                return out;
+                return;
             }
             position += matched;
             match next {
@@ -1604,8 +1628,7 @@ impl RunIndex {
                 None => break,
             }
         }
-        emit(&alive[..words], position as u32, &mut out);
-        out
+        emit(&alive[..words], position as u32, &mut report);
     }
 
     /// Every block every worker holds, as `(worker, position, content hash, prefix hash)`;
@@ -1701,24 +1724,22 @@ fn reforward(meta: &RunMeta, mut offsets: Vec<u32>, work: &mut Vec<Removal>) -> 
     offsets
 }
 
-fn emit(alive: &[u64], score: u32, out: &mut OverlapScores) {
+fn emit(alive: &[u64], score: u32, report: &mut impl FnMut(u32, u32)) {
     if score == 0 {
         return;
     }
-    let count: u32 = alive.iter().map(|word| word.count_ones()).sum();
-    out.scores.reserve(count as usize);
     for (index, &word) in alive.iter().enumerate() {
         if word != 0 {
-            emit_word(index, word, score, out);
+            emit_word(index, word, score, report);
         }
     }
 }
 
 #[inline]
-fn emit_word(index: usize, mut word: u64, score: u32, out: &mut OverlapScores) {
+fn emit_word(index: usize, mut word: u64, score: u32, report: &mut impl FnMut(u32, u32)) {
     while word != 0 {
         let bit = word.trailing_zeros();
-        out.scores.insert((index * 64 + bit as usize) as u32, score);
+        report((index * 64 + bit as usize) as u32, score);
         word &= word - 1;
     }
 }
