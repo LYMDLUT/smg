@@ -51,14 +51,16 @@ def run_trial(
         "command": command,
     }
     with open(args.lock, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.lock_scope == "trial":
+            fcntl.flock(lock, fcntl.LOCK_EX)
         before = hostload.sample(cores, args.sample_seconds, {os.getpid()})
         started = time.time()
         with open(out / f"point{point}-trial{trial}.log", "w") as log:
             status = subprocess.run(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
         record["wall_s"] = time.time() - started
         after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
-        fcntl.flock(lock, fcntl.LOCK_UN)
+        if args.lock_scope == "trial":
+            fcntl.flock(lock, fcntl.LOCK_UN)
     record["exit_code"] = status.returncode
     foreign_b, background_b = hostload.classify(before, args.threshold_pct, allow, False)
     foreign_a, background_a = hostload.classify(after, args.threshold_pct, allow, False)
@@ -114,6 +116,12 @@ def main() -> int:
     )
     parser.add_argument("--verify-ends", action="store_true", help="run the endpoints first")
     parser.add_argument(
+        "--lock-scope",
+        choices=("trial", "run"),
+        default="trial",
+        help="hold the lock per trial (fair to other takers) or for the whole run (one queue wait)",
+    )
+    parser.add_argument(
         "--lock", required=True, help="lock file held for the duration of each trial"
     )
     parser.add_argument("--cores", default="0-63", help="cores to check for foreign load")
@@ -124,6 +132,9 @@ def main() -> int:
     )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+    run_lock = open(args.lock, "w")  # noqa: SIM115 - held until exit when the scope is "run"
+    if args.lock_scope == "run":
+        fcntl.flock(run_lock, fcntl.LOCK_EX)
     if "{window_ms}" in args.command and not args.total_block_ops:
         parser.error("--total-block-ops is required with a {window_ms} template")
 

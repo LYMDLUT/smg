@@ -50,14 +50,16 @@ def run_trial(args: argparse.Namespace, role: str, index: int, command_template:
     allow = re.compile(args.allow) if args.allow else None
     record = {"role": role, "index": index, "command": command, "started_at": time.time()}
     with open(args.lock, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.lock_scope == "trial":
+            fcntl.flock(lock, fcntl.LOCK_EX)
         before = hostload.sample(cores, args.sample_seconds, {os.getpid()})
         started = time.time()
         with open(out / f"{role}-{index}.log", "w") as log:
             status = subprocess.run(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
         record["wall_s"] = time.time() - started
         after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
-        fcntl.flock(lock, fcntl.LOCK_UN)
+        if args.lock_scope == "trial":
+            fcntl.flock(lock, fcntl.LOCK_UN)
     foreign, background = [], []
     for rows in (before, after):
         f, b = hostload.classify(rows, args.threshold_pct, allow, args.discard_kernel_threads)
@@ -221,6 +223,12 @@ def main() -> int:
     )
     parser.add_argument("--control-name", default="control (same binary)")
     parser.add_argument("--trials", type=int, default=20)
+    parser.add_argument(
+        "--lock-scope",
+        choices=("trial", "run"),
+        default="trial",
+        help="hold the lock per trial (fair to other takers) or for the whole run (one queue wait)",
+    )
     parser.add_argument("--lock", required=True)
     parser.add_argument("--cores", default="0-63")
     parser.add_argument("--threshold-pct", type=float, default=5.0)
@@ -233,6 +241,9 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+    run_lock = open(args.lock, "w")  # noqa: SIM115 - held until exit when the scope is "run"
+    if args.lock_scope == "run":
+        fcntl.flock(run_lock, fcntl.LOCK_EX)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     control = args.control_command or args.command
