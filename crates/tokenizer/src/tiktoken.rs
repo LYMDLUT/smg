@@ -185,8 +185,9 @@ pub struct TiktokenTokenizer {
     /// Every special token, as the allowed set `CoreBPE::encode` takes.
     /// `encode_with_special_tokens` rebuilds this set from the vocabulary on
     /// every call (hundreds of entries for Kimi), so it is built once per
-    /// tokenizer from the strings in [`SPECIAL_TOKEN_STRINGS`].
-    allowed_special: HashSet<&'static str>,
+    /// tokenizer from the strings in [`SPECIAL_TOKEN_STRINGS`] and shared
+    /// with the deferred Kimi K3 encode job.
+    allowed_special: Arc<HashSet<&'static str>>,
     special_tokens: SpecialTokens,
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
@@ -249,7 +250,7 @@ impl TiktokenTokenizer {
         };
 
         Ok(TiktokenTokenizer {
-            allowed_special: allowed_special_set(&tokenizer),
+            allowed_special: Arc::new(allowed_special_set(&tokenizer)),
             tokenizer,
             special_tokens,
             vocab: HashMap::new(),
@@ -364,7 +365,7 @@ impl TiktokenTokenizer {
         let renderer = detect_renderer_from_config(dir);
 
         Ok(TiktokenTokenizer {
-            allowed_special: allowed_special_set(&tokenizer),
+            allowed_special: Arc::new(allowed_special_set(&tokenizer)),
             tokenizer,
             special_tokens: config.special_tokens,
             vocab,
@@ -527,16 +528,20 @@ pub fn is_tiktoken_file(path: &Path) -> bool {
 }
 
 /// Piecewise encode for a segmented prompt: control pieces with special
-/// tokens recognized, text pieces as ordinary BPE. The allowed-special set is
-/// built once per prompt; `encode_with_special_tokens` would rebuild it for
-/// every piece, and a Kimi prompt has hundreds of control pieces.
-fn encode_segments(bpe: &CoreBPE, segments: &[PromptSegment]) -> Result<Vec<TokenIdType>> {
-    let allowed = bpe.special_tokens();
+/// tokens recognized, text pieces as ordinary BPE. `allowed` is the
+/// tokenizer's special-token set, built once per tokenizer;
+/// `encode_with_special_tokens` would rebuild it for every piece, and a Kimi
+/// prompt has hundreds of control pieces.
+fn encode_segments(
+    bpe: &CoreBPE,
+    allowed: &HashSet<&str>,
+    segments: &[PromptSegment],
+) -> Result<Vec<TokenIdType>> {
     let mut ids = Vec::new();
     for segment in segments {
         if segment.allow_special {
             let (piece, _) = bpe
-                .encode(&segment.text, &allowed)
+                .encode(&segment.text, allowed)
                 .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
             ids.extend(piece);
         } else {
@@ -704,9 +709,13 @@ impl TokenizerTrait for TiktokenTokenizer {
         let text = join_segments(&segments);
         // Piecewise encoding makes the stub's own count its share of the full encode.
         let unbilled_prompt_tokens =
-            encode_segments(&self.tokenizer, &segments[pending])?.len() as u32;
+            encode_segments(&self.tokenizer, &self.allowed_special, &segments[pending])?.len()
+                as u32;
         let bpe = Arc::clone(&self.tokenizer);
-        let job = EncodeJob::new(move || encode_segments(&bpe, &segments).map(Encoding::Tiktoken));
+        let allowed = Arc::clone(&self.allowed_special);
+        let job = EncodeJob::new(move || {
+            encode_segments(&bpe, &allowed, &segments).map(Encoding::Tiktoken)
+        });
         Ok(ChatTemplateOutput {
             text,
             encoding: PromptEncoding::Deferred(job),
@@ -1191,11 +1200,12 @@ mod tests {
     fn test_encode_segments_keeps_control_tokens_out_of_text_segments() {
         let tokenizer = TiktokenTokenizer::from_dir(k3_byte_dir().path()).unwrap();
         let bpe = &tokenizer.tokenizer;
+        let allowed = &tokenizer.allowed_special;
 
-        let control = encode_segments(bpe, &[PromptSegment::control("<|open|>")]).unwrap();
+        let control = encode_segments(bpe, allowed, &[PromptSegment::control("<|open|>")]).unwrap();
         assert_eq!(control, vec![300]);
 
-        let text = encode_segments(bpe, &[PromptSegment::text("<|open|>")]).unwrap();
+        let text = encode_segments(bpe, allowed, &[PromptSegment::text("<|open|>")]).unwrap();
         assert!(
             !text.contains(&300),
             "marker in a text segment must not become a control id: {text:?}"
@@ -1204,6 +1214,7 @@ mod tests {
 
         let mixed = encode_segments(
             bpe,
+            allowed,
             &[
                 PromptSegment::control("<|open|>"),
                 PromptSegment::text("message"),
@@ -1245,6 +1256,7 @@ mod tests {
         let ids = job.run().unwrap();
         let expected = encode_segments(
             &tokenizer.tokenizer,
+            &tokenizer.allowed_special,
             &render_kimi_k3_xtml_prompt(&messages, &params(), None)
                 .unwrap()
                 .segments,
