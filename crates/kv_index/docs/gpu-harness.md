@@ -217,9 +217,33 @@ healthy: wait for the `Tokenizer '<model>' ... registered` log line before loadi
 - `vllm serve` inside a container and from the host do not share the torch.compile / FlashInfer caches; warm the
   one you measure.
 
-## 7. What is running / where things are
+## 7. Loop-head recipe (what the publication run repeats)
 
-As of the end of the session: host processes `8b-w0..w3` (gRPC 20061-20064, logs `logs/host-8b-w*.log`, pids `logs/host-8b-w*.pid`), `http-8b` (:8104), `drill-w0..w3` (gRPC 20071-20074), `sgl-dp2` (:8201), `sgl-hicache` (:8202); the podman containers were killed by pid and podman itself is still wedged. `kill $(cat logs/host-*.pid)` stops the host processes.
+Binaries: `smg` and `replay` built from the loop-head worktree (`/tmp/wt-leap-gpu-harness-head`, f4dc134b at the time of
+writing; rebuild from the SHA the orchestrator names) into `~/.cargo/target-leap-gpu-harness-head/release/`, and the `smg`
+binding wheel from the same tree (`scripts/build-head.sh`, maturin `--compatibility linux`) installed into both host venvs
+(`venv-vllm`, `venv-sglang`) together with `crates/grpc_client/python` and `grpc_servicer/` from that tree.
+
+1. Workers, cores 72-143, one GPU each, pid files under `logs/host-<name>.pid`:
+   `scripts/run-vllm-grpc-host.sh 8b-w$i $i $((20061+i)) $((5730+2*i)) Qwen/Qwen3-8B --max-model-len 40960 --max-num-seqs 128 --gpu-memory-utilization 0.4`
+   (0.3 on a GPU that also carries the reference instance); the servicer logs `Engine connected; the servicer is SERVING`
+   (2-6 min on a cold FlashInfer cache, ~70 s warm). SGLang: `scripts/run-sglang-grpc-host.sh <name> <gpu> <port> <zmq> <replay> [flags]`
+   (the servicer listens on `--port` = `<port>+1000`). Keep `PYTHONHASHSEED` unset. Never kill by name; `kill $(cat logs/host-<name>.pid)`.
+2. Gateway, cores 64-71: `SMG_BIN=<head smg> WORKER_URLS="grpc://127.0.0.1:20061 ..." scripts/launch-gateway.sh <policy> 4 <tokenizer-dir> --reasoning-parser passthrough --health-check-timeout-secs 30 --health-check-interval-secs 20 --health-failure-threshold 5`
+   (`GATEWAY_LOG_LEVEL=warn` default, never info to a file; `GATEWAY_BACKEND=sglang` for SGLang workers; `GATEWAY_PORT`/`PROM_PORT` to run a second one).
+   Before any load, wait until `/workers` shows every worker healthy **and** a dozen chat requests have returned 200 (the
+   tokenizer registration finishes after the health flip; early requests get `Tokenizer not found` 500s).
+   `--reasoning-parser passthrough` because Qwen3 thinks by default and the replay counts only `delta.content`.
+3. Replay (client on 64-71): `replay --trace ~/dynamo/lib/kv-router/traces/mooncake_trace.jsonl --gateway http://127.0.0.1:30100 --model Qwen/Qwen3-8B --speedup 3 --skip 0 --limit 2000 --out results/replay/<label> --label <label>`;
+   three runs per policy, 10 s apart; `summary.json` carries the table columns. Results: `gpu-harness-replay-8b.md`
+   (cache_aware mean of 3: goodput 14.48 req/s, within-SLO 87.8 %, TTFT p50 179 ms; round robin 13.88 req/s, 83.6 %, 213 ms;
+   prefix reuse 0.39 under both because four 97 GB pools hold the whole working set). 50 rows over 40 960 tokens are rejected (`http-400`).
+4. HiCache check against the loop-head gateway: `gpu-harness-hicache-routing.md` (recheck routed to the demoted worker with
+   `event_hit`, `cached_tokens` 624, after its prefix blocks went `Remove GPU` with the host copy kept).
+
+## 8. What is running / where things are
+
+As of the end of round 3: host processes `8b-w0..w3` (kept up for the policy comparison, 40 960 context) (gRPC 20061-20064, logs `logs/host-8b-w*.log`, pids `logs/host-8b-w*.pid`), `http-8b` (:8104), `drill-w0..w3` (gRPC 20071-20074), `sgl-dp2` (:8201), `sgl-hicache` (:8202); the podman containers were killed by pid and podman itself is still wedged. `kill $(cat logs/host-*.pid)` stops the host processes.
 
 - `~/smg-perf/gpu/scripts`: everything above; `fixtures/{vllm,sglang}`: raw captures and summaries;
   `results/`: bench JSONs, T4 table, anomaly note; `logs/`: container and gateway logs; `models/hub`: copies

@@ -1,0 +1,18 @@
+# Mooncake replay on the Qwen3-8B fleet (T9 input parity), 2026-10-05
+
+Trace `~/dynamo/lib/kv-router/traces/mooncake_trace.jsonl` rows 0-1999 at `--speedup 3` (trace span 342 s -> ~117 s per run), `crates/replay` from the loop head (f4dc134b), `--words-per-block 480 --max-output 512`, streaming chat completions with `include_usage`. Gateway: loop-head `smg` on cores 64-71, `--log-level warn --reasoning-parser passthrough` (Qwen3 thinks by default and the replay counts only `delta.content`; with the gateway's Qwen3 reasoning parser active, 1814 of 2000 requests ended with no content token, see run0), health probe timeout 30 s / interval 20 s / threshold 5. Workers: 4 x vLLM 0.31 Qwen3-8B through the loop-head Rust servicer (host venv), `--max-model-len 40960` (Qwen3-8B's `max_position_embeddings`), KV events on. 50 rows exceed 40 960 tokens and are rejected by the gateway's context-length stage (`http-400`) in every run; the mock accepts them. `oracle` is empty on hardware (no mock admin API); `cached_tokens` is the truth. The per-worker split is a single bucket because the Rust servicer sets no `weight_version`, so `balance` is not meaningful here.
+
+| run | ok / errors | req/s | goodput req/s (SLO 500 ms TTFT, 50 ms mean ITL) | within SLO | within SLO strict (p99 ITL) | prefix reuse (cached/prompt) | TTFT mean / p50 / p90 / p99 (ms) | mean ITL mean / p90 / p99 (ms) | per-request p99 ITL p50 / p90 (ms) | e2e p50 / p99 (ms) | hit-over-oracle |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| cache_aware run 1 | 1950 / 50 | 16.30 | 14.26 | 87.5 % | 45.2 % | 0.389 | 273 / 186 / 475 / 1268 | 16.4 / 25.9 / 171.4 | 64.2 / 216.0 | 624 / 12221 | n/a |
+| cache_aware run 2 | 1950 / 50 | 16.60 | 14.80 | 89.2 % | 44.8 % | 0.391 | 240 / 170 / 456 / 884 | 15.9 / 24.0 / 165.2 | 66.4 / 205.4 | 617 / 10675 | n/a |
+| cache_aware run 3 | 1950 / 50 | 16.59 | 14.38 | 86.7 % | 45.0 % | 0.398 | 399 / 181 / 478 / 7414 | 21.0 / 27.8 / 200.3 | 64.2 / 203.6 | 632 / 12407 | n/a |
+| round_robin run 1 | 1950 / 50 | 16.39 | 13.47 | 82.2 % | 36.3 % | 0.389 | 408 / 211 / 502 / 5247 | 24.3 / 51.4 / 227.2 | 70.9 / 214.4 | 722 / 8532 | n/a |
+| round_robin run 2 | 1950 / 50 | 16.66 | 13.66 | 82.0 % | 36.8 % | 0.393 | 336 / 202 / 484 / 3499 | 22.8 / 51.1 / 202.8 | 70.0 / 203.0 | 679 / 8430 | n/a |
+| round_robin run 3 | 1950 / 50 | 16.76 | 14.50 | 86.5 % | 39.1 % | 0.386 | 249 / 227 / 424 / 786 | 20.3 / 36.0 / 198.9 | 69.2 / 198.2 | 645 / 7842 | n/a |
+| **cache_aware mean of 3** | 1950 / 50 | 16.50 | 14.48 | 87.8 % | 45.0 % | 0.393 | 304 / 179 / 470 / 3189 | 17.7 / 25.9 / 179.0 | 64.9 / 208.3 | 624 / 11768 | n/a |
+| **round_robin mean of 3** | 1950 / 50 | 16.60 | 13.88 | 83.6 % | 37.4 % | 0.389 | 331 / 213 / 470 / 3177 | 22.5 / 46.1 / 209.6 | 70.0 / 205.2 | 682 / 8268 | n/a |
+
+run0 (cache_aware with the Qwen3 reasoning parser active, kept for the record): ok 136, errors 1864 (1814 `no-tokens`, 50 `http-400`), TTFT p50 4070 ms.
+
+Reading: the engines report the same prefix reuse under both policies (0.39): with four workers whose KV pools hold the whole working set (97 GB each) and a trace whose repeats are spread over minutes, every worker ends up holding every popular prefix, so round robin also hits after its first visit. Cache-aware routing shows up in the tails and the goodput (within-SLO 87-89 % vs 82-87 %, strict 45 % vs 36-39 %, goodput 14.3-14.8 vs 13.5-14.5 req/s), not in the hit rate. A fleet whose per-worker pool is smaller than the working set (or more workers) is where the hit rate itself separates; the mock's pool size is the parameter to match when comparing row for row.
