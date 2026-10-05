@@ -28,6 +28,18 @@ replay --trace mooncake_trace.jsonl --gateway http://127.0.0.1:31000 \
   --model mock-model --speedup 4 --limit 5000 --admin http://127.0.0.1:31002 --out out/
 ```
 
+With `--gateway-log <file>` (the gateway run at `--log-level debug`) the
+gateway's routing decisions are joined to the requests by request id (the
+`x-request-id` header, which is the response id without its uuid tail) and
+`t4.md` prints the GB300 harness's T4 table: `phase, idx, worker, branch,
+prompt_tokens, engine cached_tokens, implied overlap, agree`. The implied
+overlap is the gateway's stated credit when its log carries one
+(`overlap_tokens=`, `overlap_blocks=` or the tree path's `matched_ratio=`);
+otherwise `agree` compares the branch's claim of an overlap (`event_hit`,
+`event_spill`) with whether the engine served cached tokens. With `--admin`
+the summary also carries `engine_truth_per_worker`, each engine's own account
+of the prompt, cached and oracle tokens it served.
+
 The mock fleet it is meant for is `mock-worker --engine realistic --admin-port`;
 see `crates/mock_worker/README.md` for the engine's scheduler, KV pool and
 timing model (and the caveat that its timing polynomials were validated against

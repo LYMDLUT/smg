@@ -80,6 +80,16 @@ struct Args {
     /// Seed mixed into the synthesized text.
     #[arg(long, default_value_t = 7)]
     seed: u64,
+    /// The gateway's log at debug level: its routing decisions are joined to
+    /// the requests by request id (T4: gateway credit vs engine truth).
+    #[arg(long)]
+    gateway_log: Option<PathBuf>,
+    /// The fleet's block size, to turn a credit in blocks into tokens.
+    #[arg(long, default_value_t = 16)]
+    block_size: u32,
+    /// Rows of the T4 table written to `t4.md`.
+    #[arg(long, default_value_t = 40)]
+    t4_rows: usize,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -112,6 +122,14 @@ struct ReqResult {
     /// Output tokens the engine counted but the stream never showed as text
     /// (an incomplete UTF-8 piece the detokenizer holds back).
     invisible_tokens: u32,
+    /// The gateway's `x-request-id` (the response id without its uuid tail).
+    gateway_request_id: String,
+    /// The gateway's routing branch for this request (from its debug log).
+    branch: String,
+    /// The gateway's cache credit in tokens, when its log states one.
+    credit_tokens: Option<u32>,
+    /// Whether the gateway's credit agrees with what the engine served.
+    agree: Option<bool>,
 }
 
 const WORDS: &[&str] = &[
@@ -449,6 +467,12 @@ async fn run_one(job: Job) -> ReqResult {
         result.latency_ms = started.elapsed().as_secs_f64() * 1000.0;
         return result;
     }
+    result.gateway_request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut observer = StreamObserver::default();
@@ -585,6 +609,186 @@ impl StreamObserver {
             result.status = "no-tokens".to_string();
         }
     }
+}
+
+/// One routing decision from the gateway's debug log.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Decision {
+    worker: String,
+    branch: String,
+    /// `matched_ratio=` on the tree path.
+    matched_ratio: Option<f64>,
+    /// `overlap_tokens=` / `overlap_blocks=`, when the gateway logs them.
+    overlap_tokens: Option<u32>,
+    overlap_blocks: Option<u32>,
+}
+
+impl Decision {
+    /// The credit in tokens, floored to the block, when the log states one.
+    fn credit_tokens(&self, prompt_tokens: u32, block_size: u32) -> Option<u32> {
+        let bs = block_size.max(1);
+        if let Some(t) = self.overlap_tokens {
+            return Some(t / bs * bs);
+        }
+        if let Some(b) = self.overlap_blocks {
+            return Some(b * bs);
+        }
+        self.matched_ratio
+            .map(|r| ((r * f64::from(prompt_tokens)) as u32) / bs * bs)
+    }
+
+    fn claims_overlap(&self) -> bool {
+        matches!(self.branch.as_str(), "event_hit" | "event_spill")
+            || self.branch.starts_with("hit")
+            || self.branch.contains("cache_hit")
+    }
+}
+
+/// The value of `name="..."` or `name=<token>` in a log line.
+fn log_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let start = line.find(&format!("{name}="))? + name.len() + 1;
+    let rest = &line[start..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        quoted.split('"').next()
+    } else {
+        rest.split(|c: char| c.is_whitespace() || c == ',' || c == '}')
+            .next()
+    }
+}
+
+/// A log line without its ANSI colour sequences (`ESC [ ... m`), which the
+/// gateway writes even into a file.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for d in chars.by_ref() {
+                if ('@'..='~').contains(&d) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The gateway's routing decisions by request id: the last decision line of
+/// each request (`Event-driven routing` and `Cache-aware selection` lines).
+fn parse_decisions(text: &str) -> HashMap<String, Decision> {
+    let mut out = HashMap::new();
+    for raw in text.lines() {
+        if !(raw.contains("Event-driven routing") || raw.contains("Cache-aware selection")) {
+            continue;
+        }
+        let clean = strip_ansi(raw);
+        let line = clean.as_str();
+        let Some(id) = log_field(line, "request_id") else {
+            continue;
+        };
+        let branch = log_field(line, "branch").unwrap_or_else(|| {
+            if line.contains("no overlap") {
+                "expected_wait_fallback"
+            } else {
+                "?"
+            }
+        });
+        out.insert(
+            id.to_string(),
+            Decision {
+                worker: log_field(line, "worker").unwrap_or_default().to_string(),
+                branch: branch.to_string(),
+                matched_ratio: log_field(line, "matched_ratio").and_then(|v| v.parse().ok()),
+                overlap_tokens: log_field(line, "overlap_tokens").and_then(|v| v.parse().ok()),
+                overlap_blocks: log_field(line, "overlap_blocks").and_then(|v| v.parse().ok()),
+            },
+        );
+    }
+    out
+}
+
+/// The gateway's request id is the response id without its uuid tail
+/// (`-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, 37 bytes).
+fn request_id_prefix(id: &str) -> String {
+    let bytes = id.as_bytes();
+    if bytes.len() > 37 {
+        let tail = &bytes[bytes.len() - 37..];
+        let uuid_shaped = [0usize, 9, 14, 19, 24].iter().all(|&i| tail[i] == b'-')
+            && tail
+                .iter()
+                .enumerate()
+                .all(|(i, b)| matches!(i, 0 | 9 | 14 | 19 | 24) || b.is_ascii_hexdigit());
+        if uuid_shaped {
+            return id[..bytes.len() - 37].to_string();
+        }
+    }
+    id.to_string()
+}
+
+fn t4_summary(ok: &[&ReqResult], decisions: usize) -> Value {
+    let joined: Vec<&&ReqResult> = ok.iter().filter(|r| !r.branch.is_empty()).collect();
+    let agree = joined.iter().filter(|r| r.agree == Some(true)).count();
+    let credit_known = joined.iter().filter(|r| r.credit_tokens.is_some()).count();
+    let mut by_branch: BTreeMap<String, (usize, usize, u64)> = BTreeMap::new();
+    for r in &joined {
+        let e = by_branch.entry(r.branch.clone()).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += usize::from(r.agree == Some(true));
+        e.2 += u64::from(r.cached_tokens);
+    }
+    json!({
+        "decisions_in_log": decisions,
+        "joined": joined.len(),
+        "credit_known": credit_known,
+        "agree": agree,
+        "disagree": joined.len() - agree,
+        "by_branch": by_branch.iter().map(|(b, (n, a, cached))| json!({
+            "branch": b, "requests": n, "agree": a,
+            "engine_cached_tokens_mean": if *n == 0 { 0.0 } else { *cached as f64 / *n as f64 },
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The T4 table with the GB300 harness's columns: `implied overlap` is the
+/// gateway's stated credit when its log carries one, `-` otherwise (then
+/// `agree` compares the branch's claim of an overlap with the engine).
+fn t4_table(results: &[ReqResult], rows: usize) -> String {
+    let mut out = String::from(
+        "| phase | idx | worker | branch | prompt_tokens | engine cached_tokens | implied overlap | agree |
+|---|---|---|---|---|---|---|---|
+",
+    );
+    let joined: Vec<&ReqResult> = results
+        .iter()
+        .filter(|r| r.status == "ok" && !r.branch.is_empty())
+        .collect();
+    for r in joined.iter().take(rows) {
+        out.push_str(&format!(
+            "| replay | {} | {} | {} | {} | {} | {} | {} |
+",
+            r.row,
+            r.worker.rsplit(':').next().unwrap_or(&r.worker),
+            r.branch,
+            r.prompt_tokens,
+            r.cached_tokens,
+            r.credit_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            r.agree.map(|v| v.to_string()).unwrap_or_default()
+        ));
+    }
+    let agree = joined.iter().filter(|r| r.agree == Some(true)).count();
+    out.push_str(&format!(
+        "
+agreement: {agree}/{} (gateway credit vs engine truth; {} rows shown)
+",
+        joined.len(),
+        joined.len().min(rows)
+    ));
+    out
 }
 
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
@@ -728,6 +932,41 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Gateway routing decisions (T4): join by request id.
+    let mut decisions: HashMap<String, Decision> = HashMap::new();
+    if let Some(log) = &args.gateway_log {
+        match fs::read_to_string(log) {
+            Ok(text) => decisions = parse_decisions(&text),
+            Err(e) => eprintln!("gateway log unreadable: {e}"),
+        }
+        for r in &mut results {
+            let key = if r.gateway_request_id.is_empty() {
+                request_id_prefix(&r.request_id)
+            } else {
+                r.gateway_request_id.clone()
+            };
+            if let Some(d) = decisions.get(&key) {
+                r.branch.clone_from(&d.branch);
+                r.credit_tokens = d.credit_tokens(r.prompt_tokens, args.block_size);
+                r.agree = Some(match r.credit_tokens {
+                    Some(credit) => credit == r.cached_tokens,
+                    None => d.claims_overlap() == (r.cached_tokens > 0),
+                });
+            }
+        }
+    }
+    let mut truth_per_worker: Value = Value::Null;
+    if let Some(admin) = &args.admin {
+        match client
+            .get(format!("{}/admin/truth", admin.trim_end_matches('/')))
+            .send()
+            .await
+        {
+            Ok(resp) => truth_per_worker = resp.json().await.unwrap_or(Value::Null),
+            Err(e) => eprintln!("engine truth unavailable: {e}"),
+        }
+    }
+
     // Statistics over the non-warm-up rows.
     let scored: Vec<&ReqResult> = results.iter().filter(|r| r.row >= args.warmup).collect();
     let ok: Vec<&ReqResult> = scored
@@ -799,6 +1038,8 @@ async fn main() -> Result<()> {
         "hit_over_oracle": if oracle_total == 0 { f64::NAN } else { cached_total as f64 / oracle_total as f64 },
         "oracle_known": oracle_known,
         "per_worker_requests": per_worker.iter().map(|(w, v)| json!({"worker": w, "requests": v.0, "uncached_prompt_tokens": v.1})).collect::<Vec<_>>(),
+        "t4": t4_summary(&ok, decisions.len()),
+        "engine_truth_per_worker": truth_per_worker.get("workers").cloned().unwrap_or(Value::Array(Vec::new())),
         "balance_max_over_mean": balance_max_over_mean,
         "slo": {"ttft_ms": args.slo_ttft_ms, "itl_ms": args.slo_itl_ms, "itl_metric": "per-request mean (strict variant: per-request p99)"},
     });
@@ -807,10 +1048,10 @@ async fn main() -> Result<()> {
         args.out.join("summary.json"),
         serde_json::to_string_pretty(&summary)?,
     )?;
-    let mut csv = String::from("row,trace_ts_ms,trace_input_length,sent_at_ms,status,request_id,worker,prompt_tokens,completion_tokens,cached_tokens,oracle_tokens,queued_ms,ttft_ms,latency_ms,itl_mean_ms,itl_p99_ms,tokens_seen,invisible_tokens\n");
+    let mut csv = String::from("row,trace_ts_ms,trace_input_length,sent_at_ms,status,request_id,worker,prompt_tokens,completion_tokens,cached_tokens,oracle_tokens,queued_ms,ttft_ms,latency_ms,itl_mean_ms,itl_p99_ms,tokens_seen,invisible_tokens,gateway_request_id,branch,credit_tokens,agree\n");
     for r in &results {
         csv.push_str(&format!(
-            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{}\n",
+            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{}\n",
             r.row,
             r.trace_ts_ms,
             r.trace_input_length,
@@ -828,10 +1069,15 @@ async fn main() -> Result<()> {
             r.itl_mean_ms.map(|v| format!("{v:.2}")).unwrap_or_default(),
             r.itl_p99_ms.map(|v| format!("{v:.2}")).unwrap_or_default(),
             r.tokens_seen,
-            r.invisible_tokens
+            r.invisible_tokens,
+            r.gateway_request_id,
+            r.branch,
+            r.credit_tokens.map(|v| v.to_string()).unwrap_or_default(),
+            r.agree.map(|v| v.to_string()).unwrap_or_default()
         ));
     }
     fs::write(args.out.join("requests.csv"), csv)?;
+    fs::write(args.out.join("t4.md"), t4_table(&results, args.t4_rows))?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
@@ -954,6 +1200,59 @@ mod tests {
         // No usage arrived: the stream is still a served one, counted as seen.
         assert_eq!(result.status, "ok");
         assert_eq!(result.completion_tokens, 3);
+    }
+
+    #[test]
+    fn gateway_decisions_are_parsed_and_joined_by_request_id() {
+        let log = concat!(
+            "2026-10-05 10:23:43 DEBUG http_request{method=POST uri=/v1/chat/completions version=HTTP/1.1 module=\"smg\" request_id=\"chatcmpl-nukU\"}: smg::policies::cache_aware: cache_aware.rs:1681: Cache-aware selection index=\"tree\" branch=\"expected_wait_fallback\" worker=\"grpc://127.0.0.1:19611\" model_id=\"mock-model\" matched_ratio=0.0 threshold=0.30000001192092896\n",
+            "2026-10-05 10:23:46 DEBUG http_request{method=POST uri=/v1/chat/completions version=HTTP/1.1 module=\"smg\" request_id=\"chatcmpl-UNiu\"}: smg::policies::cache_aware: cache_aware.rs:1493: Event-driven routing: overlap match worker=\"grpc://127.0.0.1:19611\" branch=\"event_hit\" model_id=\"mock-model\"\n",
+            "2026-10-05 10:23:48 DEBUG http_request{request_id=\"chatcmpl-fut\"}: smg::policies::cache_aware: Event-driven routing: overlap match worker=\"grpc://127.0.0.1:19610\" branch=\"event_hit\" overlap_blocks=12 model_id=\"mock-model\"\n",
+            "2026-10-05 10:23:49 DEBUG http_request{request_id=\"chatcmpl-none\"}: smg::policies::cache_aware: Event-driven routing: no overlap, expected-wait fallback worker=\"grpc://127.0.0.1:19610\" model_id=\"mock-model\"\n",
+            "2026-10-05 10:23:50 DEBUG some other line request_id=\"x\" branch=\"nope\"\n",
+            // As the gateway really writes it: ANSI colour sequences around every field.
+            "\u{1b}[2m2026-10-05 10:59:48\u{1b}[0m \u{1b}[34mDEBUG\u{1b}[0m \u{1b}[1mhttp_request\u{1b}[0m\u{1b}[1m{\u{1b}[0m\u{1b}[3mrequest_id\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"chatcmpl-7lE1\"\u{1b}[1m}\u{1b}[0m\u{1b}[2m:\u{1b}[0m Event-driven routing: overlap match \u{1b}[3mworker\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"grpc://127.0.0.1:19702\" \u{1b}[3mbranch\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"event_spill\"\n",
+        );
+        let d = parse_decisions(log);
+        assert_eq!(d.len(), 5);
+        assert_eq!(d["chatcmpl-7lE1"].branch, "event_spill");
+        assert_eq!(d["chatcmpl-7lE1"].worker, "grpc://127.0.0.1:19702");
+        assert_eq!(d["chatcmpl-nukU"].branch, "expected_wait_fallback");
+        assert_eq!(d["chatcmpl-nukU"].matched_ratio, Some(0.0));
+        assert_eq!(d["chatcmpl-nukU"].credit_tokens(1000, 16), Some(0));
+        assert_eq!(d["chatcmpl-UNiu"].branch, "event_hit");
+        assert!(d["chatcmpl-UNiu"].claims_overlap());
+        assert_eq!(d["chatcmpl-UNiu"].credit_tokens(1000, 16), None);
+        assert_eq!(d["chatcmpl-fut"].credit_tokens(1000, 16), Some(192));
+        assert_eq!(d["chatcmpl-none"].branch, "expected_wait_fallback");
+        assert!(!d["chatcmpl-none"].claims_overlap());
+        assert_eq!(
+            request_id_prefix(
+                "chatcmpl-nukUelurU5QeHF4GhOUknktv-01a10b97-428b-7f72-9728-a08fad5787ae"
+            ),
+            "chatcmpl-nukUelurU5QeHF4GhOUknktv"
+        );
+    }
+
+    #[test]
+    fn t4_table_has_the_harness_columns() {
+        let mut r = ReqResult {
+            row: 3,
+            status: "ok".to_string(),
+            worker: "grpc:19500".to_string(),
+            branch: "event_hit".to_string(),
+            prompt_tokens: 640,
+            cached_tokens: 512,
+            agree: Some(true),
+            ..Default::default()
+        };
+        let table = t4_table(std::slice::from_ref(&r), 10);
+        assert!(table.starts_with("| phase | idx | worker | branch | prompt_tokens | engine cached_tokens | implied overlap | agree |"));
+        assert!(table.contains("| replay | 3 | 19500 | event_hit | 640 | 512 | - | true |"));
+        assert!(table.contains("agreement: 1/1"));
+        r.credit_tokens = Some(512);
+        let table = t4_table(std::slice::from_ref(&r), 10);
+        assert!(table.contains("| 640 | 512 | 512 | true |"));
     }
 
     #[test]
