@@ -32,7 +32,7 @@ use std::{
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 /// Seed for XXH3 hashing.
 pub const XXH3_SEED: u64 = 1337;
@@ -234,6 +234,120 @@ pub fn compute_request_content_hashes(tokens: &[u32], block_size: usize) -> Vec<
 // SeqEntry: optimizes for the common case (one seq_hash per position+content)
 // ---------------------------------------------------------------------------
 
+/// Ids below this many live in the inline words of a [`WorkerSet`].
+const INLINE_WORKER_IDS: u32 = 128;
+
+/// Dense set of interned worker ids.
+///
+/// Two inline words cover ids below [`INLINE_WORKER_IDS`] with no heap
+/// allocation, which is every worker in a typical fleet; larger ids spill
+/// into a boxed word slice that is regrown on demand (rare: a fleet past 128
+/// workers). Membership is a bit test and "does this set hold every active
+/// worker" a loop of bit tests, which is what the lookup path does at every
+/// landing and scan step.
+#[derive(Debug, Clone, Default)]
+struct WorkerSet {
+    low: [u64; 2],
+    high: Option<Box<[u64]>>,
+}
+
+impl WorkerSet {
+    fn single(id: u32) -> Self {
+        let mut set = Self::default();
+        set.insert(id);
+        set
+    }
+
+    #[inline]
+    fn slot(id: u32) -> (usize, u64) {
+        ((id / 64) as usize, 1u64 << (id % 64))
+    }
+
+    /// Insert `id`; returns whether it was newly added.
+    fn insert(&mut self, id: u32) -> bool {
+        let (word, bit) = Self::slot(id);
+        if id < INLINE_WORKER_IDS {
+            let was = self.low[word] & bit != 0;
+            self.low[word] |= bit;
+            return !was;
+        }
+        let index = word - 2;
+        let mut high = match self.high.take() {
+            Some(high) if high.len() > index => high,
+            Some(high) => {
+                let mut grown = vec![0u64; index + 1];
+                grown[..high.len()].copy_from_slice(&high);
+                grown.into_boxed_slice()
+            }
+            None => vec![0u64; index + 1].into_boxed_slice(),
+        };
+        let was = high[index] & bit != 0;
+        high[index] |= bit;
+        self.high = Some(high);
+        !was
+    }
+
+    /// Remove `id`; returns whether it was present.
+    fn remove(&mut self, id: u32) -> bool {
+        let (word, bit) = Self::slot(id);
+        if id < INLINE_WORKER_IDS {
+            let was = self.low[word] & bit != 0;
+            self.low[word] &= !bit;
+            return was;
+        }
+        let Some(high) = self.high.as_mut() else {
+            return false;
+        };
+        let index = word - 2;
+        let Some(slot) = high.get_mut(index) else {
+            return false;
+        };
+        let was = *slot & bit != 0;
+        *slot &= !bit;
+        was
+    }
+
+    #[inline]
+    fn contains(&self, id: u32) -> bool {
+        let (word, bit) = Self::slot(id);
+        if id < INLINE_WORKER_IDS {
+            return self.low[word] & bit != 0;
+        }
+        self.high
+            .as_ref()
+            .and_then(|high| high.get(word - 2))
+            .is_some_and(|slot| slot & bit != 0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.low == [0, 0]
+            && self
+                .high
+                .as_ref()
+                .is_none_or(|high| high.iter().all(|w| *w == 0))
+    }
+
+    /// Every id in the set, ascending.
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        let words = self
+            .low
+            .iter()
+            .copied()
+            .chain(self.high.iter().flat_map(|high| high.iter().copied()));
+        words.enumerate().flat_map(|(index, mut word)| {
+            let base = index as u32 * 64;
+            std::iter::from_fn(move || {
+                if word == 0 {
+                    return None;
+                }
+                let bit = word.trailing_zeros();
+                word &= word - 1;
+                Some(base + bit)
+            })
+        })
+    }
+}
+
 /// Entry for the innermost level of the index.
 ///
 /// Optimizes for the common case where there's only one sequence hash
@@ -241,16 +355,14 @@ pub fn compute_request_content_hashes(tokens: &[u32], block_size: usize) -> Vec<
 #[derive(Debug, Clone)]
 enum SeqEntry {
     /// Single seq_hash → workers mapping (common case, no HashMap allocation).
-    Single(SequenceHash, FxHashSet<u32>),
+    Single(SequenceHash, WorkerSet),
     /// Multiple seq_hash → workers mappings (rare: different prefixes with same content).
-    Multi(FxHashMap<SequenceHash, FxHashSet<u32>>),
+    Multi(FxHashMap<SequenceHash, WorkerSet>),
 }
 
 impl SeqEntry {
     fn new(seq_hash: SequenceHash, worker_id: u32) -> Self {
-        let mut workers = FxHashSet::default();
-        workers.insert(worker_id);
-        Self::Single(seq_hash, workers)
+        Self::Single(seq_hash, WorkerSet::single(worker_id))
     }
 
     /// Insert a worker for a given seq_hash, upgrading to Multi if needed.
@@ -281,14 +393,14 @@ impl SeqEntry {
     fn remove(&mut self, seq_hash: SequenceHash, worker_id: u32) -> (bool, bool) {
         match self {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => {
-                let removed = workers.remove(&worker_id);
+                let removed = workers.remove(worker_id);
                 (removed, workers.is_empty())
             }
             Self::Single(_, _) => (false, false),
             Self::Multi(map) => {
                 let mut removed = false;
                 if let Some(workers) = map.get_mut(&seq_hash) {
-                    removed = workers.remove(&worker_id);
+                    removed = workers.remove(worker_id);
                     if workers.is_empty() {
                         map.remove(&seq_hash);
                     }
@@ -305,13 +417,13 @@ impl SeqEntry {
     fn accumulate_worker_counts(&self, acc: &mut FxHashMap<u32, usize>) {
         match self {
             Self::Single(_, workers) => {
-                for &w in workers {
+                for w in workers.iter() {
                     *acc.entry(w).or_default() += 1;
                 }
             }
             Self::Multi(map) => {
                 for workers in map.values() {
-                    for &w in workers {
+                    for w in workers.iter() {
                         *acc.entry(w).or_default() += 1;
                     }
                 }
@@ -320,7 +432,7 @@ impl SeqEntry {
     }
 
     /// Get workers for a specific prefix hash (used in query path and event processing).
-    fn get(&self, seq_hash: SequenceHash) -> Option<&FxHashSet<u32>> {
+    fn get(&self, seq_hash: SequenceHash) -> Option<&WorkerSet> {
         match self {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => Some(workers),
             Self::Single(_, _) => None,
@@ -766,11 +878,11 @@ impl PositionalIndexer {
             let (position, content) = *entry.key();
             match &entry.value().seq {
                 SeqEntry::Single(prefix, workers) => {
-                    out.extend(workers.iter().map(|&w| (w, position, content, *prefix)));
+                    out.extend(workers.iter().map(|w| (w, position, content, *prefix)));
                 }
                 SeqEntry::Multi(map) => {
                     for (prefix, workers) in map {
-                        out.extend(workers.iter().map(|&w| (w, position, content, *prefix)));
+                        out.extend(workers.iter().map(|w| (w, position, content, *prefix)));
                     }
                 }
             }
@@ -999,7 +1111,7 @@ impl PositionalIndexer {
             .value()
             .seq
             .get(seq_hashes[position])
-            .map(|workers| workers.iter().copied().collect())
+            .map(|workers| workers.iter().collect())
     }
 
     /// Whether every worker in `active` still holds the request's exact block at `position`
@@ -1026,9 +1138,7 @@ impl PositionalIndexer {
             .value()
             .seq
             .get(seq_hashes[position])
-            .is_some_and(|workers| {
-                workers.len() >= active.len() && active.iter().all(|w| workers.contains(w))
-            })
+            .is_some_and(|workers| active.iter().all(|&w| workers.contains(w)))
     }
 
     /// Scan positions sequentially, draining workers that stop matching.
@@ -1074,7 +1184,7 @@ impl PositionalIndexer {
 
             let mut i = 0;
             while i < active.len() {
-                if workers.contains(&active[i]) {
+                if workers.contains(active[i]) {
                     i += 1;
                 } else {
                     internal_scores.insert(active[i], pos as u32);
@@ -1265,6 +1375,36 @@ mod tests {
     /// Helper: create ContentHash sequence for find_matches.
     fn hashes(values: &[u64]) -> Vec<ContentHash> {
         values.iter().map(|&v| ContentHash(v)).collect()
+    }
+
+    #[test]
+    fn worker_set_inline_and_spilled_ids() {
+        let mut set = WorkerSet::default();
+        assert!(set.is_empty());
+        for id in [0u32, 63, 64, 127, 128, 200, 10_000] {
+            assert!(set.insert(id), "{id} newly inserted");
+            assert!(!set.insert(id), "{id} already present");
+            assert!(set.contains(id));
+        }
+        assert!(!set.contains(1));
+        assert!(!set.contains(129));
+        assert!(!set.contains(100_000));
+        assert_eq!(
+            set.iter().collect::<Vec<_>>(),
+            vec![0, 63, 64, 127, 128, 200, 10_000],
+            "iteration is ascending across the inline and spilled words"
+        );
+        for id in [63u32, 128, 10_000] {
+            assert!(set.remove(id));
+            assert!(!set.remove(id));
+            assert!(!set.contains(id));
+        }
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 64, 127, 200]);
+        for id in [0u32, 64, 127, 200] {
+            set.remove(id);
+        }
+        assert!(set.is_empty(), "all bits cleared, including spilled words");
+        assert!(!WorkerSet::default().remove(5));
     }
 
     #[test]
