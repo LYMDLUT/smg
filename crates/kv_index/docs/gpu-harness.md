@@ -144,9 +144,12 @@ prefix_repetition` from the vLLM image; `scripts/bench_prefix.py` = the same sha
 | gateway random | bench_prefix.py | 1222 / 2730 / 3723 | 0.02 / 4.6 | 1352 | 14.2 (72 x HTTP 500) |
 | gateway cache_aware (later run) | bench_prefix.py | 732 / 3082 / 3698 | 0.04 / 4.1 | 801 | 16.0 (28 x HTTP 500) |
 | one plain vLLM HTTP instance, same 16 req/s | bench_prefix.py | 28.5 / 44.1 / 56.9 | 1.99 / 4.06 | 155 | 17.0 |
+| gateway cache_aware, **warn** level, 4 workers w0-w3, cores 64-71 | bench_prefix.py | 18.4 / 22.4 / 28.1 | 1.49 / 1.93 | 113 | 17.0 |
+| gateway round_robin, **warn** level, 4 workers | bench_prefix.py | 17.6 / 20.8 / 27.0 | 1.47 / 1.85 | 110 | 17.0 |
+| gateway round_robin, info level, same 4 workers | bench_prefix.py | 333 / 910 / 1744 | 1.44 / 22.6 | 463 | 16.9 |
 | one plain vLLM HTTP instance, all-unique prompts, 2 req/s | vllm bench | 23.5 / - / 33.5 | 1.68 / 2.08 | 129 | 2.0 |
 
-Starvation was tested and ruled out afterwards (gateway and clients on the idle cores 64-71, scheduler wait time 0 ms, 8 or 72 runtime workers, round robin and cache_aware, HTTP and gRPC workers all show the same stall; details and a syscall timeline in `~/smg-perf/gpu/results/gateway-stream-anomaly.md`). The gateway and the load clients now run on cores 64-71 for every GPU-side run (`launch-gateway.sh`, `GATEWAY_CPUS`), engines and builds on 72-143. Read with that note: the direct gRPC path to any of the eight
+Resolved the same day: the stall is the gateway's per-request info logging written to a file (warn level or stdout to /dev/null gives 18-31 ms TTFT and smooth streaming on the same workers; table in the anomaly note). The harness runs the gateway at `--log-level warn` for every measurement; the info-level rows above are kept as the record of that defect. Starvation was tested and ruled out first (gateway and clients on the idle cores 64-71, scheduler wait time 0 ms, 8 or 72 runtime workers, round robin and cache_aware, HTTP and gRPC workers all show the same stall; details and a syscall timeline in `~/smg-perf/gpu/results/gateway-stream-anomaly.md`). The gateway and the load clients now run on cores 64-71 for every GPU-side run (`launch-gateway.sh`, `GATEWAY_CPUS`), engines and builds on 72-143. Read with that note: the direct gRPC path to any of the eight
 servicers answers a 2048-token prompt in 15-41 ms and streams at 1.4 ms/token, while the gateway's HTTP path
 adds 30-600 ms and often delivers the whole response as one burst (`smg_router_request_duration_seconds` mean
 3.6 ms vs `smg_http_request_duration_seconds` mean 140 ms over the same requests). The first cache_aware run is
