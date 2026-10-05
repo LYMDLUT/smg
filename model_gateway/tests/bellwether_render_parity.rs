@@ -5,12 +5,13 @@
 //! Hugging Face revision, what the checkpoint's own chat template renders for
 //! a corpus of chat requests: the prompt text and its token ids. This test
 //! turns each recorded request into the `ChatCompletionRequest` the HTTP layer
-//! would build, renders it with `process_chat_messages`, the entry point the
-//! gateway and the bindings share (content format, typed tools, tool-call
-//! arguments parsed for renderers that do not take them raw, template kwargs,
-//! the thinking toggle, `continue_final_message`), encodes the text as the
-//! gateway's tokenize step does, and compares text and ids with the reference
-//! byte for byte.
+//! would hand on (deserialized, normalized and validated as `ValidatedJson`
+//! does, tools narrowed by `tool_choice` as the chat preparation stage does),
+//! renders it with `process_chat_messages`, the entry point the gateway and the
+//! bindings share (content format, typed tools, tool-call arguments parsed for
+//! renderers that do not take them raw, template kwargs, the thinking toggle,
+//! `continue_final_message`), encodes the text as the gateway's tokenize step
+//! does, and compares text and ids with the reference byte for byte.
 //!
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory
 //! of a bellwether checkout; without it the test prints a skip notice and
@@ -36,10 +37,11 @@ use std::{
 };
 
 use llm_tokenizer::{create_tokenizer, traits::Tokenizer};
-use openai_protocol::chat::ChatCompletionRequest;
+use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
 use serde::Deserialize;
 use serde_json::Value;
 use smg::routers::grpc::utils::process_chat_messages;
+use validator::Validate;
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 const CACHE_DIR: &str = ".tokenizer_cache/bellwether";
@@ -87,6 +89,16 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "deepseek-r1/render/tools-history-content-and-call",
         "the gateway parses tool-call arguments into objects before rendering and the R1 template \
          concatenates them as text, so the render fails (smg-project/smg#2783)",
+    ),
+    (
+        "qwen3-8b/render/text-empty-user",
+        "the gateway's request validation rejects an empty message content with 400; the template \
+         renders it (smg-project/bellwether#13, needs:simo)",
+    ),
+    (
+        "deepseek-r1/render/text-empty-user",
+        "the gateway's request validation rejects an empty message content with 400; the template \
+         renders it (smg-project/bellwether#13, needs:simo)",
     ),
     (
         "qwen3-8b/render/tools-call-arguments-object",
@@ -209,8 +221,13 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
                     println!("  match   {}", fixture.id);
                 }
                 Err(why) => {
+                    let listed = known
+                        .get(fixture.id.as_str())
+                        .map_or(String::new(), |reason| {
+                            format!("\n          known: {reason}")
+                        });
                     println!(
-                        "  differs {} (reference {}): {why}",
+                        "  differs {} (reference {}): {why}{listed}",
                         fixture.id, fixture.reference.source
                     );
                     differences.insert(fixture.id, why);
@@ -259,18 +276,34 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
 }
 
 /// Hand a corpus request to the gateway's own request processing. The request
-/// becomes the `ChatCompletionRequest` the HTTP layer would build, with the
-/// manifest's model, and keys SMG does not know are ignored the way the
-/// gateway ignores them. `process_chat_messages` then renders it exactly as the
-/// gateway does before tokenizing, and the ids are the flat encode of that
-/// text, which is the gateway's tokenize step for a renderer that returns text
-/// to encode.
+/// becomes the `ChatCompletionRequest` the HTTP layer would hand on: the
+/// manifest's model added, keys SMG does not know ignored the way the gateway
+/// ignores them, then normalized and validated as `ValidatedJson` does with
+/// every chat request (the provider profile's rewrites, deprecated-field
+/// migration, the `tool_choice` default; a request the gateway would answer
+/// with 400 is a difference, not a rendering), then the tools narrowed by
+/// `tool_choice` as the chat preparation stage does before rendering.
+/// `process_chat_messages` then renders it exactly as the gateway does before
+/// tokenizing, and the ids are the flat encode of that text, which is the
+/// gateway's tokenize step for a renderer that returns text to encode.
 fn render(tok: &dyn Tokenizer, model: &str, request: &Value) -> Result<Rendered, String> {
     let mut body = request.clone();
     let object = body.as_object_mut().ok_or("the request is not an object")?;
     object.insert("model".to_string(), Value::String(model.to_string()));
-    let request: ChatCompletionRequest = serde_json::from_value(body)
+    let mut request: ChatCompletionRequest = serde_json::from_value(body)
         .map_err(|e| format!("the gateway does not accept this request: {e}"))?;
+    request.normalize();
+    request
+        .validate()
+        .map_err(|e| format!("the gateway rejects this request with 400: {e}"))?;
+    // `filter_chat_request_by_tool_choice`, crate-private, applies this rule.
+    let narrowed = match (&request.tools, &request.tool_choice) {
+        (Some(tools), Some(choice)) => choice.narrow_tools(tools),
+        _ => None,
+    };
+    if let Some(tools) = narrowed {
+        request.tools = Some(tools);
+    }
     let processed = process_chat_messages(&request, tok, None)?;
     let ids = tok
         .encode(&processed.text, false)
