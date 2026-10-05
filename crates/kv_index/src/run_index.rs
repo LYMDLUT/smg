@@ -865,6 +865,39 @@ pub struct RunIndexStats {
     pub header_bytes: usize,
 }
 
+/// Where a writer waited: the root, a leaf only this worker holds, or a run others hold too.
+#[derive(Clone, Copy)]
+enum LockKind {
+    Root = 0,
+    Own = 1,
+    Shared = 2,
+}
+
+/// Lane-side counters (feature `lane-stats`; zero otherwise): lock acquisitions and the time spent
+/// waiting for contended ones by run kind, store walks restarted, and splits by cause.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaneStats {
+    pub locks: [u64; 3],
+    pub contended: [u64; 3],
+    pub wait_ns: [u64; 3],
+    pub restarts: u64,
+    pub splits_divergence: u64,
+    pub splits_hole: u64,
+    pub splits_stale_parent: u64,
+}
+
+#[cfg(feature = "lane-stats")]
+#[derive(Default)]
+struct LaneCounters {
+    locks: [CachePadded<AtomicU64>; 3],
+    contended: [CachePadded<AtomicU64>; 3],
+    wait_ns: [CachePadded<AtomicU64>; 3],
+    restarts: CachePadded<AtomicU64>,
+    splits_divergence: CachePadded<AtomicU64>,
+    splits_hole: CachePadded<AtomicU64>,
+    splits_stale_parent: CachePadded<AtomicU64>,
+}
+
 /// Worker slots: a slot is in use from `intern_worker` until `remove_worker`, after which it is
 /// handed out again (every coverage bit of a removed worker is clear by then).
 #[derive(Default)]
@@ -885,6 +918,8 @@ pub struct RunIndex {
     worker_blocks: Box<[CachePadded<AtomicUsize>]>,
     /// Per-worker signed contributions to the distinct-block count, summed on demand.
     distinct_blocks: Box<[CachePadded<AtomicIsize>]>,
+    #[cfg(feature = "lane-stats")]
+    counters: LaneCounters,
 }
 
 impl Default for RunIndex {
@@ -974,6 +1009,92 @@ impl RunIndex {
             distinct_blocks: (0..max_workers)
                 .map(|_| CachePadded::new(AtomicIsize::new(0)))
                 .collect(),
+            #[cfg(feature = "lane-stats")]
+            counters: LaneCounters::default(),
+        }
+    }
+
+    /// The lane-side counters (all zero unless the crate is built with `lane-stats`).
+    pub fn lane_stats(&self) -> LaneStats {
+        #[cfg(feature = "lane-stats")]
+        {
+            let load = |slots: &[CachePadded<AtomicU64>; 3]| {
+                [
+                    slots[0].load(Ordering::Relaxed),
+                    slots[1].load(Ordering::Relaxed),
+                    slots[2].load(Ordering::Relaxed),
+                ]
+            };
+            LaneStats {
+                locks: load(&self.counters.locks),
+                contended: load(&self.counters.contended),
+                wait_ns: load(&self.counters.wait_ns),
+                restarts: self.counters.restarts.load(Ordering::Relaxed),
+                splits_divergence: self.counters.splits_divergence.load(Ordering::Relaxed),
+                splits_hole: self.counters.splits_hole.load(Ordering::Relaxed),
+                splits_stale_parent: self.counters.splits_stale_parent.load(Ordering::Relaxed),
+            }
+        }
+        #[cfg(not(feature = "lane-stats"))]
+        {
+            let _ = self;
+            LaneStats::default()
+        }
+    }
+
+    /// Lock a run's writer state, charging contended waits to the kind of run (root, a leaf only
+    /// `worker` holds, or a shared run) when `lane-stats` is on.
+    #[inline]
+    fn lock_run(&self, run_id: u32, worker: u32) -> MutexGuard<'_, RunMeta> {
+        let run = self.slab.run(run_id);
+        #[cfg(not(feature = "lane-stats"))]
+        {
+            let _ = worker;
+            run.meta.lock()
+        }
+        #[cfg(feature = "lane-stats")]
+        {
+            let (guard, waited) = match run.meta.try_lock() {
+                Some(guard) => (guard, 0u64),
+                None => {
+                    let started = std::time::Instant::now();
+                    let guard = run.meta.lock();
+                    (guard, started.elapsed().as_nanos() as u64)
+                }
+            };
+            let kind = if run_id == ROOT {
+                LockKind::Root
+            } else if run.children.load(Ordering::Relaxed) == NONE
+                && run.partials.load(Ordering::Relaxed) == NONE
+                && covered_only_by(self.slab.coverage(run_id), worker)
+            {
+                LockKind::Own
+            } else {
+                LockKind::Shared
+            } as usize;
+            self.counters.locks[kind].fetch_add(1, Ordering::Relaxed);
+            if waited > 0 {
+                self.counters.contended[kind].fetch_add(1, Ordering::Relaxed);
+                self.counters.wait_ns[kind].fetch_add(waited, Ordering::Relaxed);
+            }
+            guard
+        }
+    }
+
+    #[inline]
+    fn count_split(&self, cause: LockKind) {
+        #[cfg(feature = "lane-stats")]
+        {
+            let counter = match cause {
+                LockKind::Root => &self.counters.splits_divergence,
+                LockKind::Own => &self.counters.splits_hole,
+                LockKind::Shared => &self.counters.splits_stale_parent,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "lane-stats"))]
+        {
+            let _ = (self, cause);
         }
     }
 
@@ -1084,14 +1205,18 @@ impl RunIndex {
     /// Follow split forwarding records to where a block lives now, returning with the final run
     /// locked so nothing can move the block before the caller uses it. `None` when the block is
     /// not held any more (its run died, or it was forwarded to nowhere).
-    fn resolve_locked(&self, mut at: BlockRef) -> Option<(BlockRef, MutexGuard<'_, RunMeta>)> {
+    fn resolve_locked(
+        &self,
+        worker: u32,
+        mut at: BlockRef,
+    ) -> Option<(BlockRef, MutexGuard<'_, RunMeta>)> {
         let mut expected: Option<u32> = None;
         loop {
             if at.run == GONE {
                 return None;
             }
             let run = self.slab.run(at.run);
-            let meta = run.meta.lock();
+            let meta = self.lock_run(at.run, worker);
             if meta.dead || expected.is_some_and(|generation| generation != run.generation()) {
                 return None;
             }
@@ -1480,9 +1605,9 @@ impl RunIndex {
         pending: &mut Vec<Placed>,
     ) -> Walk {
         let (mut run_id, mut offset, mut meta) = match origin {
-            None => (ROOT, 0usize, self.slab.run(ROOT).meta.lock()),
+            None => (ROOT, 0usize, self.lock_run(ROOT, worker)),
             Some((hash, at)) => {
-                let Some((at, meta)) = self.resolve_locked(at) else {
+                let Some((at, meta)) = self.resolve_locked(worker, at) else {
                     map.remove(&hash);
                     return Walk::NoParent;
                 };
@@ -1523,8 +1648,10 @@ impl RunIndex {
             // its id given to another run: start over from the parent block if so.
             run_id = child;
             offset = 0;
-            meta = self.slab.run(run_id).meta.lock();
+            meta = self.lock_run(run_id, worker);
             if meta.dead || self.slab.run(run_id).generation() != generation {
+                #[cfg(feature = "lane-stats")]
+                self.counters.restarts.fetch_add(1, Ordering::Relaxed);
                 return Walk::Restart;
             }
         }
@@ -1552,6 +1679,7 @@ impl RunIndex {
         if held < offset {
             // The parent entry pointed past what this worker holds (it cannot, unless the engine
             // re-stored under a stale parent). Cut here and join the suffix instead.
+            self.count_split(LockKind::Shared);
             let suffix = self.split_locked(run_id, meta, offset);
             return InRun::MoveTo(suffix, self.slab.run(suffix).generation());
         }
@@ -1567,6 +1695,7 @@ impl RunIndex {
         let before = self.held_len(run_id);
         let suffix = if matched < available && matched < remaining.len() {
             // A divergence inside the run: both branches stay held, the run ends here.
+            self.count_split(LockKind::Root);
             Some(self.split_locked(run_id, meta, reach))
         } else {
             None
@@ -1731,7 +1860,7 @@ impl RunIndex {
             return;
         }
         let run = self.slab.run(removal.run);
-        let mut meta = run.meta.lock();
+        let mut meta = self.lock_run(removal.run, worker);
         if meta.dead
             || removal
                 .generation
@@ -1770,7 +1899,10 @@ impl RunIndex {
             let before = self.held_len(run_id);
             // Blocks after the range stay held by this worker too: a hole, so the tail becomes
             // its own run. A range reaching the worker's end only lowers its cutoff.
-            let tail = (high + 1 < held).then(|| self.split_locked(run_id, meta, high + 1));
+            let tail = (high + 1 < held).then(|| {
+                self.count_split(LockKind::Own);
+                self.split_locked(run_id, meta, high + 1)
+            });
             self.set_holding(run_id, worker, low);
             self.debit(worker, high + 1 - low);
             self.settle_distinct(worker, before, run_id, tail);
@@ -1807,7 +1939,7 @@ impl RunIndex {
                 continue;
             }
             let run = self.slab.run(run_id);
-            let mut meta = run.meta.lock();
+            let mut meta = self.lock_run(run_id, worker);
             if meta.dead || generation.is_some_and(|generation| generation != run.generation()) {
                 continue;
             }

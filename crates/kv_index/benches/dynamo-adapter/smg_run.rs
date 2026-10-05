@@ -55,6 +55,10 @@ pub struct SmgRun {
     /// Lookups served and runs walked by them, for the fragmentation line of the report.
     lookups: AtomicUsize,
     runs_walked: AtomicUsize,
+    /// Wall time the lanes spent waiting for an event (empty queue), summed over lanes.
+    idle_ns: AtomicUsize,
+    /// Wall time the lanes spent applying events, summed over lanes.
+    busy_ns: AtomicUsize,
 }
 
 impl SmgRun {
@@ -66,6 +70,8 @@ impl SmgRun {
             map_slots: AtomicUsize::new(0),
             lookups: AtomicUsize::new(0),
             runs_walked: AtomicUsize::new(0),
+            idle_ns: AtomicUsize::new(0),
+            busy_ns: AtomicUsize::new(0),
         }
     }
 
@@ -213,7 +219,13 @@ impl SyncIndexer for SmgRun {
         let counters = metrics.as_ref().map(|m| m.prebind());
         #[cfg(feature = "bench")]
         let mut observation = WorkerObservationState::default();
+        let (mut idle_ns, mut busy_ns) = (0u64, 0u64);
+        let mut last = std::time::Instant::now();
         while let Ok(task) = event_receiver.recv() {
+            let now = std::time::Instant::now();
+            idle_ns += now.duration_since(last).as_nanos() as u64;
+            let started = now;
+            let stop = matches!(task, WorkerTask::Terminate);
             match task {
                 WorkerTask::Event(event) => {
                     let kind = EventKind::of(&event.event.data);
@@ -287,9 +299,16 @@ impl SyncIndexer for SmgRun {
                 WorkerTask::Flush(sender) => {
                     let _ = sender.send(());
                 }
-                WorkerTask::Terminate => break,
+                WorkerTask::Terminate => {}
+            }
+            last = std::time::Instant::now();
+            busy_ns += last.duration_since(started).as_nanos() as u64;
+            if stop {
+                break;
             }
         }
+        self.idle_ns.fetch_add(idle_ns as usize, Ordering::Relaxed);
+        self.busy_ns.fetch_add(busy_ns as usize, Ordering::Relaxed);
         Ok(())
     }
 
@@ -320,6 +339,7 @@ impl SyncIndexer for SmgRun {
 
     fn timing_report(&self) -> String {
         let stats = self.inner.stats();
+        let lane = self.inner.lane_stats();
         let memberships = self.inner.current_size();
         let distinct = self.inner.entry_count();
         let map_slots = self.map_slots.load(Ordering::Relaxed);
@@ -340,7 +360,10 @@ impl SyncIndexer for SmgRun {
              arena bytes = {} header bytes = {} (index {:.1} B per membership)\n  \
              lane map slots = {map_slots} bytes = {map_bytes} ({:.1} B per membership)\n  \
              total {:.1} B per membership\n  \
-             lookups = {} runs walked per lookup = {:.2}",
+             lookups = {} runs walked per lookup = {:.2}\n  \
+             lanes: busy {:.3} s idle {:.3} s (finished lanes only)\n  \
+             locks root/own/shared = {:?} contended = {:?} wait_ms = {:?}\n  \
+             restarts = {} splits divergence/hole/stale-parent = {}/{}/{}",
             stats.runs_allocated,
             stats.runs_live,
             stats.blocks_live,
@@ -352,6 +375,19 @@ impl SyncIndexer for SmgRun {
             self.lookups.load(Ordering::Relaxed),
             self.runs_walked.load(Ordering::Relaxed) as f64
                 / self.lookups.load(Ordering::Relaxed).max(1) as f64,
+            self.busy_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            self.idle_ns.load(Ordering::Relaxed) as f64 / 1e9,
+            lane.locks,
+            lane.contended,
+            [
+                lane.wait_ns[0] as f64 / 1e6,
+                lane.wait_ns[1] as f64 / 1e6,
+                lane.wait_ns[2] as f64 / 1e6,
+            ],
+            lane.restarts,
+            lane.splits_divergence,
+            lane.splits_hole,
+            lane.splits_stale_parent,
         )
     }
 }
