@@ -1,12 +1,14 @@
 //! The lane map: one worker's blocks by engine hash, as the event lane that owns the worker
 //! keeps them for the run index.
 //!
-//! An open-addressing table of 16-byte slots (engine hash, run id, offset): Fibonacci home slot,
-//! linear probing, at most three quarters full so every probe run ends at an empty slot,
-//! doubling growth, and backward-shift deletion so steady churn (an engine storing and evicting
-//! at the same rate for hours) never accumulates tombstones. Removals and insertions come in
-//! batches of an event's blocks: the home slots of the next keys are prefetched a few keys ahead
-//! so their cache misses overlap instead of serialising.
+//! An open-addressing table of 16-byte slots (engine hash, run id, offset) with a one-byte tag
+//! per slot beside them: Fibonacci home slot, linear probing over the tags (dense, so a probe
+//! run of several slots reads one cache line and touches a slot only when its tag matches), at
+//! most three quarters full so every probe run ends at an empty tag, doubling growth, and
+//! backward-shift deletion so steady churn (an engine storing and evicting at the same rate for
+//! hours) never accumulates tombstones. Removals and insertions come in batches of an event's
+//! blocks: the home slots of the next keys are prefetched a few keys ahead so their cache misses
+//! overlap instead of serialising.
 //!
 //! Semantics match a hash map: a key maps to at most one place, `insert` replaces, `remove` of an
 //! absent key is a no-op, iteration yields every entry once. A differential test against a hash
@@ -20,6 +22,8 @@ const MIN_SLOTS: usize = 16;
 const AHEAD: usize = 8;
 /// Run id that marks an empty slot (never a live location: run ids are below 2^26).
 const EMPTY: u32 = u32::MAX;
+/// Tag of an empty slot; a full slot's tag is seven bits of its key with the top bit set.
+const VACANT: u8 = 0;
 
 #[derive(Clone, Copy)]
 struct Slot {
@@ -38,6 +42,8 @@ const EMPTY_SLOT: Slot = Slot {
 pub struct RunBlockMap {
     /// Power-of-two length, or empty before the first insert.
     slots: Box<[Slot]>,
+    /// One tag per slot: `VACANT`, or the key's fingerprint.
+    tags: Box<[u8]>,
     len: usize,
     shift: u32,
 }
@@ -46,10 +52,18 @@ impl Default for RunBlockMap {
     fn default() -> Self {
         Self {
             slots: Box::default(),
+            tags: Box::default(),
             len: 0,
             shift: 64,
         }
     }
+}
+
+/// Seven bits of the key the home slot does not use, with the top bit set so it is never
+/// `VACANT`.
+#[inline]
+fn fingerprint(key: u64) -> u8 {
+    ((key >> 25) as u8) | 0x80
 }
 
 impl RunBlockMap {
@@ -66,7 +80,7 @@ impl RunBlockMap {
         self.len == 0
     }
 
-    /// Slots allocated (16 bytes each).
+    /// Slots allocated (16 bytes each, plus a tag byte).
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
@@ -83,16 +97,18 @@ impl RunBlockMap {
     }
 
     /// The slot holding `key`, or else the empty slot that ends its probe run. Requires slots.
+    /// Walks the tags; a slot is read only when its tag matches.
     #[inline]
     fn probe(&self, key: u64) -> Result<usize, usize> {
         let mask = self.mask();
+        let tag = fingerprint(key);
         let mut index = self.home(key);
         loop {
-            let slot = &self.slots[index];
-            if slot.run == EMPTY {
+            let found = self.tags[index];
+            if found == VACANT {
                 return Err(index);
             }
-            if slot.key == key {
+            if found == tag && self.slots[index].key == key {
                 return Ok(index);
             }
             index = (index + 1) & mask;
@@ -131,14 +147,16 @@ impl RunBlockMap {
             capacity *= 2;
         }
         let old = std::mem::replace(&mut self.slots, (0..capacity).map(|_| EMPTY_SLOT).collect());
+        self.tags = (0..capacity).map(|_| VACANT).collect();
         self.shift = 64 - capacity.trailing_zeros();
         let mask = capacity - 1;
         for slot in old.iter().filter(|slot| slot.run != EMPTY) {
             let mut index = self.home(slot.key);
-            while self.slots[index].run != EMPTY {
+            while self.tags[index] != VACANT {
                 index = (index + 1) & mask;
             }
             self.slots[index] = *slot;
+            self.tags[index] = fingerprint(slot.key);
         }
     }
 
@@ -162,6 +180,7 @@ impl RunBlockMap {
                     run: at.run,
                     offset: at.offset,
                 };
+                self.tags[empty] = fingerprint(key.0);
                 self.len += 1;
                 None
             }
@@ -176,6 +195,7 @@ impl RunBlockMap {
             offset: self.slots[hole].offset,
         };
         self.slots[hole] = EMPTY_SLOT;
+        self.tags[hole] = VACANT;
         self.len -= 1;
         // Backward-shift deletion: pull later entries of the probe run into the hole whenever
         // the hole lies between their home slot and their current slot.
@@ -183,14 +203,16 @@ impl RunBlockMap {
         let mut next = hole;
         loop {
             next = (next + 1) & mask;
-            let slot = self.slots[next];
-            if slot.run == EMPTY {
+            if self.tags[next] == VACANT {
                 break;
             }
+            let slot = self.slots[next];
             let home = self.home(slot.key);
             if (next.wrapping_sub(home) & mask) >= (next.wrapping_sub(hole) & mask) {
                 self.slots[hole] = slot;
+                self.tags[hole] = self.tags[next];
                 self.slots[next] = EMPTY_SLOT;
+                self.tags[next] = VACANT;
                 hole = next;
             }
         }
@@ -202,7 +224,9 @@ impl RunBlockMap {
     #[inline]
     fn touch(&self, key: u64) {
         if !self.slots.is_empty() {
-            prefetch_hint::prefetch_read(&self.slots[self.home(key)]);
+            let home = self.home(key);
+            prefetch_hint::prefetch_read(&self.tags[home]);
+            prefetch_hint::prefetch_read(&self.slots[home]);
         }
     }
 
@@ -256,6 +280,7 @@ impl RunBlockMap {
                         run: at.run,
                         offset: at.offset,
                     };
+                    self.tags[empty] = fingerprint(key.0);
                     self.len += 1;
                 }
             }
