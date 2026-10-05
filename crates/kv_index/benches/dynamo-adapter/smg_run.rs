@@ -17,9 +17,10 @@
 //! the lane threads are the lanes of SMG's `LanePool`: each drains its channel into per-worker
 //! queues and serves ready workers from any lane, so a lane whose workers are quiet works off the
 //! backlog of a busy one (whole workers at a time; events of one worker never leave their order).
-//! A worker's queue holds at most `DEPTH_CAP` events; past that its lane keeps the next events in
-//! a backlog and reads nothing further from its channel until they are in, so the harness's own
-//! queue is the overflow and its queue-depth row still measures it. Flush, seal, stats and worker
+//! A worker's queue holds at most `DEPTH_CAP` events; past that its lane keeps that worker's next
+//! events in a backlog of its own, in order, and goes on draining the channel for the others, so
+//! one worker at its cap never holds back another's events (the harness's channel stays the
+//! overflow of last resort, `BACKLOG_CAP` events per lane). Flush, seal, stats and worker
 //! removal are barriers queued behind every worker the channel has fed, answered by whichever
 //! lane applies the last one; observation records go to the writer of the channel the event came
 //! in on, so each lane's completion buffer keeps the capacity the harness planned for it.
@@ -53,12 +54,16 @@ use crate::protocols::{
 const DEPTH_CAP: usize = 2048;
 /// Events a lane applies from one worker before letting another ready worker in.
 const BATCH: usize = 32;
-/// How long an idle lane waits on its channel before looking for work to steal again. Shorter
-/// waits cost more than they gain: every wake-up is a syscall on a core shared with the query
-/// lanes, and preempting a lane that holds a run lock stalls every lane waiting for it.
-const WAIT: Duration = Duration::from_millis(1);
+/// How long an idle lane waits on its channel before looking for work to steal again, while some
+/// lane has work to take and while none has (the channel wakes it either way). Shorter waits
+/// cost more than they gain: every wake-up is a syscall on a core shared with the query lanes,
+/// and preempting a lane that holds a run lock stalls every lane waiting for it.
+const WAIT_STEALABLE: Duration = Duration::from_millis(1);
+const WAIT_QUIET: Duration = Duration::from_millis(10);
 /// How long a lane whose refused events are waiting on a worker another lane is serving sleeps.
 const BACKLOG_WAIT: Duration = Duration::from_micros(100);
+/// Refused events a lane holds across its workers before it stops draining its channel.
+const BACKLOG_CAP: usize = 65_536;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -139,6 +144,8 @@ pub struct SmgRun {
     registry: Mutex<SlotRegistry>,
     /// Lane indices handed out to `worker` calls.
     next_lane: AtomicUsize,
+    /// Most refused events one lane held at once (published at flush).
+    backlog_max: AtomicUsize,
     /// Completion writers by the lane whose channel installed them.
     #[cfg(feature = "bench")]
     observations: Box<[Mutex<WorkerObservationState>]>,
@@ -171,6 +178,7 @@ impl SmgRun {
             }),
             registry: Mutex::new(SlotRegistry::default()),
             next_lane: AtomicUsize::new(0),
+            backlog_max: AtomicUsize::new(0),
             #[cfg(feature = "bench")]
             observations: (0..lanes)
                 .map(|_| Mutex::new(WorkerObservationState::default()))
@@ -340,9 +348,11 @@ struct Lane<'a> {
     counters: Option<PreBoundEventCounters>,
     /// Workers this lane's channel has fed: Dynamo worker -> pool slot.
     fed: FxHashMap<WorkerWithDpRank, u32>,
-    /// Events refused by the depth cap, in channel order; nothing later leaves the channel until
-    /// these are in.
-    backlog: VecDeque<(u32, LaneEvent)>,
+    /// Events refused by the depth cap, per worker and in order; they go in before anything
+    /// later for the same worker, while other workers' events keep flowing.
+    backlog: FxHashMap<u32, VecDeque<LaneEvent>>,
+    backlogged: usize,
+    backlog_max: usize,
 }
 
 impl Lane<'_> {
@@ -397,26 +407,44 @@ impl Lane<'_> {
         self.fed.values().copied().collect()
     }
 
-    /// Queue `event` for `slot`, behind anything the pool refused earlier.
+    /// Queue `event` for `slot`, behind anything of that worker the pool refused earlier.
     fn push(&mut self, slot: u32, event: LaneEvent) {
-        if !self.backlog.is_empty() {
-            self.backlog.push_back((slot, event));
+        if let Some(waiting) = self.backlog.get_mut(&slot) {
+            waiting.push_back(event);
+            self.hold_one();
             return;
         }
         if let Err(QueueFull(event)) = self.run.pool.enqueue(self.lane, slot, event) {
-            self.backlog.push_back((slot, event));
+            self.backlog.entry(slot).or_default().push_back(event);
+            self.hold_one();
         }
     }
 
-    /// Move refused events into the pool in order; `false` while the head is still refused.
+    fn hold_one(&mut self) {
+        self.backlogged += 1;
+        self.backlog_max = self.backlog_max.max(self.backlogged);
+    }
+
+    /// Move refused events into the pool, each worker's in order; `true` once none is left.
     fn flush_backlog(&mut self) -> bool {
-        while let Some((slot, event)) = self.backlog.pop_front() {
-            if let Err(QueueFull(event)) = self.run.pool.enqueue(self.lane, slot, event) {
-                self.backlog.push_front((slot, event));
-                return false;
-            }
+        if self.backlog.is_empty() {
+            return true;
         }
-        true
+        let lane = self.lane;
+        let pool = &self.run.pool;
+        let mut moved = 0;
+        self.backlog.retain(|&slot, waiting| {
+            while let Some(event) = waiting.pop_front() {
+                if let Err(QueueFull(event)) = pool.enqueue(lane, slot, event) {
+                    waiting.push_front(event);
+                    return true;
+                }
+                moved += 1;
+            }
+            false
+        });
+        self.backlogged -= moved;
+        self.backlog.is_empty()
     }
 
     /// Queue a barrier behind every target; the last to apply it runs `finish`. No target:
@@ -563,6 +591,10 @@ impl Lane<'_> {
                 }
             },
             WorkerTask::Flush(sender) => {
+                // The report follows the flush: publish this lane's backlog high-water.
+                self.run
+                    .backlog_max
+                    .fetch_max(self.backlog_max, Ordering::Relaxed);
                 let targets = self.fed_slots();
                 self.fan_out(targets, Step::Pass, Finish::Flush(sender));
             }
@@ -632,32 +664,43 @@ impl LaneHooks<LaneWorker, LaneEvent> for Lane<'_> {
     }
 
     fn pump(&mut self) -> Control {
-        if !self.flush_backlog() {
-            return Control::Continue;
-        }
-        loop {
+        self.flush_backlog();
+        while self.backlogged < BACKLOG_CAP {
             match self.receiver.try_recv() {
                 Ok(task) => {
                     if self.ingest(task) == Control::Stop {
                         return Control::Stop;
                     }
-                    if !self.backlog.is_empty() {
-                        return Control::Continue;
-                    }
                 }
-                Err(TryRecvError::Empty) => return Control::Continue,
+                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Control::Stop,
             }
         }
+        Control::Continue
     }
 
     fn wait(&mut self) -> Control {
         if !self.backlog.is_empty() {
-            // The refused worker is being served by another lane; its queue will have room soon.
-            std::thread::sleep(BACKLOG_WAIT);
-            return Control::Continue;
+            // The refused workers are being served by other lanes; their queues will have room
+            // soon. Keep reading the channel meanwhile unless the backlog is at its cap.
+            let timeout = if self.backlogged < BACKLOG_CAP {
+                BACKLOG_WAIT
+            } else {
+                std::thread::sleep(BACKLOG_WAIT);
+                return Control::Continue;
+            };
+            return match self.receiver.recv_timeout(timeout) {
+                Ok(task) => self.ingest(task),
+                Err(RecvTimeoutError::Timeout) => Control::Continue,
+                Err(RecvTimeoutError::Disconnected) => Control::Stop,
+            };
         }
-        match self.receiver.recv_timeout(WAIT) {
+        let timeout = if self.run.pool.has_stealable() {
+            WAIT_STEALABLE
+        } else {
+            WAIT_QUIET
+        };
+        match self.receiver.recv_timeout(timeout) {
             Ok(task) => self.ingest(task),
             Err(RecvTimeoutError::Timeout) => Control::Continue,
             Err(RecvTimeoutError::Disconnected) => Control::Stop,
@@ -683,7 +726,9 @@ impl SyncIndexer for SmgRun {
             receiver: event_receiver,
             counters: metrics.as_ref().map(|m| m.prebind()),
             fed: FxHashMap::default(),
-            backlog: VecDeque::new(),
+            backlog: FxHashMap::default(),
+            backlogged: 0,
+            backlog_max: 0,
         };
         self.pool.run_lane(lane, &mut hooks);
         Ok(())
@@ -743,7 +788,7 @@ impl SyncIndexer for SmgRun {
              allocated: arena chunks {} (free-listed {}) slab {} maps {map_bytes} = {} ({:.1} B per membership)\n  \
              lookups = {} runs walked per lookup = {:.2}\n  \
              lanes: busy {:.3} s idle {:.3} s\n  \
-             pool: enqueued {} applied {} refused {} steals {} max depth {} (cap {}) max queued {}\n  \
+             pool: enqueued {} applied {} refused {} steals {} max depth {} (cap {}) max queued {} lane backlog max {}\n  \
              locks root/own/shared = {:?} contended = {:?} wait_ms = {:?}\n  \
              restarts = {} splits divergence/hole/stale-parent = {}/{}/{} lock-free inserts = {}\n  \
              stores = {} ({:.1} blocks each): resolve {:.0} ns, walk {:.0} ns, lane map {:.0} ns per event\n  \
@@ -773,6 +818,7 @@ impl SyncIndexer for SmgRun {
             pool.max_depth,
             DEPTH_CAP,
             pool.max_queued,
+            self.backlog_max.load(Ordering::Relaxed),
             lane.locks,
             lane.contended,
             [
