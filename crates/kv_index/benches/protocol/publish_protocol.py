@@ -11,6 +11,11 @@ Reported: medians with bootstrap 95% confidence intervals (percentile method) of
 ops/s and lookup p50/p99, per series, plus the subject-minus-control difference of medians with
 its own bootstrap interval. Finished trials are skipped on re-run, so an interrupted run resumes.
 
+Thresholds: every process above `--record-pct` (5%) of a core on the measured cores is recorded
+with its peak; a trial is discarded when a process above `--discard-pct` (50%) is neither the
+trial nor allow-listed. The rows are stored raw, so re-running on the same output directory
+re-summarises finished trials under other thresholds without re-measuring.
+
 Command placeholders: `{json}` (result path) and `{trial}`.
 """
 
@@ -47,7 +52,6 @@ def run_trial(args: argparse.Namespace, role: str, index: int, command_template:
     result = out / f"{role}-{index}.json"
     command = command_template.format(json=result, trial=index)
     cores = hostload.parse_cpu_list(args.cores)
-    allow = re.compile(args.allow) if args.allow else None
     record = {"role": role, "index": index, "command": command, "started_at": time.time()}
     with open(args.lock, "w") as lock:
         if args.lock_scope == "trial":
@@ -60,13 +64,9 @@ def run_trial(args: argparse.Namespace, role: str, index: int, command_template:
         after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
         if args.lock_scope == "trial":
             fcntl.flock(lock, fcntl.LOCK_UN)
-    foreign, background = [], []
-    for rows in (before, after):
-        f, b = hostload.classify(rows, args.threshold_pct, allow, args.discard_kernel_threads)
-        foreign += f
-        background += b
-    record["foreign_load"] = foreign
-    record["background_load"] = background
+    # Everything above the record threshold is kept; the discard decision is made at summary time
+    # from these rows, so a finished run can be re-summarised under other thresholds.
+    record["load_rows"] = [row for row in before + after if row["cpu_pct"] >= args.record_pct]
     record["exit_code"] = status.returncode
     if status.returncode != 0 or not result.exists():
         record["discarded"] = f"trial failed (exit {status.returncode})"
@@ -90,10 +90,6 @@ def run_trial(args: argparse.Namespace, role: str, index: int, command_template:
         if not data["generator_valid"]:
             record["discarded"] = (
                 "generator invalid: " + ", ".join(data.get("failure_reasons", []))[:200]
-            )
-        elif foreign:
-            record["discarded"] = "foreign load: " + ", ".join(
-                f"{row['comm']}[{row['pid']}] {row['cpu_pct']:.0f}%" for row in foreign[:4]
             )
     record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text(json.dumps(record, indent=1))
@@ -130,12 +126,41 @@ def bootstrap_difference(
     )
 
 
-def background_summary(records: list[dict]) -> list[str]:
-    """Allow-listed and kernel background per process name: trials seen in, peak CPU share."""
+def load_rows(record: dict) -> list[dict]:
+    """The sampled processes of a trial (older records kept them pre-classified)."""
+    return record.get(
+        "load_rows", record.get("foreign_load", []) + record.get("background_load", [])
+    )
+
+
+def verdict(
+    record: dict, args: argparse.Namespace, allow: re.Pattern | None
+) -> tuple[str | None, list]:
+    """(reason the trial is discarded or None, background rows) under the current thresholds."""
+    hard = record.get("discarded")
+    if hard and not hard.startswith("foreign load"):
+        return hard, []
+    rows = load_rows(record)
+    foreign, background = hostload.classify(
+        rows, args.discard_pct, allow, args.discard_kernel_threads
+    )
+    background += [row for row in rows if row["cpu_pct"] < args.discard_pct]
+    if foreign:
+        busy = ", ".join(
+            f"{row['comm']}[{row['pid']}] {row['cpu_pct']:.0f}%" for row in foreign[:4]
+        )
+        return f"foreign load: {busy}", background
+    return None, background
+
+
+def background_summary(
+    records: list[dict], args: argparse.Namespace, allow: re.Pattern | None
+) -> list[str]:
+    """Background per process name (allow-listed, kernel, or below the discard threshold)."""
     peak: dict[str, tuple[int, float]] = {}
     for record in records:
         seen: dict[str, float] = {}
-        for row in record["background_load"]:
+        for row in verdict(record, args, allow)[1]:
             name = "kernel threads" if row["kernel_thread"] else row["comm"]
             seen[name] = max(seen.get(name, 0.0), row["cpu_pct"])
         for name, pct in seen.items():
@@ -149,10 +174,14 @@ def background_summary(records: list[dict]) -> list[str]:
 
 def summarize(args: argparse.Namespace, series: dict[str, list[dict]]) -> tuple[dict, str]:
     rng = random.Random(args.seed)
+    allow = re.compile(args.allow) if args.allow else None
     summary: dict = {"trials_requested": args.trials, "series": {}}
+    attempts = max(len(records) for records in series.values())
     lines = [
-        f"{args.name}: {args.trials} trials per series, fresh process each, lock held per trial, "
-        f"foreign-load threshold {args.threshold_pct:.0f}% on cores {args.cores}.",
+        f"{args.name}: {args.trials} usable trials wanted per series ({attempts} attempted), fresh "
+        f"process each, lock scope {args.lock_scope}; cores {args.cores} sampled before and after "
+        f"each trial, processes above {args.record_pct:.0f}% recorded, a trial discarded when one "
+        f"above {args.discard_pct:.0f}% is neither the trial nor allow-listed.",
         "",
         "| Series | Used / discarded | Kept up | Achieved median [95% CI] (M block ops/s) "
         "| Lookup p50 [CI] (us) | Lookup p99 [CI] (us) | Drain median (ms) |",
@@ -160,8 +189,9 @@ def summarize(args: argparse.Namespace, series: dict[str, list[dict]]) -> tuple[
     ]
     kept: dict[str, dict[str, list[float]]] = {}
     for role, records in series.items():
-        used = [r for r in records if "discarded" not in r]
-        discarded = [r for r in records if "discarded" in r]
+        verdicts = {id(r): verdict(r, args, allow)[0] for r in records}
+        used = [r for r in records if verdicts[id(r)] is None]
+        discarded = [r for r in records if verdicts[id(r)] is not None]
         kept[role] = {key: [r[key] for r in used] for key, _, _ in METRICS}
         stats = {}
         cells = []
@@ -172,11 +202,11 @@ def summarize(args: argparse.Namespace, series: dict[str, list[dict]]) -> tuple[
         drain = statistics.median([r["drain_ms"] for r in used]) if used else float("nan")
         summary["series"][role] = {
             "used": len(used),
-            "discarded": [{"index": r["index"], "why": r["discarded"]} for r in discarded],
+            "discarded": [{"index": r["index"], "why": verdicts[id(r)]} for r in discarded],
             "kept_up": sum(1 for r in used if r.get("kept_up")),
             "stats": stats,
             "drain_ms_median": drain,
-            "background_load": background_summary(records),
+            "background_load": background_summary(records, args, allow),
         }
         lines.append(
             f"| {role} | {len(used)} / {len(discarded)} | {summary['series'][role]['kept_up']} of {len(used)} | "
@@ -204,7 +234,7 @@ def summarize(args: argparse.Namespace, series: dict[str, list[dict]]) -> tuple[
         for d in summary["series"][role]["discarded"]
     ]
     lines += ["", "Discarded trials:" + (" none" if not discarded_lines else "")] + discarded_lines
-    background = background_summary([r for role in roles for r in series[role]])
+    background = background_summary([r for role in roles for r in series[role]], args, allow)
     lines += ["", "Background load recorded (allow-listed daemons and kernel threads):"]
     lines += [f"- {entry}" for entry in background] or ["- none"]
     return summary, "\n".join(lines) + "\n"
@@ -222,7 +252,13 @@ def main() -> int:
         help="control template; default: the subject's; 'none' disables",
     )
     parser.add_argument("--control-name", default="control (same binary)")
-    parser.add_argument("--trials", type=int, default=20)
+    parser.add_argument("--trials", type=int, default=20, help="usable trials wanted per series")
+    parser.add_argument(
+        "--max-trials",
+        type=int,
+        default=0,
+        help="stop after this many attempts per series even if fewer are usable (default 2 x trials)",
+    )
     parser.add_argument(
         "--lock-scope",
         choices=("trial", "run"),
@@ -231,7 +267,15 @@ def main() -> int:
     )
     parser.add_argument("--lock", required=True)
     parser.add_argument("--cores", default="0-63")
-    parser.add_argument("--threshold-pct", type=float, default=5.0)
+    parser.add_argument(
+        "--record-pct", type=float, default=5.0, help="record processes above this CPU share"
+    )
+    parser.add_argument(
+        "--discard-pct",
+        type=float,
+        default=50.0,
+        help="discard a trial when a process above this share is neither the trial nor allow-listed",
+    )
     parser.add_argument("--sample-seconds", type=float, default=1.0)
     parser.add_argument(
         "--allow", default="", help="regex of background processes to record, not flag"
@@ -250,29 +294,39 @@ def main() -> int:
     series: dict[str, list[dict]] = {args.name: []}
     if control != "none":
         series[args.control_name] = []
-    for index in range(args.trials):
+    max_trials = args.max_trials or 2 * args.trials
+    index = 0
+    # Discarded trials are replaced until every series has `--trials` usable ones (or the cap).
+    allow = re.compile(args.allow) if args.allow else None
+    while index < max_trials and any(
+        sum(1 for r in records if verdict(r, args, allow)[0] is None) < args.trials
+        for records in series.values()
+    ):
         record = run_trial(args, "subject", index, args.command)
         series[args.name].append(record)
-        print(f"subject {index}: " + describe(record), flush=True)
+        print(f"subject {index}: " + describe(record, verdict(record, args, allow)[0]), flush=True)
         if control != "none":
             record = run_trial(args, "control", index, control)
             series[args.control_name].append(record)
-            print(f"control {index}: " + describe(record), flush=True)
+            print(
+                f"control {index}: " + describe(record, verdict(record, args, allow)[0]), flush=True
+            )
         summary, text = summarize(args, series)
         (out / "summary.json").write_text(json.dumps(summary, indent=1))
         (out / "summary.md").write_text(text)
+        index += 1
     print(text)
     return 0
 
 
-def describe(record: dict) -> str:
+def describe(record: dict, discarded: str | None) -> str:
     if "achieved_m" not in record:
-        return record.get("discarded", "failed")
+        return discarded or "failed"
     text = (
         f"{record['achieved_m']:.1f}M ({record['ratio'] * 100:.1f}% of offered), "
         f"p50 {record['p50_us']:.1f} us, p99 {record['p99_us']:.0f} us"
     )
-    return text + (f" DISCARDED: {record['discarded']}" if "discarded" in record else "")
+    return text + (f" DISCARDED: {discarded}" if discarded else "")
 
 
 if __name__ == "__main__":
