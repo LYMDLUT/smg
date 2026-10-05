@@ -170,6 +170,31 @@ Design direction (to be validated by the harness, not assumed):
 
 ## 6. The loop
 
+### 6.1 Parallel structure (from 2026-10-05 22:55)
+
+Phase 0 established the shared harness and the exactness tooling; from here the work fans out. Each
+workstream owns a branch `leap/<topic>` cut from this branch, a worktree `/tmp/wt-leap-<topic>`, a
+target directory, and a disjoint set of files; the orchestrator (the loop) harvests their commits,
+integrates them here in dependency order, re-measures, appends the scoreboard, and re-dispatches.
+Measurements on the quiet cores (0–63) are serialised through `flock /tmp/leap-measure.lock`;
+builds and tests stay on cores 72–143.
+
+| Workstream | Owns | Deliverable |
+|---|---|---|
+| indexer-run | `crates/kv_index/src/run_index*`, `tests/exactness_run.rs` | run-compressed, chain-hash-keyed index with O(log D) lookups and O(1) amortised events, bitset coverage, lock-free reads, measured in the shared harness |
+| indexer-fast | `crates/kv_index/src/event_tree.rs`, `tests/exactness.rs` | PositionalIndexer: store-free lookups, bitset coverage, batched write path, allocation-free probes, each change measured |
+| servicer-schema | proto `common.proto`, `engine_servicer` relay and tests, monitor field plumbing, `kv_index/src/salt.rs` | section 4.1: every engine field carried, normaliser rules, fixtures for both layouts and engines |
+| mock-engine | `crates/mock_worker/**`, new `crates/replay/`, `~/smg-perf/replay/` | KV-event-emitting mock with a real prefix cache and timing model; Mooncake replayer with TTFT/TPOT/goodput/hit-rate/oracle |
+| policy | `model_gateway/src/policies/**`, policy flags, selection bench | filter/score/pick interface, Dynamo default + llm-d-optimized-baseline + ramjet + dualmap, optimistic self-accounting, softmax |
+| recovery | `model_gateway/src/worker/kv_event_monitor.rs` control flow, `~/smg-perf/chaos/`, `docs/recovery-protocol.md` | cursors, live-tail buffer, fencing, transactional resync, metrics, synthetic-stream tests, section 5 drills |
+| bench-port | `crates/kv_index/benches/**` (not `dynamo-adapter/`), `~/smg-perf/indexer/` | corpus export from Dynamo's bench, SMG-side open-loop drain-inclusive replay, issuer scaling, parity check |
+| gpu-harness | `~/smg-perf/gpu/**`, `docs/gpu-harness.md`, captured fixtures | vLLM and SGLang containers with KV events on the GB300s, real event captures, first real-engine baseline |
+
+Integration rule: a workstream's commits land here only after its own gates and the exactness harness
+pass on the integrated tree; conflicts in shared files (`lib.rs` exports, flags, workspace members) are
+resolved by the orchestrator, never by a workstream editing another's files.
+
+
 Each iteration: measure (scoreboard row) → profile → one change → gates (§3) → re-measure → append the row
 and the decision here. Weekly: the full matrix with 20 trials and CIs, both systems rebuilt at their current
 heads. The competitor's number is re-measured whenever their stack moves.
