@@ -189,6 +189,45 @@ why, and the background processes seen. The sampled rows are stored raw, so re-r
 same output directory resumes an interrupted run and re-summarises finished trials under other
 thresholds.
 
+## Measurement method for published numbers
+
+This is the method guardrail 5 asks for, as the runner implements it; a publication can cite
+this section and the `summary.json` files it produces.
+
+- **Workload.** The standard corpus: Mooncake trace, 128 workers, duplication 20, length
+  factor 4, 128-token blocks; 2,446,195 operations, 320,105,993 block ops. Dynamo's binary
+  prepares the same schedule from the trace per trial; the SMG harness replays the exported file.
+  The offered rate is the corpus's block ops over the window.
+- **Layouts.** Competitor layout (Dynamo's documented one): event issuers on CPUs 0-3, query
+  issuer on 4, 64 event lanes and 128 query lanes floating over 5-63. Scaled layout, for
+  indexers beyond that generator's reach: 8 event issuers on 0-7, 4 query issuers on 8-11 (one,
+  on 8, in Dynamo's harness), lanes on 12-63. Every system in one scoreboard entry runs on one
+  layout, so backend cores are equal; the issuer side is scaled until the indexer, not the
+  generator, is the limit. `numactl --interleave=all`, one process per trial, mimalloc in both
+  harnesses, 5 s quiescence before each trial.
+- **Points.** Sustained: the kept-up end of the threshold search (3 fresh processes per point,
+  all must achieve at least 99% of offered with a valid generator, geometric bisection until the
+  bracket is within 10%). Overload (capacity): at least twice the sustained rate for the SMG
+  backends; the 300 ms window for the competitor, which its generator can still issue on schedule.
+  Every point is reported with lookup p50 and p99 at that load.
+- **Trials and controls.** 20 usable trials per series as fresh processes, each followed by a
+  control trial of the same binary and configuration, interleaved, so the control series is an
+  A/A measurement of the noise floor taken under the same conditions. No difference under 5% is
+  called without the control pair showing a floor below it.
+- **Statistics.** Medians; 95% confidence intervals by the percentile bootstrap with 10,000
+  resamples of the trial medians; the subject-minus-control difference of medians carries its own
+  bootstrap interval. Overload capacity is compared only within one harness.
+- **Host conditions.** The measurement cores are sampled for one second before and after every
+  trial. Every process above 5% of a core is recorded with its peak; a trial is discarded, kept and
+  listed with the offending process, when a process above 50% of a core is neither the trial nor
+  on the allow list of this host's permanent daemons (monitoring, proxies, session tooling, kernel
+  threads). Discarded trials are replaced until the series has its 20 usable trials or twice that
+  many were attempted. Series hold the measurement lock once, for at most 45 minutes per hold,
+  announcing themselves in the lock's owner note.
+- **Provenance.** Each result JSON carries the command line, binary and corpus hashes, the
+  layout and the trace parameters; the summaries carry the discard list and the background
+  processes seen, so a published row states its conditions.
+
 ## First protocol run (competitor layout)
 
 Both systems through the runner above on the development host, competitor layout (issuers on
