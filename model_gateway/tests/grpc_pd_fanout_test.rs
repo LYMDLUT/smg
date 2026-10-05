@@ -131,6 +131,7 @@ async fn start_mock_grpc_worker() -> u16 {
         output_tokens: OUTPUT_TOKENS,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        ..mock_worker::config::Config::default()
     });
     tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
     port

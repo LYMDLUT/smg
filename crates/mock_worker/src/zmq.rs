@@ -313,21 +313,16 @@ mod tests {
             http_count: 0,
             grpc_base_port: 0,
             grpc_count: 0,
-            admin_port: None,
-            context_length: 32768,
-            kv_events_zmq_base_port: None,
-            kv_events_replay: true,
-            kv_events_topic: String::new(),
-            kv_events_buffer_steps: 10_000,
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,
             model_id: "mock-model".to_string(),
-            tokenizer_path: "mock-model".to_string(),
-            gen_delay: Duration::ZERO,
+            tokenizer_path: String::new(),
+            gen_delay: Duration::from_millis(0),
             output_tokens: 4,
-            realistic: false,
+            realistic: true,
             engine: EngineParams::default(),
+            ..Config::default()
         }
     }
 

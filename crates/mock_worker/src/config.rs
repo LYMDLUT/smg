@@ -107,10 +107,9 @@ fn parse_poly(raw: String, flag: &str) -> Result<[f64; 3], String> {
     }
 }
 
-impl Config {
-    /// Parse the configuration from `std::env::args`, falling back to defaults.
-    pub fn from_args() -> Result<Self, String> {
-        let mut cfg = Self {
+impl Default for Config {
+    fn default() -> Self {
+        Self {
             host: "127.0.0.1".to_string(),
             http_base_port: 9000,
             http_count: 0,
@@ -131,7 +130,14 @@ impl Config {
             kv_events_replay: true,
             kv_events_topic: String::new(),
             kv_events_buffer_steps: 10_000,
-        };
+        }
+    }
+}
+
+impl Config {
+    /// Parse the configuration from `std::env::args`, falling back to defaults.
+    pub fn from_args() -> Result<Self, String> {
+        let mut cfg = Self::default();
         let mut timing = TimingFlags::default();
         let mut kv_blocks: Option<u64> = None;
 
