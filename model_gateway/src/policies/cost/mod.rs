@@ -20,3 +20,4 @@ mod default;
 pub use catalog::{build, default_policy, CatalogError, DEFAULT_POLICY, POLICY_NAMES};
 pub use inputs::{CandidateInputs, RequestInputs};
 pub use policy::{Needs, Pick, WorkerFilter, WorkerPicker, WorkerScorer, WorkerSelectionPolicy};
+pub use softmax::TieBreak;
