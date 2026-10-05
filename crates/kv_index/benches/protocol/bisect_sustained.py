@@ -16,7 +16,6 @@ output.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import math
 import os
@@ -29,10 +28,16 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import hostload  # noqa: E402
+import measurelock  # noqa: E402
 
 
 def run_trial(
-    args: argparse.Namespace, point: int, trial: int, rate: float, out: pathlib.Path
+    args: argparse.Namespace,
+    point: int,
+    trial: int,
+    rate: float,
+    out: pathlib.Path,
+    lock: measurelock.MeasureLock,
 ) -> dict:
     window_ms = (
         max(1, round(args.total_block_ops / rate * 1000.0)) if args.total_block_ops else None
@@ -50,17 +55,21 @@ def run_trial(
         "window_ms": window_ms,
         "command": command,
     }
-    with open(args.lock, "w") as lock:
-        if args.lock_scope == "trial":
-            fcntl.flock(lock, fcntl.LOCK_EX)
-        before = hostload.sample(cores, args.sample_seconds, {os.getpid()})
-        started = time.time()
-        with open(out / f"point{point}-trial{trial}.log", "w") as log:
-            status = subprocess.run(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
-        record["wall_s"] = time.time() - started
-        after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
-        if args.lock_scope == "trial":
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    if args.lock_scope == "trial":
+        lock.acquire(args.trial_minutes)
+    before = hostload.sample(cores, args.sample_seconds, {os.getpid()})
+    started = time.time()
+    with open(out / f"point{point}-trial{trial}.log", "w") as log:
+        status = subprocess.run(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
+    record["wall_s"] = time.time() - started
+    after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
+    if args.lock_scope == "trial":
+        lock.release()
+    elif lock.over_cap():
+        print(f"lock held {lock.held_s() / 60:.0f} min: releasing and queueing again", flush=True)
+        lock.rotate(args.point_minutes)
+    else:
+        lock.note(args.point_minutes)
     record["exit_code"] = status.returncode
     foreign_b, background_b = hostload.classify(before, args.threshold_pct, allow, False)
     foreign_a, background_a = hostload.classify(after, args.threshold_pct, allow, False)
@@ -124,6 +133,22 @@ def main() -> int:
     parser.add_argument(
         "--lock", required=True, help="lock file held for the duration of each trial"
     )
+    parser.add_argument(
+        "--owner-file", default="", help="owner note for waiters (default: <lock>.owner)"
+    )
+    parser.add_argument("--workstream", default="bench", help="first word of the owner note")
+    parser.add_argument(
+        "--series", default="", help="second word of the owner note (default: out dir name)"
+    )
+    parser.add_argument(
+        "--max-hold-minutes", type=float, default=45.0, help="release and re-queue past this"
+    )
+    parser.add_argument(
+        "--trial-minutes", type=float, default=2.0, help="expected length of one trial"
+    )
+    parser.add_argument(
+        "--point-minutes", type=float, default=6.0, help="expected length of one point"
+    )
     parser.add_argument("--cores", default="0-63", help="cores to check for foreign load")
     parser.add_argument("--threshold-pct", type=float, default=5.0)
     parser.add_argument("--sample-seconds", type=float, default=1.0)
@@ -132,9 +157,15 @@ def main() -> int:
     )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    run_lock = open(args.lock, "w")  # noqa: SIM115 - held until exit when the scope is "run"
+    lock = measurelock.MeasureLock(
+        args.lock,
+        args.owner_file or re.sub(r"\.lock$", "", args.lock) + ".owner",
+        args.workstream,
+        args.series or pathlib.Path(args.out).name,
+        args.max_hold_minutes,
+    )
     if args.lock_scope == "run":
-        fcntl.flock(run_lock, fcntl.LOCK_EX)
+        lock.acquire(min(args.max_hold_minutes, args.max_points * args.point_minutes))
     if "{window_ms}" in args.command and not args.total_block_ops:
         parser.error("--total-block-ops is required with a {window_ms} template")
 
@@ -145,7 +176,7 @@ def main() -> int:
 
     def measure(rate: float) -> bool:
         index = len(points)
-        trials = [run_trial(args, index, t, rate, out) for t in range(args.trials)]
+        trials = [run_trial(args, index, t, rate, out, lock) for t in range(args.trials)]
         passed = all(t["kept_up"] for t in trials)
         points.append({"rate": rate, "passed": passed, "trials": trials})
         line = ", ".join(
@@ -208,6 +239,7 @@ def main() -> int:
         )
     (out / "bracket.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
+    lock.release()
     return 0 if summary["within_tolerance"] else 1
 
 

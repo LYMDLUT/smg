@@ -22,7 +22,6 @@ Command placeholders: `{json}` (result path) and `{trial}`.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import pathlib
@@ -36,6 +35,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import hostload  # noqa: E402
+import measurelock  # noqa: E402
 
 METRICS = (
     ("achieved_m", "Achieved (M block ops/s)", 1.0),
@@ -44,7 +44,13 @@ METRICS = (
 )
 
 
-def run_trial(args: argparse.Namespace, role: str, index: int, command_template: str) -> dict:
+def run_trial(
+    args: argparse.Namespace,
+    role: str,
+    index: int,
+    command_template: str,
+    lock: measurelock.MeasureLock,
+) -> dict:
     out = pathlib.Path(args.out)
     record_path = out / "trials" / f"{role}-{index}.json"
     if record_path.exists():
@@ -53,17 +59,16 @@ def run_trial(args: argparse.Namespace, role: str, index: int, command_template:
     command = command_template.format(json=result, trial=index)
     cores = hostload.parse_cpu_list(args.cores)
     record = {"role": role, "index": index, "command": command, "started_at": time.time()}
-    with open(args.lock, "w") as lock:
-        if args.lock_scope == "trial":
-            fcntl.flock(lock, fcntl.LOCK_EX)
-        before = hostload.sample(cores, args.sample_seconds, {os.getpid()})
-        started = time.time()
-        with open(out / f"{role}-{index}.log", "w") as log:
-            status = subprocess.run(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
-        record["wall_s"] = time.time() - started
-        after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
-        if args.lock_scope == "trial":
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    if args.lock_scope == "trial":
+        lock.acquire(args.trial_minutes)
+    before = hostload.sample(cores, args.sample_seconds, {os.getpid()})
+    started = time.time()
+    with open(out / f"{role}-{index}.log", "w") as log:
+        status = subprocess.run(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
+    record["wall_s"] = time.time() - started
+    after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
+    if args.lock_scope == "trial":
+        lock.release()
     # Everything above the record threshold is kept; the discard decision is made at summary time
     # from these rows, so a finished run can be re-summarised under other thresholds.
     record["load_rows"] = [row for row in before + after if row["cpu_pct"] >= args.record_pct]
@@ -266,6 +271,19 @@ def main() -> int:
         help="hold the lock per trial (fair to other takers) or for the whole run (one queue wait)",
     )
     parser.add_argument("--lock", required=True)
+    parser.add_argument(
+        "--owner-file", default="", help="owner note for waiters (default: <lock>.owner)"
+    )
+    parser.add_argument("--workstream", default="bench", help="first word of the owner note")
+    parser.add_argument(
+        "--series", default="", help="second word of the owner note (default: out dir name)"
+    )
+    parser.add_argument(
+        "--max-hold-minutes", type=float, default=45.0, help="release and re-queue past this"
+    )
+    parser.add_argument(
+        "--trial-minutes", type=float, default=2.0, help="expected length of one trial"
+    )
     parser.add_argument("--cores", default="0-63")
     parser.add_argument(
         "--record-pct", type=float, default=5.0, help="record processes above this CPU share"
@@ -285,11 +303,17 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    run_lock = open(args.lock, "w")  # noqa: SIM115 - held until exit when the scope is "run"
-    if args.lock_scope == "run":
-        fcntl.flock(run_lock, fcntl.LOCK_EX)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    lock = measurelock.MeasureLock(
+        args.lock,
+        args.owner_file or re.sub(r"\.lock$", "", args.lock) + ".owner",
+        args.workstream,
+        args.series or out.name,
+        args.max_hold_minutes,
+    )
+    if args.lock_scope == "run":
+        lock.acquire(min(args.max_hold_minutes, args.trials * 2 * args.trial_minutes))
     control = args.control_command or args.command
     series: dict[str, list[dict]] = {args.name: []}
     if control != "none":
@@ -302,11 +326,11 @@ def main() -> int:
         sum(1 for r in records if verdict(r, args, allow)[0] is None) < args.trials
         for records in series.values()
     ):
-        record = run_trial(args, "subject", index, args.command)
+        record = run_trial(args, "subject", index, args.command, lock)
         series[args.name].append(record)
         print(f"subject {index}: " + describe(record, verdict(record, args, allow)[0]), flush=True)
         if control != "none":
-            record = run_trial(args, "control", index, control)
+            record = run_trial(args, "control", index, control, lock)
             series[args.control_name].append(record)
             print(
                 f"control {index}: " + describe(record, verdict(record, args, allow)[0]), flush=True
@@ -315,6 +339,23 @@ def main() -> int:
         (out / "summary.json").write_text(json.dumps(summary, indent=1))
         (out / "summary.md").write_text(text)
         index += 1
+        if args.lock_scope == "run":
+            done = [r for records in series.values() for r in records if "wall_s" in r]
+            per_trial = sum(r["wall_s"] for r in done) / max(len(done), 1) / 60.0 + 0.1
+            usable = min(
+                sum(1 for r in records if verdict(r, args, allow)[0] is None)
+                for records in series.values()
+            )
+            expected = max(0, args.trials - usable) * len(series) * per_trial
+            if lock.over_cap() and expected > 0:
+                print(
+                    f"lock held {lock.held_s() / 60:.0f} min: releasing and queueing again",
+                    flush=True,
+                )
+                lock.rotate(min(args.max_hold_minutes, expected))
+            else:
+                lock.note(min(args.max_hold_minutes, expected))
+    lock.release()
     print(text)
     return 0
 
