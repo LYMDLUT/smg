@@ -647,6 +647,28 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             max_total_num_tokens=int(self.scheduler_info.get("max_total_num_tokens", 0)),
         )
 
+    # In-flight engine probes, kept across calls. TokenSpeed answers these
+    # through a queueing communicator that resets its result state only after
+    # a normal completion: cancelling the await mid-wait (a timeout here, or a
+    # gRPC client giving up) leaves that state set and wedges every later
+    # query. So a probe is never cancelled; a timed-out one keeps running and
+    # the next call waits on it instead of queueing another behind it.
+    _pause_probe: asyncio.Future | None = None
+    _load_probe: asyncio.Future | None = None
+
+    async def _bounded_probe(self, slot: str, awaitable: Any) -> Any:
+        """Await an engine query with a deadline, without ever cancelling it."""
+        probe = getattr(self, slot, None)
+        if probe is None or probe.done():
+            probe = asyncio.ensure_future(awaitable)
+            # A late failure on an orphaned probe is reported by the caller that
+            # was waiting then; retrieve it so asyncio does not log it as lost.
+            probe.add_done_callback(lambda f: f.cancelled() or f.exception())
+            setattr(self, slot, probe)
+        elif inspect.iscoroutine(awaitable):
+            awaitable.close()  # the in-flight probe answers this call too
+        return await asyncio.wait_for(asyncio.shield(probe), timeout=HEALTH_CHECK_TIMEOUT)
+
     async def _is_paused(self) -> bool:
         """Live scheduler pause state; False on engines without the query.
 
@@ -668,9 +690,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         try:
             result = query()
             if inspect.isawaitable(result):
-                # The engine's query waits on a scheduler reply with no bound of
-                # its own; a silent scheduler must not hang discovery.
-                result = await asyncio.wait_for(result, timeout=HEALTH_CHECK_TIMEOUT)
+                result = await self._bounded_probe("_pause_probe", result)
             return bool(result)
         except Exception:  # noqa: BLE001 — a failed probe must not break discovery
             logger.warning("is_scheduler_paused failed; reporting not paused", exc_info=True)
@@ -712,9 +732,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 ),
             )
         try:
-            load_outputs = await asyncio.wait_for(
-                self.async_llm.get_load(), timeout=HEALTH_CHECK_TIMEOUT
-            )
+            load_outputs = await self._bounded_probe("_load_probe", self.async_llm.get_load())
         except TimeoutError:
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED,
@@ -1750,15 +1768,18 @@ def _is_secret_key(key: str) -> bool:
     return any(fragment in lowered for fragment in _SECRET_FRAGMENTS) or lowered.endswith("_token")
 
 
-def _redact_secrets(args: dict) -> dict:
+def _redact_secrets(args: Any) -> Any:
     """Drop credential-looking keys at every level: ``dataclasses.asdict`` nests
-    sub-configs as dicts, and a secret two levels down is still a secret.
+    sub-configs as dicts (and lists of them), and a secret two levels down is
+    still a secret. Lists and tuples keep their shape.
     """
-    return {
-        k: _redact_secrets(v) if isinstance(v, dict) else v
-        for k, v in args.items()
-        if not _is_secret_key(str(k))
-    }
+    if isinstance(args, dict):
+        return {k: _redact_secrets(v) for k, v in args.items() if not _is_secret_key(str(k))}
+    if isinstance(args, list):
+        return [_redact_secrets(v) for v in args]
+    if isinstance(args, tuple):
+        return tuple(_redact_secrets(v) for v in args)
+    return args
 
 
 def _version_str(version: Any) -> str | None:

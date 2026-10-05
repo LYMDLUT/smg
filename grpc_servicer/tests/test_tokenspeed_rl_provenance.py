@@ -106,17 +106,42 @@ class TestGetServerInfo:
         monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
         assert _server_info(_servicer(paused_sync=True)).is_paused is True
 
-    def test_silent_scheduler_does_not_hang_discovery(self, monkeypatch):
-        """The engine's pause query has no timeout of its own; ours bounds it."""
+    def test_silent_scheduler_does_not_hang_discovery_or_lose_the_probe(self, monkeypatch):
+        """The engine's pause query has no timeout of its own; ours bounds it
+        without cancelling it. TokenSpeed's queueing communicator resets its
+        state only after a normal completion, so a cancelled query would wedge
+        every later one. A timed-out probe therefore keeps running, a later
+        call waits on that same probe, and once the scheduler answers the true
+        state comes through.
+        """
         monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
         monkeypatch.setattr(servicer_mod, "HEALTH_CHECK_TIMEOUT", 0.05)
         s = _servicer()
+        starts: list[int] = []
+        cancelled: list[int] = []
 
-        async def _never():
-            await asyncio.Event().wait()
+        async def scenario():
+            gate = asyncio.Event()
 
-        s.async_llm.is_scheduler_paused = _never
-        assert _server_info(s).is_paused is False
+            async def _slow():
+                starts.append(1)
+                try:
+                    await gate.wait()
+                except asyncio.CancelledError:
+                    cancelled.append(1)
+                    raise
+                return True
+
+            s.async_llm.is_scheduler_paused = _slow
+            first = await s.GetServerInfo(pb.GetServerInfoRequest(), None)
+            second = await s.GetServerInfo(pb.GetServerInfoRequest(), None)
+            gate.set()
+            third = await s.GetServerInfo(pb.GetServerInfoRequest(), None)
+            return first.is_paused, second.is_paused, third.is_paused
+
+        assert asyncio.run(scenario()) == (False, False, True)
+        assert cancelled == [], "the engine's query must never be cancelled"
+        assert starts == [1], "later calls wait on the in-flight probe, not a new one"
 
     def test_secrets_never_leave_the_engine(self, monkeypatch):
         monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
@@ -150,6 +175,18 @@ def test_redaction_reaches_nested_configs():
         "kv_store": {"endpoint": "redis://cache", "ttl": 5},
         "nested": {"deeper": {"keep": 1}},
     }
+
+
+def test_redaction_reaches_lists_and_tuples():
+    """A credential inside a list of sub-configs is a credential too."""
+    redacted = servicer_mod._redact_secrets(
+        {
+            "providers": [{"name": "p", "api_key": "k"}, "plain"],
+            "pair": ({"password": "x", "port": 1}, 2),
+        }
+    )
+    assert redacted == {"providers": [{"name": "p"}, "plain"], "pair": ({"port": 1}, 2)}
+    assert isinstance(redacted["pair"], tuple)
 
 
 class TestGetModelInfo:
