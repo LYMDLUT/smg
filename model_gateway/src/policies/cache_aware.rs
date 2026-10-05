@@ -75,16 +75,25 @@ use std::{
 };
 
 use dashmap::DashMap;
-use kv_index::{compute_request_content_hashes, PositionalIndexer, TenantId, TokenTree, Tree};
+use kv_index::{
+    compute_request_content_hashes, request_prefix_hashes, ContentHash, PositionalIndexer,
+    TenantId, TokenTree, Tree,
+};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
+#[cfg(test)]
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::{
-    normalize_model_key, utils::PeriodicTask, CacheAwareConfig, CacheNamespace, LeastLoadPolicy,
-    LoadBalancingPolicy, SelectWorkerInfo, TEXT_MARKER_LEN,
+    cost::{
+        self, CandidateInputs, OptimisticAccounting, Pick, RequestInputs, WorkerSelectionPolicy,
+    },
+    normalize_model_key,
+    utils::PeriodicTask,
+    CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo,
+    TEXT_MARKER_LEN,
 };
 /// Latest per-worker backend load snapshot stream, keyed by worker URL.
 pub(crate) use crate::worker::load_state::{LoadReceiver, LoadSnapshot};
@@ -113,6 +122,13 @@ pub struct CacheAwarePolicy {
     /// candidate set. It owns backend snapshots and since-poll dispatch credit,
     /// keeping selection and credit atomic under concurrent arrivals.
     load_scorer: LeastLoadPolicy,
+    /// Selection policy run over the per-worker inputs gathered for each
+    /// request (`cost` module); the default reproduces the affinity-group
+    /// decision exactly and the ports of published cost functions replace it.
+    selection: WorkerSelectionPolicy,
+    /// Optimistic self-accounting of dispatches the engines have not yet
+    /// reported; `None` unless `selection_accounting_ttl_ms > 0`.
+    accounting: Option<OptimisticAccounting>,
     /// String-based trees for HTTP connections (text input)
     string_trees: Arc<DashMap<String, Arc<Tree>>>,
     /// Token-based trees for gRPC connections (pre-tokenized input)
@@ -364,9 +380,31 @@ impl CacheAwarePolicy {
             None
         };
 
+        let selection_policy_name = config
+            .selection_policy
+            .as_deref()
+            .unwrap_or(cost::DEFAULT_POLICY);
+        let selection = cost::build(
+            selection_policy_name,
+            config.selection_policy_params.as_deref(),
+            config.selection_temperature,
+        )
+        .unwrap_or_else(|err| {
+            // Configuration validation rejects this before a policy is built;
+            // a policy constructed outside that path still routes, with the
+            // default decision, rather than failing every request.
+            error!(%err, "Invalid selection policy; using {}", cost::DEFAULT_POLICY);
+            cost::default_policy(config.selection_temperature)
+        });
+        let accounting = (config.selection_accounting_ttl_ms > 0).then(|| {
+            OptimisticAccounting::new(Duration::from_millis(config.selection_accounting_ttl_ms))
+        });
+
         Self {
             config,
             load_scorer: LeastLoadPolicy::new(),
+            selection,
+            accounting,
             string_trees,
             token_trees,
             _eviction_task: eviction_task,
@@ -1093,9 +1131,12 @@ impl TreeHandle for CacheAwarePolicy {
     }
 }
 
-/// One positive-overlap candidate: slice index and possibly decayed score.
+/// One positive-overlap candidate: slice index, undecayed overlap in blocks
+/// (the tree paths report matched units over the block size) and the possibly
+/// decayed score the affinity-group decision ranks on.
 struct OverlapCandidate {
     idx: usize,
+    raw_score: f64,
     effective_score: f64,
 }
 
@@ -1107,6 +1148,9 @@ struct OverlapCandidate {
 /// receiver is wired; workers absent from the snapshot are never decayed.
 struct OverlapTuning<'a> {
     overlap_decay: f32,
+    /// Read by the test-only reference selector (`affinity_score_group`);
+    /// production selection carries the temperature inside the policy.
+    #[cfg_attr(not(test), expect(dead_code, reason = "test-only reference selector"))]
     selection_temperature: f32,
     waiting_prefill_tokens: Option<&'a LoadSnapshot>,
 }
@@ -1192,6 +1236,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
+        if let Some(accounting) = &self.accounting {
+            accounting.release(worker_url);
+        }
+        self.selection.on_request_complete(worker_url);
         // Could track success rates per worker for more intelligent routing
         if !success {
             // Optionally reduce affinity for failed requests
@@ -1234,6 +1282,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // hook. Keep this hook scoped to LeastLoad state so worker churn does
         // not repeat the full all-model cache scan.
         self.load_scorer.remove_worker(url);
+        if let Some(accounting) = &self.accounting {
+            accounting.forget_worker(url);
+        }
+        self.selection.on_worker_removed(url);
     }
 
     fn reset(&self) {
@@ -1294,6 +1346,26 @@ impl CacheAwarePolicy {
         }
         let guard = self.load_rx.read();
         guard.as_ref().map(|rx| rx.borrow().clone())
+    }
+
+    /// The latest load snapshot regardless of the decay setting, for
+    /// selection policies that read backend loads.
+    fn load_snapshot(&self) -> Option<Arc<LoadSnapshot>> {
+        let guard = self.load_rx.read();
+        guard.as_ref().map(|rx| rx.borrow().clone())
+    }
+
+    /// Request inputs for the tree paths: units are tokens (token tree) or
+    /// chars (string tree); the trees carry no prefix hashes.
+    fn tree_request(&self, units: usize, avg_load: f64) -> RequestInputs<'static> {
+        let block_size = self.config.block_size.max(1);
+        RequestInputs {
+            prompt_tokens: units,
+            block_size,
+            request_blocks: (units / block_size).max(1),
+            avg_load,
+            prefix_hashes: None,
+        }
     }
 
     /// Select and credit one final worker atomically with LeastLoad's
@@ -1386,11 +1458,163 @@ impl CacheAwarePolicy {
         self.select_expected_wait(workers, candidates, info)
     }
 
+    /// Run the selection policy over this request's inputs and resolve its
+    /// pick with the host's gate, expected-wait selector and credit.
+    ///
+    /// `candidates` are the positive-overlap workers with their decayed
+    /// scores. Policies that also want cold workers or backend loads declare
+    /// it in their `Needs`; the default policy declares neither, so with no
+    /// accounting its hot path gathers exactly what the affinity-group
+    /// decision did and reaches the same `select_final_from_affinity` call.
+    ///
+    /// - `Pick::Group`: the affinity group, resolved as before (pressure
+    ///   gate, then expected wait, which credits the result).
+    /// - `Pick::None`: the miss path (expected wait over the healthy fleet).
+    /// - `Pick::Final`: that worker, credited through the expected-wait
+    ///   selector; the policy owns the load trade-off, so the count-pressure
+    ///   gate does not apply. If the waiting-queue veto drops it, the fleet
+    ///   fallback runs.
+    fn resolve_selection(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        candidates: &[OverlapCandidate],
+        request: &RequestInputs<'_>,
+        avg_load: f64,
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        let needs = self.selection.needs();
+        let accounting = self.accounting.as_ref();
+        let wants_all = needs.all_workers || accounting.is_some();
+        if candidates.is_empty() && !wants_all {
+            return self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info);
+        }
+
+        let loads = if needs.backend_loads {
+            self.load_snapshot()
+        } else {
+            None
+        };
+        let predicted = match (accounting, request.prefix_hashes) {
+            (Some(accounting), Some(hashes)) => accounting.predicted_overlaps(hashes),
+            _ => Vec::new(),
+        };
+        let block_size = request.block_size.max(1) as f64;
+        let gather = |idx: usize, raw: f64, effective: f64| {
+            let worker = &workers[idx];
+            let url = worker.url();
+            let load = loads.as_deref().and_then(|snapshot| snapshot.get(url));
+            let booked = accounting.map_or(0, |accounting| accounting.pending_prefill_tokens(url));
+            let active_prefill_tokens = match load {
+                Some(load) => Some(load.total_waiting_uncached_tokens().max(0) as u64 + booked),
+                None if booked > 0 => Some(booked),
+                None => None,
+            };
+            let decode_blocks = load
+                .filter(|load| load.has_absolute_token_data())
+                .map(|load| {
+                    load.total_used_tokens().max(0) as f64 / block_size
+                        + accounting.map_or(0.0, |accounting| accounting.output_blocks(url))
+                });
+            let predicted_blocks = predicted
+                .iter()
+                .find(|(predicted_url, _)| &**predicted_url == url)
+                .map_or(0.0, |(_, blocks)| *blocks);
+            // A prediction deeper than the index's view stands in for both
+            // scores: the blocks are expected to be resident by the time the
+            // request lands, so no decay is applied to them.
+            let (device_blocks, effective_score) = if predicted_blocks > raw {
+                (predicted_blocks, predicted_blocks)
+            } else {
+                (raw, effective)
+            };
+            CandidateInputs {
+                idx,
+                url,
+                device_blocks,
+                host_blocks: 0.0,
+                disk_blocks: 0.0,
+                effective_score,
+                active_requests: worker.load(),
+                active_prefill_tokens,
+                decode_blocks,
+                kv_usage: load.map(WorkerLoadResponse::effective_token_usage),
+                queue_depth: load.map(|load| load.total_waiting_reqs().max(0) as u64),
+                running_requests: load.map(|load| {
+                    load.loads
+                        .iter()
+                        .map(|rank| rank.num_running_reqs.max(0) as u64)
+                        .sum()
+                }),
+                taint: 1.0,
+            }
+        };
+        let inputs: Vec<CandidateInputs<'_>> = if wants_all {
+            // Candidates follow healthy order, so one merge pass pairs them.
+            let mut next = candidates.iter().peekable();
+            healthy_indices
+                .iter()
+                .map(|&idx| {
+                    let (raw, effective) = next
+                        .next_if(|candidate| candidate.idx == idx)
+                        .map_or((0.0, 0.0), |candidate| {
+                            (candidate.raw_score, candidate.effective_score)
+                        });
+                    gather(idx, raw, effective)
+                })
+                .collect()
+        } else {
+            candidates
+                .iter()
+                .map(|candidate| {
+                    gather(
+                        candidate.idx,
+                        candidate.raw_score,
+                        candidate.effective_score,
+                    )
+                })
+                .collect()
+        };
+
+        let selected = match self.selection.select(request, &inputs) {
+            Pick::None => {
+                self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+            }
+            Pick::Group(rows) => {
+                let group: Vec<usize> = rows.iter().map(|&row| inputs[row].idx).collect();
+                self.select_final_from_affinity(workers, &group, healthy_indices, avg_load, info)
+            }
+            Pick::Final(row) => {
+                let idx = inputs[row].idx;
+                self.select_expected_wait(workers, &[idx], info)
+                    .or_else(|| self.select_expected_wait(workers, healthy_indices, info))
+            }
+        }?;
+
+        if let Some(dispatched) = inputs.iter().find(|candidate| candidate.idx == selected) {
+            self.selection.on_dispatch(request, dispatched);
+            if let Some(accounting) = accounting {
+                let uncached = dispatched.uncached_prompt_tokens(request) as u64;
+                accounting.record_dispatch(
+                    dispatched.url,
+                    uncached,
+                    request.prefix_hashes.unwrap_or(&[]),
+                );
+            }
+        }
+        Some(selected)
+    }
+
     /// Pick an effective-affinity score group while preserving temperature.
     /// At temperature zero this is the exact maximum. With temperature, the
     /// existing softmax samples one worker; expanding that draw back to every
     /// equal-score worker preserves each score group's aggregate probability,
     /// then LeastLoad breaks the tie inside the sampled group.
+    ///
+    /// Kept as the reference for the default selection policy, which must
+    /// reproduce it (see the pin tests); production goes through
+    /// `resolve_selection`.
+    #[cfg(test)]
     fn affinity_score_group(
         candidates: &[OverlapCandidate],
         selection_temperature: f32,
@@ -1428,16 +1652,20 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
         matched_tenants: &[TenantId],
-        request_units: usize,
-        avg_load: f64,
+        matched_units: usize,
+        request: &RequestInputs<'_>,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
+        let avg_load = request.avg_load;
+        let request_units = request.prompt_tokens;
+        let matched_blocks = (matched_units / self.config.block_size.max(1)) as f64;
         let mut candidates: Vec<OverlapCandidate> = Vec::new();
         for &idx in healthy_indices {
             let url = workers[idx].url();
             if matched_tenants.iter().any(|tenant| tenant.as_ref() == url) {
                 candidates.push(OverlapCandidate {
                     idx,
+                    raw_score: matched_blocks,
                     effective_score: 1.0,
                 });
             }
@@ -1456,12 +1684,11 @@ impl CacheAwarePolicy {
             self.config.block_size,
             &tuning,
         );
-        let affinity_candidates =
-            Self::affinity_score_group(&candidates, tuning.selection_temperature);
-        self.select_final_from_affinity(
+        self.resolve_selection(
             workers,
-            &affinity_candidates,
             healthy_indices,
+            &candidates,
+            request,
             avg_load,
             info,
         )
@@ -1495,44 +1722,56 @@ impl CacheAwarePolicy {
             waiting_prefill_tokens: waiting_prefill_tokens.as_deref(),
         };
 
-        let candidates = Self::overlap_candidates(
+        let content_hashes = compute_request_content_hashes(tokens, block_size);
+        let candidates = Self::overlap_candidates_for_hashes(
             workers,
-            tokens,
+            &content_hashes,
             healthy_indices,
             indexer,
             block_size,
             &tuning,
         );
-        let affinity_candidates =
-            Self::affinity_score_group(&candidates, tuning.selection_temperature);
-        if !affinity_candidates.is_empty() {
-            let idx = self.select_final_from_affinity(
-                workers,
-                &affinity_candidates,
-                healthy_indices,
-                avg_load,
-                info,
-            )?;
-            debug!(
-                worker = workers[idx].url(),
-                branch = if affinity_candidates.contains(&idx) {
-                    "event_hit"
-                } else {
-                    "event_spill"
-                },
-                model_id,
-                "Event-driven routing: overlap match"
-            );
-            return Some(idx);
-        }
-
-        // No cache overlap — expected-wait fallback over the healthy fleet.
-        let selected = self.select_expected_wait(workers, healthy_indices, info)?;
+        // Chain hashes are computed only for policies (or accounting) keyed
+        // on prefixes; the default decision never pays for them.
+        let prefix_hashes: Vec<u64> =
+            if self.selection.needs().prefix_hashes || self.accounting.is_some() {
+                request_prefix_hashes(&content_hashes)
+                    .into_iter()
+                    .map(|hash| hash.0)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let request = RequestInputs {
+            prompt_tokens: tokens.len(),
+            block_size,
+            request_blocks: content_hashes.len().max(1),
+            avg_load,
+            prefix_hashes: (!prefix_hashes.is_empty()).then_some(prefix_hashes.as_slice()),
+        };
+        let had_overlap = !candidates.is_empty();
+        let idx = self.resolve_selection(
+            workers,
+            healthy_indices,
+            &candidates,
+            &request,
+            avg_load,
+            info,
+        )?;
         debug!(
-            worker = workers[selected].url(),
-            model_id, "Event-driven routing: no overlap, expected-wait fallback"
+            worker = workers[idx].url(),
+            branch = if !had_overlap {
+                "event_miss"
+            } else if candidates.iter().any(|candidate| candidate.idx == idx) {
+                "event_hit"
+            } else {
+                "event_spill"
+            },
+            policy = self.selection.name(),
+            model_id,
+            "Event-driven routing"
         );
-        Some(selected)
+        Some(idx)
     }
 
     /// Build positive-overlap candidates for event-driven routing.
@@ -1543,6 +1782,7 @@ impl CacheAwarePolicy {
     /// at temperature zero; a softmax-sampled group otherwise), and
     /// `select_final_from_affinity` uses LeastLoad to choose and credit one
     /// final worker from that group. An empty result means no full-block overlap.
+    #[cfg(test)]
     fn overlap_candidates(
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
@@ -1552,11 +1792,30 @@ impl CacheAwarePolicy {
         tuning: &OverlapTuning<'_>,
     ) -> Vec<OverlapCandidate> {
         let content_hashes = compute_request_content_hashes(tokens, block_size);
+        Self::overlap_candidates_for_hashes(
+            workers,
+            &content_hashes,
+            healthy_indices,
+            indexer,
+            block_size,
+            tuning,
+        )
+    }
+
+    /// `overlap_candidates` over already-computed block hashes.
+    fn overlap_candidates_for_hashes(
+        workers: &[Arc<dyn Worker>],
+        content_hashes: &[ContentHash],
+        healthy_indices: &[usize],
+        indexer: &PositionalIndexer,
+        block_size: usize,
+        tuning: &OverlapTuning<'_>,
+    ) -> Vec<OverlapCandidate> {
         if content_hashes.is_empty() {
             return Vec::new();
         }
 
-        let overlap = indexer.find_matches(&content_hashes, false);
+        let overlap = indexer.find_matches(content_hashes, false);
         if overlap.scores.is_empty() {
             return Vec::new();
         }
@@ -1575,6 +1834,7 @@ impl CacheAwarePolicy {
             };
             candidates.push(OverlapCandidate {
                 idx,
+                raw_score: f64::from(score),
                 effective_score: f64::from(score),
             });
         }
@@ -1639,6 +1899,7 @@ impl CacheAwarePolicy {
     /// or 2000. The best candidate's exponent is exactly 0 (overflow-safe);
     /// a degenerate spread (all equal) is a uniform draw. Inverse-CDF
     /// sampling with a last-row fallback against floating-point drift.
+    #[cfg(test)]
     fn sample_by_temperature(candidates: &[OverlapCandidate], temperature: f32) -> Option<usize> {
         let first = candidates.first()?;
         let (min, max) = candidates.iter().fold(
@@ -2015,17 +2276,18 @@ impl CacheAwarePolicy {
             } else {
                 matched as f32 / input as f32
             };
+            let request = self.tree_request(tokens.len(), avg_load);
             selected_idx = if match_rate > self.config.cache_threshold {
                 self.select_matched_candidate(
                     workers,
                     healthy_indices,
                     &result.matched_tenants,
-                    tokens.len(),
-                    avg_load,
+                    matched,
+                    &request,
                     info,
                 )
             } else {
-                self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+                self.resolve_selection(workers, healthy_indices, &[], &request, avg_load, info)
             };
             selected_idx.map(|idx| workers[idx].url())
         });
@@ -2092,17 +2354,18 @@ impl CacheAwarePolicy {
             } else {
                 matched as f32 / input as f32
             };
+            let request = self.tree_request(input, avg_load);
             selected_idx = if match_rate > self.config.cache_threshold {
                 self.select_matched_candidate(
                     workers,
                     healthy_indices,
                     &result.matched_tenants,
-                    input,
-                    avg_load,
+                    matched,
+                    &request,
                     info,
                 )
             } else {
-                self.select_final_from_affinity(workers, &[], healthy_indices, avg_load, info)
+                self.resolve_selection(workers, healthy_indices, &[], &request, avg_load, info)
             };
             selected_idx.map(|idx| workers[idx].url())
         });
@@ -5708,5 +5971,260 @@ mod tests {
         let mut forged = tenant_a.token_marker().to_vec();
         forged.extend_from_slice(&tokens);
         assert_eq!(route_namespaced(&policy, &workers, &forged, None), 0);
+    }
+
+    // -- selection policy layer --
+
+    /// Random positive-overlap candidate sets, as `overlap_candidates` would
+    /// produce them (healthy order, scores from a small set so ties occur).
+    fn random_overlap_candidates(rng: &mut impl RngExt, workers: usize) -> Vec<OverlapCandidate> {
+        let mut candidates = Vec::new();
+        for idx in 0..workers {
+            if rng.random::<f64>() >= 0.6 {
+                continue;
+            }
+            let score = f64::from(rng.random_range(1..6u32)) * 1.5;
+            let decayed = if rng.random::<f64>() < 0.3 {
+                score / 1.5
+            } else {
+                score
+            };
+            candidates.push(OverlapCandidate {
+                idx,
+                raw_score: score,
+                effective_score: decayed,
+            });
+        }
+        candidates
+    }
+
+    fn policy_inputs<'a>(
+        candidates: &'a [OverlapCandidate],
+        urls: &'a [String],
+    ) -> Vec<CandidateInputs<'a>> {
+        candidates
+            .iter()
+            .map(|candidate| CandidateInputs {
+                idx: candidate.idx,
+                url: &urls[candidate.idx],
+                device_blocks: candidate.raw_score,
+                host_blocks: 0.0,
+                disk_blocks: 0.0,
+                effective_score: candidate.effective_score,
+                active_requests: 0,
+                active_prefill_tokens: None,
+                decode_blocks: None,
+                kv_usage: None,
+                queue_depth: None,
+                running_requests: None,
+                taint: 1.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_policy_reproduces_affinity_score_group_at_zero_temperature() {
+        let policy = cost::build(cost::DEFAULT_POLICY, None, 0.0).unwrap();
+        let urls: Vec<String> = (0..16).map(|i| format!("http://w{i:02}:8000")).collect();
+        let request = RequestInputs {
+            prompt_tokens: 64,
+            block_size: 4,
+            request_blocks: 16,
+            avg_load: 0.0,
+            prefix_hashes: None,
+        };
+        let mut rng = rand::rng();
+        for _ in 0..2_000 {
+            let candidates = random_overlap_candidates(&mut rng, urls.len());
+            let mut reference = CacheAwarePolicy::affinity_score_group(&candidates, 0.0);
+            reference.sort_unstable();
+            let inputs = policy_inputs(&candidates, &urls);
+            let mut group = match policy.select(&request, &inputs) {
+                Pick::Group(rows) => rows.iter().map(|&row| inputs[row].idx).collect::<Vec<_>>(),
+                Pick::None => Vec::new(),
+                Pick::Final(_) => panic!("the default policy never returns a single pick"),
+            };
+            group.sort_unstable();
+            assert_eq!(group, reference);
+        }
+    }
+
+    #[test]
+    fn default_policy_temperature_groups_are_score_groups() {
+        let policy = cost::build(cost::DEFAULT_POLICY, None, 0.5).unwrap();
+        let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+        let candidates: Vec<OverlapCandidate> = (0..8)
+            .map(|idx| OverlapCandidate {
+                idx,
+                raw_score: if idx < 4 { 8.0 } else { 2.0 },
+                effective_score: if idx < 4 { 8.0 } else { 2.0 },
+            })
+            .collect();
+        let inputs = policy_inputs(&candidates, &urls);
+        let request = RequestInputs {
+            prompt_tokens: 32,
+            block_size: 4,
+            request_blocks: 8,
+            avg_load: 0.0,
+            prefix_hashes: None,
+        };
+        let mut saw_high = false;
+        let mut saw_low = false;
+        for _ in 0..400 {
+            let Pick::Group(rows) = policy.select(&request, &inputs) else {
+                panic!("expected a group");
+            };
+            let score = inputs[rows[0]].effective_score;
+            assert!(rows.iter().all(|&row| inputs[row].effective_score == score));
+            assert_eq!(rows.len(), 4, "a score group is every equal-score worker");
+            if score == 8.0 {
+                saw_high = true;
+            } else {
+                saw_low = true;
+            }
+        }
+        assert!(
+            saw_high && saw_low,
+            "temperature must reach both score groups"
+        );
+    }
+
+    /// Parameters that put a ported policy on the tests' scale (4-token
+    /// blocks, 8-token prompts); Ramjet's affinity block is 512 tokens.
+    fn test_scale_params(name: &str) -> Option<String> {
+        (name == "ramjet").then(|| "{affinity_block_tokens: 4}".to_string())
+    }
+
+    #[test]
+    fn ported_policies_route_event_driven_hits_and_misses() {
+        for name in cost::POLICY_NAMES {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                selection_policy: Some((*name).to_string()),
+                selection_policy_params: test_scale_params(name),
+                ..test_config()
+            });
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            policy.init_workers(&workers);
+            let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+            let indexer =
+                setup_indexer_with_blocks("http://w2:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
+            monitor.indexers.insert("unknown".to_string(), indexer);
+            policy.set_kv_event_monitor(Some(monitor));
+
+            let hit = policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(hit, Some(1), "{name}: the holder of every block must win");
+            policy.on_request_complete("http://w2:8000", true);
+
+            let miss = policy.select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&[100, 200, 300, 400]),
+                    ..Default::default()
+                },
+            );
+            assert!(miss.is_some(), "{name}: a miss must still route");
+        }
+    }
+
+    #[test]
+    fn ported_policies_route_tree_matches() {
+        for name in cost::POLICY_NAMES {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                selection_policy: Some((*name).to_string()),
+                selection_policy_params: test_scale_params(name),
+                ..test_config()
+            });
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            policy.init_workers(&workers);
+            let text = "a shared system prompt that is long enough to match";
+            let first = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            policy.on_request_complete(workers[first].url(), true);
+            let second = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(text),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(first, second, "{name}: an idle holder keeps its prefix");
+        }
+    }
+
+    #[test]
+    fn accounting_books_the_dispatch_until_completion() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            selection_accounting_ttl_ms: 60_000,
+            ..test_config()
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+        let accounting = policy.accounting.as_ref().expect("accounting enabled");
+
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let selected = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(selected, 0);
+        // One block cached, one block (4 tokens) booked as uncached prefill.
+        assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 4);
+        let hashes: Vec<u64> = request_prefix_hashes(&compute_request_content_hashes(&tokens, 4))
+            .into_iter()
+            .map(|hash| hash.0)
+            .collect();
+        let predicted = accounting.predicted_overlaps(&hashes);
+        assert_eq!(predicted.len(), 1);
+        assert_eq!(&*predicted[0].0, "http://w1:8000");
+        assert_eq!(
+            predicted[0].1, 2.0,
+            "the whole two-block prefix is predicted resident"
+        );
+
+        // A sibling that shares the first block but not the second is predicted one block on w1.
+        let sibling: Vec<u64> = request_prefix_hashes(&compute_request_content_hashes(
+            &[1, 2, 3, 4, 9, 9, 9, 9],
+            4,
+        ))
+        .into_iter()
+        .map(|hash| hash.0)
+        .collect();
+        assert_eq!(accounting.predicted_overlaps(&sibling)[0].1, 1.0);
+
+        policy.on_request_complete("http://w1:8000", true);
+        assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 0);
+    }
+
+    #[test]
+    fn invalid_selection_policy_falls_back_to_the_default() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            selection_policy: Some("no-such-policy".to_string()),
+            ..test_config()
+        });
+        assert_eq!(policy.selection.name(), cost::DEFAULT_POLICY);
     }
 }

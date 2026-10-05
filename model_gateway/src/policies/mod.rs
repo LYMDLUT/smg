@@ -188,6 +188,17 @@ pub struct CacheAwareConfig {
     /// Ascending token positions at which serving engines retain reusable
     /// prefix state; the hash index keys request heads at these boundaries.
     pub cache_boundaries: Vec<usize>,
+    /// Worker selection policy run over the gathered per-worker inputs, by
+    /// name from [`cost::POLICY_NAMES`]. `None` is [`cost::DEFAULT_POLICY`],
+    /// the affinity-group decision this policy has always made.
+    pub selection_policy: Option<String>,
+    /// YAML/JSON parameters for `selection_policy`; each policy documents its
+    /// own and rejects unknown ones.
+    pub selection_policy_params: Option<String>,
+    /// Lifetime of optimistic dispatch bookings (predicted prefill and prefix
+    /// placement charged to the chosen worker before the engine reports it).
+    /// `0` disables (default); set a little above the engine's event lag.
+    pub selection_accounting_ttl_ms: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -210,6 +221,9 @@ impl Default for CacheAwareConfig {
             cache_index: CacheIndexKind::Tree,
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_policy_params: None,
+            selection_accounting_ttl_ms: 0,
         }
     }
 }

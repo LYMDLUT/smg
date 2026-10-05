@@ -766,6 +766,20 @@ pub enum PolicyConfig {
         /// shared `cache_boundaries` config).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cache_boundaries: Vec<usize>,
+        /// Worker selection policy run over the gathered per-worker inputs
+        /// (`cache-aware-default`, `dynamo-default`,
+        /// `llm-d-optimized-baseline`, `ramjet`, `dualmap`). Unset is the
+        /// cache-aware default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection_policy: Option<String>,
+        /// YAML/JSON parameters for `selection_policy`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection_policy_params: Option<String>,
+        /// Lifetime in milliseconds of optimistic dispatch bookings
+        /// (predicted prefill and prefix placement charged to the chosen
+        /// worker before the engine reports it). `0` disables.
+        #[serde(default)]
+        selection_accounting_ttl_ms: u64,
     },
 
     /// Power-of-two choices policy: samples two workers and routes to the one
@@ -1815,6 +1829,9 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_policy_params: None,
+            selection_accounting_ttl_ms: 0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1844,6 +1861,9 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_policy_params: None,
+            selection_accounting_ttl_ms: 0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1874,6 +1894,9 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_policy_params: None,
+            selection_accounting_ttl_ms: 0,
         };
 
         match cache_aware {
@@ -2403,6 +2426,9 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_policy_params: None,
+                selection_accounting_ttl_ms: 0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -2441,6 +2467,9 @@ mod tests {
                 cache_index: Default::default(),
                 cache_ttl_secs: 180,
                 cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_policy_params: None,
+                selection_accounting_ttl_ms: 0,
             }),
             decode_policy: None,
         };
@@ -2505,6 +2534,9 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_policy_params: None,
+            selection_accounting_ttl_ms: 0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

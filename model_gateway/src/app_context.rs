@@ -982,6 +982,9 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_policy_params: None,
+            selection_accounting_ttl_ms: 0,
         });
         let builder = AppContextBuilder::new()
             .with_client(&config, 5)
@@ -1025,6 +1028,9 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_policy_params: None,
+            selection_accounting_ttl_ms: 0,
         }));
     }
 
@@ -1048,6 +1054,9 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_policy_params: None,
+            selection_accounting_ttl_ms: 0,
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);

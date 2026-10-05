@@ -24,6 +24,7 @@ use smg::{
         metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
+    policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
     server::{self, ServerConfig},
     service_discovery::{ModelIdSource, ServiceDiscoveryConfig},
     version,
@@ -343,6 +344,30 @@ struct CliArgs {
     /// argmax.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     selection_temperature: f32,
+
+    /// Worker selection policy for cache_aware, run over the per-worker
+    /// inputs the router gathers (prefix overlap, in-flight requests,
+    /// backend load reports): cache-aware-default (the affinity-group
+    /// decision), dynamo-default, llm-d-optimized-baseline, ramjet, dualmap
+    #[arg(
+        long,
+        default_value = "cache-aware-default",
+        help_heading = "Routing Policy"
+    )]
+    selection_policy: String,
+
+    /// YAML/JSON parameters for --selection-policy, e.g.
+    /// '{alpha: 2.0, basis: absolute}' for ramjet; each policy documents its
+    /// own and rejects unknown ones
+    #[arg(long, help_heading = "Routing Policy")]
+    selection_policy_params: Option<String>,
+
+    /// Lifetime in milliseconds of optimistic dispatch bookings for
+    /// cache_aware: predicted prefill and prefix placement are charged to the
+    /// chosen worker until the engine reports them or the booking expires.
+    /// 0 disables; set a little above the engine's KV-event lag
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    selection_accounting_ttl_ms: u64,
 
     /// Interval in seconds between cache-tree eviction cycles
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -1525,6 +1550,10 @@ impl CliArgs {
                 cache_index: Self::parse_cache_index(&self.cache_index),
                 cache_ttl_secs: self.cache_ttl_secs,
                 cache_boundaries: self.cache_boundaries.clone(),
+                selection_policy: (self.selection_policy != DEFAULT_SELECTION_POLICY)
+                    .then(|| self.selection_policy.clone()),
+                selection_policy_params: self.selection_policy_params.clone(),
+                selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,

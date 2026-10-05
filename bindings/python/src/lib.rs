@@ -664,6 +664,9 @@ impl Router {
                     cache_index: self.parse_cache_index()?,
                     cache_ttl_secs: self.cache_ttl_secs,
                     cache_boundaries: self.cache_boundaries.clone(),
+                    selection_policy: None,
+                    selection_policy_params: None,
+                    selection_accounting_ttl_ms: 0,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: self.load_monitor_interval,

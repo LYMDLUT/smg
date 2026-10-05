@@ -54,6 +54,9 @@ impl PolicyFactory {
                 cache_index,
                 cache_ttl_secs,
                 cache_boundaries,
+                selection_policy,
+                selection_policy_params,
+                selection_accounting_ttl_ms,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -69,6 +72,9 @@ impl PolicyFactory {
                     cache_index: *cache_index,
                     cache_ttl_secs: *cache_ttl_secs,
                     cache_boundaries: cache_boundaries.clone(),
+                    selection_policy: selection_policy.clone(),
+                    selection_policy_params: selection_policy_params.clone(),
+                    selection_accounting_ttl_ms: *selection_accounting_ttl_ms,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -168,6 +174,9 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_policy_params: None,
+            selection_accounting_ttl_ms: 0,
         });
         assert_eq!(policy.name(), "cache_aware");
 
