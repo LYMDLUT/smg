@@ -10,9 +10,12 @@
 //! - `dynamo-default`, the three llm-d profiles (`llm-d-optimized-baseline`,
 //!   `llm-d-precise-prefix`, `llm-d-sticky-until-saturated`), `ramjet` and `dualmap` are ports
 //!   of published policies so routing quality can be compared under one host and one mock engine.
+//! - [`accounting::OptimisticAccounting`] closes the window between a dispatch and the engine's
+//!   first event, when enabled.
 //!
 //! The cost of the stage itself is measured by `benches/policy_selection.rs`.
 
+pub mod accounting;
 pub mod catalog;
 pub mod inputs;
 pub mod policy;
@@ -27,6 +30,7 @@ mod ramjet;
 #[cfg(test)]
 mod sim_tests;
 
+pub use accounting::OptimisticAccounting;
 pub use catalog::{build, default_policy, CatalogError, DEFAULT_POLICY, POLICY_NAMES};
 pub use inputs::{CandidateInputs, RequestInputs};
 pub use policy::{Needs, Pick, WorkerFilter, WorkerPicker, WorkerScorer, WorkerSelectionPolicy};
