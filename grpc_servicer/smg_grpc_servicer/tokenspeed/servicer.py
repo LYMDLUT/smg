@@ -608,7 +608,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # advertisement; they simply stay label-free.
         advertise = getattr(self.async_llm, "rl_advertisement", None)
         if callable(advertise):
-            server_args_dict.update(advertise())
+            try:
+                server_args_dict.update(advertise())
+            except Exception:  # noqa: BLE001 — a failed probe must not break discovery
+                logger.warning(
+                    "rl_advertisement failed; serving without rl.* labels", exc_info=True
+                )
         server_args_dict = _redact_secrets(server_args_dict)
         server_args_struct = Struct()
         server_args_struct.update(_make_json_serializable(server_args_dict))
@@ -663,7 +668,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         try:
             result = query()
             if inspect.isawaitable(result):
-                result = await result
+                # The engine's query waits on a scheduler reply with no bound of
+                # its own; a silent scheduler must not hang discovery.
+                result = await asyncio.wait_for(result, timeout=HEALTH_CHECK_TIMEOUT)
             return bool(result)
         except Exception:  # noqa: BLE001 — a failed probe must not break discovery
             logger.warning("is_scheduler_paused failed; reporting not paused", exc_info=True)
@@ -1603,7 +1610,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         )
         if _GENERATE_CHUNK_HAS_WEIGHT_VERSION:
             # protobuf treats None as unset for an optional field.
-            chunk_kwargs["weight_version"] = meta.get("weight_version")
+            chunk_kwargs["weight_version"] = _version_str(meta.get("weight_version"))
         return tokenspeed_scheduler_pb2.GenerateResponse(
             request_id=rid,
             chunk=tokenspeed_scheduler_pb2.GenerateStreamChunk(**chunk_kwargs),
@@ -1649,7 +1656,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         )
         if _GENERATE_COMPLETE_HAS_WEIGHT_VERSION:
             # protobuf treats None as unset for an optional field.
-            complete_kwargs["weight_version"] = meta.get("weight_version")
+            complete_kwargs["weight_version"] = _version_str(meta.get("weight_version"))
         return tokenspeed_scheduler_pb2.GenerateResponse(
             request_id=rid,
             complete=tokenspeed_scheduler_pb2.GenerateComplete(**complete_kwargs),
@@ -1744,7 +1751,19 @@ def _is_secret_key(key: str) -> bool:
 
 
 def _redact_secrets(args: dict) -> dict:
-    return {k: v for k, v in args.items() if not _is_secret_key(str(k))}
+    """Drop credential-looking keys at every level: ``dataclasses.asdict`` nests
+    sub-configs as dicts, and a secret two levels down is still a secret.
+    """
+    return {
+        k: _redact_secrets(v) if isinstance(v, dict) else v
+        for k, v in args.items()
+        if not _is_secret_key(str(k))
+    }
+
+
+def _version_str(version: Any) -> str | None:
+    """``meta_info["weight_version"]`` as the proto's string, ``None`` when absent."""
+    return None if version is None else str(version)
 
 
 def _make_json_serializable(obj: Any) -> Any:

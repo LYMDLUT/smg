@@ -68,6 +68,19 @@ class TestGetServerInfo:
         assert "rl.control_url" not in info.server_args
         assert info.server_args["model"] == "m"
 
+    def test_failing_advertisement_degrades_to_a_label_free_worker(self, monkeypatch):
+        """A bug in the engine's advertisement must not take discovery down."""
+        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
+        s = _servicer()
+
+        def _boom():
+            raise RuntimeError("advertisement broke")
+
+        s.async_llm.rl_advertisement = _boom
+        info = _server_info(s)
+        assert "rl.control_url" not in info.server_args
+        assert info.server_args["model"] == "m"
+
     def test_reports_live_pause_state_and_defaults_false(self, monkeypatch):
         monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
         assert _server_info(_servicer(paused=True)).is_paused is True
@@ -93,6 +106,18 @@ class TestGetServerInfo:
         monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
         assert _server_info(_servicer(paused_sync=True)).is_paused is True
 
+    def test_silent_scheduler_does_not_hang_discovery(self, monkeypatch):
+        """The engine's pause query has no timeout of its own; ours bounds it."""
+        monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
+        monkeypatch.setattr(servicer_mod, "HEALTH_CHECK_TIMEOUT", 0.05)
+        s = _servicer()
+
+        async def _never():
+            await asyncio.Event().wait()
+
+        s.async_llm.is_scheduler_paused = _never
+        assert _server_info(s).is_paused is False
+
     def test_secrets_never_leave_the_engine(self, monkeypatch):
         monkeypatch.setattr(servicer_mod, "_engine_supports_dp_rank_pin", lambda: False)
         info = _server_info(_servicer())
@@ -108,6 +133,23 @@ def test_is_secret_key_targets_credentials_only():
     assert is_secret("some_secret") and is_secret("db_password")
     assert not is_secret("max_total_tokens") and not is_secret("tokenizer")
     assert not is_secret("weight_version")
+
+
+def test_redaction_reaches_nested_configs():
+    """``dataclasses.asdict`` nests sub-configs; secrets inside them go too."""
+    redacted = servicer_mod._redact_secrets(
+        {
+            "model": "m",
+            "hf_token": "hf_abc",
+            "kv_store": {"endpoint": "redis://cache", "password": "p", "ttl": 5},
+            "nested": {"deeper": {"api_key": "k", "keep": 1}},
+        }
+    )
+    assert redacted == {
+        "model": "m",
+        "kv_store": {"endpoint": "redis://cache", "ttl": 5},
+        "nested": {"deeper": {"keep": 1}},
+    }
 
 
 class TestGetModelInfo:
@@ -145,6 +187,18 @@ class TestGenerateStampsVersion:
         output = {"output_ids": [1], "meta_info": {"finish_reason": {"type": "stop"}}}
         complete = s._complete_response("r", output, {"type": "stop"}, 0)
         assert not complete.complete.HasField("weight_version")
+
+    def test_non_string_version_is_coerced_not_rejected(self):
+        """A trainer that stamps an integer step must not break every response."""
+        s = _servicer()
+        output = {
+            "output_ids": [1],
+            "meta_info": {"finish_reason": {"type": "stop"}, "weight_version": 42},
+        }
+        complete = s._complete_response("r", output, {"type": "stop"}, 0)
+        assert complete.complete.weight_version == "42"
+        chunk = s._chunk_response("r", output, None, 0)
+        assert chunk.chunk.weight_version == "42"
 
 
 class TestGenerateStaleStubGuard:
