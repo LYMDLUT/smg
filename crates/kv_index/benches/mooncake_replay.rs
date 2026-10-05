@@ -861,7 +861,8 @@ fn event_issuer_for(worker: u64, logical_workers: u64, issuers: usize) -> usize 
 struct Shared {
     clock: Clock,
     start_ns: AtomicUsize,
-    deadline_ready: Box<[AtomicBool]>,
+    /// Queries of each deadline group not yet published; its events wait for zero.
+    deadline_pending: Box<[AtomicU32]>,
     peer_failed: AtomicBool,
 }
 
@@ -886,6 +887,7 @@ fn issue_queries(
             .clock
             .wait_until(start_ns.saturating_add(deadline_ns));
         touched.clear();
+        let group_start = i;
         while i < dispatch.len() && corpus.ops[dispatch[i].0 as usize].deadline_ns == deadline_ns {
             let (id, _, lane) = dispatch[i];
             let lane = lane as usize;
@@ -917,7 +919,7 @@ fn issue_queries(
         if failure.is_some() {
             break;
         }
-        shared.deadline_ready[group].store(true, Ordering::Release);
+        shared.deadline_pending[group].fetch_sub((i - group_start) as u32, Ordering::Release);
     }
     if failure.is_some() {
         shared.peer_failed.store(true, Ordering::Release);
@@ -952,7 +954,7 @@ fn issue_events(
             .clock
             .wait_until(start_ns.saturating_add(deadline_ns));
         // Queries of this deadline are published before its events.
-        while !shared.deadline_ready[group].load(Ordering::Acquire) {
+        while shared.deadline_pending[group].load(Ordering::Acquire) != 0 {
             if shared.peer_failed.load(Ordering::Acquire) {
                 failure = Some("issuer_peer_failed");
                 break;
@@ -1036,9 +1038,13 @@ struct Args {
     /// CPUs for the event issuers (one per issuer thread when given).
     #[arg(long)]
     issuer_cpus: Option<String>,
-    /// CPU for the query issuer.
-    #[arg(long)]
-    query_issuer_cpu: Option<usize>,
+    /// Query issuer threads; query lanes are sharded over them in contiguous ranges (Dynamo
+    /// issues all queries from one thread, which caps its generator near 1.5B block ops/s here).
+    #[arg(long, default_value = "1")]
+    query_issuer_threads: usize,
+    /// CPUs for the query issuers (one per thread when given); `--query-issuer-cpu` is an alias.
+    #[arg(long, alias = "query-issuer-cpu")]
+    query_issuer_cpus: Option<String>,
     /// CPUs for query and event lanes.
     #[arg(long)]
     backend_cpus: Option<String>,
@@ -1118,6 +1124,17 @@ fn run<B: ReplayBackend>(
     } else {
         issuer_cpus.len()
     };
+    let query_cpus = args
+        .query_issuer_cpus
+        .as_deref()
+        .map(parse_cpu_list)
+        .transpose()?
+        .unwrap_or_default();
+    let query_issuers = if query_cpus.is_empty() {
+        args.query_issuer_threads.max(1)
+    } else {
+        query_cpus.len()
+    };
     if window_ns != corpus.reference_window_ns {
         let reference = corpus.reference_window_ns.max(1) as u128;
         for op in &mut corpus.ops {
@@ -1131,8 +1148,7 @@ fn run<B: ReplayBackend>(
     let mut previous_deadline = None;
     let mut event_lane_of: FxHashMap<(u64, u32), u16> = FxHashMap::default();
     let mut event_lane_expected = vec![0usize; args.event_lanes];
-    let mut query_dispatch: Vec<(u32, u32, u16)> =
-        Vec::with_capacity(corpus.totals.requests as usize);
+    let mut query_dispatch: Vec<Vec<(u32, u32, u16)>> = vec![Vec::new(); query_issuers];
     let mut event_dispatch: Vec<Vec<EventDispatch>> =
         (0..issuer_threads).map(|_| Vec::new()).collect();
     for op in &corpus.ops {
@@ -1145,7 +1161,11 @@ fn run<B: ReplayBackend>(
             let lane = (op.worker as usize) % args.query_lanes;
             lane_capacities[lane] += 1;
             deadline_query_counts[group as usize] += 1;
-            query_dispatch.push((op.id, group, lane as u16));
+            query_dispatch[lane * query_issuers / args.query_lanes].push((
+                op.id,
+                group,
+                lane as u16,
+            ));
         } else {
             let next = event_lane_of.len();
             let lane = *event_lane_of
@@ -1182,9 +1202,9 @@ fn run<B: ReplayBackend>(
             });
         }
     }
-    let deadline_ready: Box<[AtomicBool]> = deadline_query_counts
+    let deadline_pending: Box<[AtomicU32]> = deadline_query_counts
         .iter()
-        .map(|&count| AtomicBool::new(count == 0))
+        .map(|&count| AtomicU32::new(count))
         .collect::<Vec<_>>()
         .into_boxed_slice();
 
@@ -1273,40 +1293,35 @@ fn run<B: ReplayBackend>(
     let shared = Shared {
         clock,
         start_ns: AtomicUsize::new(0),
-        deadline_ready,
+        deadline_pending,
         peer_failed: AtomicBool::new(false),
     };
-    let ready = Barrier::new(issuer_threads + 2);
-    let start = Barrier::new(issuer_threads + 2);
+    let ready = Barrier::new(issuer_threads + query_issuers + 1);
+    let start = Barrier::new(issuer_threads + query_issuers + 1);
     let (start_ns, outputs) = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(issuer_threads + 1);
+        let mut handles = Vec::with_capacity(issuer_threads + query_issuers);
         let (shared_ref, corpus_ref, lanes_ref, ready_ref, start_ref) =
             (&shared, &corpus, &lanes, &ready, &start);
-        let query_dispatch = &query_dispatch;
-        let query_cpu = args.query_issuer_cpu;
-        handles.push(scope.spawn(move || {
-            let pin = query_cpu.map_or(Ok(()), |cpu| pin_current_thread(&[cpu]));
-            let mut failure = pin.err().map(|_| "issuer_affinity");
-            if failure.is_some() {
-                shared_ref.peer_failed.store(true, Ordering::Release);
-            }
-            ready_ref.wait();
-            start_ref.wait();
-            let mut records = Vec::with_capacity(query_dispatch.len());
-            let (cpu_ns, f) = if failure.is_none() {
-                issue_queries(
-                    shared_ref,
-                    corpus_ref,
-                    query_dispatch,
-                    lanes_ref,
-                    &mut records,
-                )
-            } else {
-                (0, None)
-            };
-            failure = failure.or(f);
-            (records, cpu_ns, failure)
-        }));
+        for (idx, dispatch) in query_dispatch.iter().enumerate() {
+            let cpu = query_cpus.get(idx).copied();
+            handles.push(scope.spawn(move || {
+                let pin = cpu.map_or(Ok(()), |cpu| pin_current_thread(&[cpu]));
+                let mut failure = pin.err().map(|_| "issuer_affinity");
+                if failure.is_some() {
+                    shared_ref.peer_failed.store(true, Ordering::Release);
+                }
+                ready_ref.wait();
+                start_ref.wait();
+                let mut records = Vec::with_capacity(dispatch.len());
+                let (cpu_ns, f) = if failure.is_none() {
+                    issue_queries(shared_ref, corpus_ref, dispatch, lanes_ref, &mut records)
+                } else {
+                    (0, None)
+                };
+                failure = failure.or(f);
+                (records, cpu_ns, failure)
+            }));
+        }
         for (idx, dispatch) in event_dispatch.into_iter().enumerate() {
             let cpu = issuer_cpus.get(idx).copied();
             let senders = &senders;
@@ -1378,6 +1393,7 @@ fn run<B: ReplayBackend>(
     for (lane_idx, completions) in query_results.iter().enumerate() {
         let expected: Vec<u32> = query_dispatch
             .iter()
+            .flatten()
             .filter(|(_, _, lane)| *lane as usize == lane_idx)
             .map(|(id, _, _)| *id)
             .collect();
@@ -1540,7 +1556,8 @@ fn run<B: ReplayBackend>(
         "issuer_threads": issuer_threads,
         "event_workers": args.event_lanes,
         "issuer_cpus": issuer_cpus,
-        "query_issuer_cpu": args.query_issuer_cpu,
+        "query_issuer_threads": query_issuers,
+        "query_issuer_cpus": query_cpus,
         "backend_cpus": backend_cpus.to_vec(),
         "total_requests": totals.requests,
         "total_events": totals.events(),
