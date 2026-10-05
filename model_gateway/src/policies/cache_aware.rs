@@ -1982,6 +1982,15 @@ impl CacheAwarePolicy {
         };
         Metrics::record_worker_cache_aware_policy_branch(branch);
         Metrics::record_cache_aware_match_ratio(histogram_ratio);
+        // `credited_units` is what the served worker is expected to have
+        // cached: the matched prefix only when it serves the request. On the
+        // fallback and spill branches the match belongs to another tenant, so
+        // a join against the engine's cached tokens must not count it.
+        let credited_units = if branch == "tree_match" {
+            matched_units
+        } else {
+            0
+        };
         debug!(
             index = "tree",
             branch,
@@ -1989,6 +1998,9 @@ impl CacheAwarePolicy {
             model_id,
             matched_ratio = f64::from(matched_ratio),
             threshold = f64::from(self.config.cache_threshold),
+            matched_units,
+            input_units,
+            credited_units,
             "Cache-aware selection"
         );
     }
