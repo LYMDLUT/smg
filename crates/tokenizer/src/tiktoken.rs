@@ -837,23 +837,6 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn special_token_strings_are_interned_across_loads() {
-        let first = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("load");
-        let second = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("load again");
-        assert!(!first.allowed_special.is_empty());
-        assert_eq!(first.allowed_special, second.allowed_special);
-        assert_eq!(
-            first.allowed_special.len(),
-            first.tokenizer.special_tokens().len()
-        );
-        // The second load reuses the first load's leaked strings.
-        for token in &first.allowed_special {
-            let again = second.allowed_special.get(token).expect("same token");
-            assert!(std::ptr::eq(*token, *again), "{token:?} was leaked twice");
-        }
-    }
-
     use super::*;
     use crate::traits::{Decoder, Encoder, Tokenizer};
 
@@ -950,6 +933,23 @@ mod tests {
         for (i, encoding) in encodings.iter().enumerate() {
             let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
             assert_eq!(decoded, texts[i]);
+        }
+    }
+
+    #[test]
+    fn special_token_strings_are_interned_across_loads() {
+        let first = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("load");
+        let second = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("load again");
+        assert!(!first.allowed_special.is_empty());
+        assert_eq!(first.allowed_special, second.allowed_special);
+        assert_eq!(
+            first.allowed_special.len(),
+            first.tokenizer.special_tokens().len()
+        );
+        // The second load reuses the first load's leaked strings.
+        for token in first.allowed_special.iter() {
+            let again = second.allowed_special.get(token).expect("same token");
+            assert!(std::ptr::eq(*token, *again), "{token:?} was leaked twice");
         }
     }
 
