@@ -512,7 +512,7 @@ mod tests {
             Err(PartialJsonError::Invalid("expected ',' or ']'"))
         );
         assert_eq!(
-            strict.parse("tru", true),
+            strict.parse("tru", true), // codespell:ignore tru
             Err(PartialJsonError::Invalid("invalid literal"))
         );
         assert_eq!(
@@ -523,10 +523,10 @@ mod tests {
 
     #[test]
     fn literals_and_their_prefixes_read_as_the_literal_in_prefix_mode() {
-        assert_eq!(prefix("tru").0, json!(true));
+        assert_eq!(prefix("tru").0, json!(true)); // codespell:ignore tru
         assert_eq!(prefix("f").0, json!(false));
         assert_eq!(prefix("nul").0, json!(null));
-        assert_eq!(prefix("[true, fals").0, json!([true, false]));
+        assert_eq!(prefix("[true, fals").0, json!([true, false])); // codespell:ignore fals
     }
 
     #[test]
