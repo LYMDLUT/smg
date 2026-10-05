@@ -8,8 +8,9 @@
 //! **Dual-hash scheme**: backends send a position-aware `block_hash` (SequenceHash)
 //! and raw `token_ids` per block. The router computes a position-independent
 //! ContentHash (XXH3) from token_ids, then a rolling prefix hash (also XXH3) from
-//! the ContentHash sequence. SeqEntry is keyed by the router's prefix hash for
-//! precise disambiguation at query time. The backend's SequenceHash is stored in
+//! the ContentHash sequence. SeqEntry is keyed by the router's prefix hash, and every lookup probe
+//! (position 0, each jump landing, each scanned position) matches on it, so a
+//! request is credited only for the exact chain a worker holds. The backend's SequenceHash is stored in
 //! worker_blocks only, used for `apply_removed` reverse lookup.
 //!
 //! **Performance**: Internal u32 worker IDs eliminate Arc<str> hashing and atomic
@@ -324,19 +325,6 @@ impl SeqEntry {
             Self::Single(existing_hash, workers) if *existing_hash == seq_hash => Some(workers),
             Self::Single(_, _) => None,
             Self::Multi(map) => map.get(&seq_hash),
-        }
-    }
-
-    /// For Single entries, return the worker set directly without prefix hash check.
-    /// Content hash collisions at 64-bit XXH3 are practically impossible (~2^-64),
-    /// so a matching content_hash at the same position is unambiguous — the rolling
-    /// hash computation can be skipped entirely.
-    /// Returns None for Multi entries — caller must compute prefix hash to disambiguate.
-    #[inline]
-    fn workers_if_single(&self) -> Option<&FxHashSet<u32>> {
-        match self {
-            Self::Single(_, workers) => Some(workers),
-            Self::Multi(_) => None,
         }
     }
 }
@@ -757,6 +745,29 @@ impl PositionalIndexer {
         self.tree_sizes.total()
     }
 
+    /// Every membership in the index as `(worker, position, content hash, prefix hash)`.
+    ///
+    /// A full walk under the shard read locks, for the exactness harness only; never call it on
+    /// a request path.
+    #[doc(hidden)]
+    pub fn debug_blocks(&self) -> Vec<(u32, usize, ContentHash, SequenceHash)> {
+        let mut out = Vec::new();
+        for entry in &self.index {
+            let (position, content) = *entry.key();
+            match &entry.value().seq {
+                SeqEntry::Single(prefix, workers) => {
+                    out.extend(workers.iter().map(|&w| (w, position, content, *prefix)));
+                }
+                SeqEntry::Multi(map) => {
+                    for (prefix, workers) in map {
+                        out.extend(workers.iter().map(|&w| (w, position, content, *prefix)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Number of `(position, content_hash)` entries currently in the index.
     /// O(shards); intended for prune decisions and observability, not hot paths.
     pub fn entry_count(&self) -> usize {
@@ -960,9 +971,9 @@ impl PositionalIndexer {
     // Internal: query helpers
     // -----------------------------------------------------------------------
 
-    /// Get workers at a position matching content_hash (and prefix_hash for Multi).
-    /// Copies worker IDs into a Vec — used only once at position 0 to initialize `active`.
-    /// Skips rolling hash computation for Single entries (unambiguous match).
+    /// Workers holding the request's block at `position`: same content hash and the same
+    /// prefix hash (the chain of content hashes up to `position`), whatever the entry's shape.
+    /// Copies worker IDs into a Vec; used once, at position 0, to initialize `active`.
     fn get_workers_lazy(
         index: &PosIndex,
         position: usize,
@@ -973,10 +984,6 @@ impl PositionalIndexer {
     ) -> Option<Vec<u32>> {
         let entry = index.get(&(position, content_hash))?;
         entry.value().touch(now);
-        if let Some(workers) = entry.value().seq.workers_if_single() {
-            return Some(workers.iter().copied().collect());
-        }
-        // Multi: need rolling hash to disambiguate
         Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
         entry
             .value()
@@ -985,38 +992,39 @@ impl PositionalIndexer {
             .map(|workers| workers.iter().copied().collect())
     }
 
-    /// Count workers at a position matching the prefix_hash (no set materialization).
-    /// Skips rolling hash computation for Single entries (unambiguous match).
-    fn count_workers_at(
+    /// Whether every worker in `active` still holds the request's exact block at `position`
+    /// (content hash and prefix hash). When it does, every position in between is held too
+    /// (chains have no holes: a block is only reachable through its predecessors), so the jump
+    /// search may skip to `position`. A matching worker count is not enough: a worker that
+    /// dropped out earlier and another that holds this block without the request's start would
+    /// cancel out, and the first would be credited for blocks it does not have.
+    fn landing_holds_all(
         index: &PosIndex,
         position: usize,
         content_hash: ContentHash,
         seq_hashes: &mut Vec<SequenceHash>,
         sequence: &[ContentHash],
         now: u32,
-    ) -> usize {
+        active: &[u32],
+    ) -> bool {
         let Some(entry) = index.get(&(position, content_hash)) else {
-            return 0;
+            return false;
         };
         entry.value().touch(now);
-        if let Some(workers) = entry.value().seq.workers_if_single() {
-            return workers.len();
-        }
-        // Multi: need rolling hash to disambiguate
         Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
         entry
             .value()
             .seq
             .get(seq_hashes[position])
-            .map(|workers| workers.len())
-            .unwrap_or(0)
+            .is_some_and(|workers| {
+                workers.len() >= active.len() && active.iter().all(|w| workers.contains(w))
+            })
     }
 
     /// Scan positions sequentially, draining workers that stop matching.
-    /// Accesses DashMap entries directly — no set cloning.
-    /// Skips rolling hash computation for Single entries (unambiguous match).
-    /// Uses retain guard: skips retain when workers.len() >= active.len()
-    /// (all active workers are still present, no work to do).
+    /// Accesses DashMap entries directly — no set cloning. Every position is matched on
+    /// content hash and prefix hash, and every active worker is checked against the matching
+    /// set: a set at least as large as `active` may still lack one of its workers.
     #[expect(clippy::too_many_arguments)]
     fn linear_scan_drain(
         index: &PosIndex,
@@ -1043,30 +1051,6 @@ impl PositionalIndexer {
                 break;
             };
             entry.value().touch(now);
-
-            // Fast path: Single entry — skip rolling hash, use workers directly.
-            if let Some(workers) = entry.value().seq.workers_if_single() {
-                // Retain guard: only retain when some workers
-                // have dropped off. When workers.len() >= active.len(), all active
-                // workers are still present — skip the O(active) iteration.
-                if workers.len() < active.len() {
-                    let mut i = 0;
-                    while i < active.len() {
-                        if workers.contains(&active[i]) {
-                            i += 1;
-                        } else {
-                            internal_scores.insert(active[i], pos as u32);
-                            active.swap_remove(i);
-                        }
-                    }
-                }
-                if early_exit && !active.is_empty() {
-                    break;
-                }
-                continue;
-            }
-
-            // Multi: need rolling hash to disambiguate.
             Self::ensure_seq_hash_computed(seq_hashes, pos, sequence);
             let seq_hash = seq_hashes[pos];
 
@@ -1078,19 +1062,15 @@ impl PositionalIndexer {
                 break;
             };
 
-            // Retain guard: only iterate when some workers dropped off.
-            if workers.len() < active.len() {
-                let mut i = 0;
-                while i < active.len() {
-                    if workers.contains(&active[i]) {
-                        i += 1;
-                    } else {
-                        internal_scores.insert(active[i], pos as u32);
-                        active.swap_remove(i);
-                    }
+            let mut i = 0;
+            while i < active.len() {
+                if workers.contains(&active[i]) {
+                    i += 1;
+                } else {
+                    internal_scores.insert(active[i], pos as u32);
+                    active.swap_remove(i);
                 }
             }
-
             if early_exit && !active.is_empty() {
                 break;
             }
@@ -1149,18 +1129,17 @@ impl PositionalIndexer {
         while current_pos < len - 1 && !active.is_empty() {
             let next_pos = (current_pos + self.jump_size).min(len - 1);
 
-            let count = Self::count_workers_at(
+            // Every active worker holds the exact block at the landing, so it holds the
+            // positions in between as well: skip them. Otherwise scan to find where each stops.
+            if Self::landing_holds_all(
                 &self.index,
                 next_pos,
                 content_hashes[next_pos],
                 &mut seq_hashes,
                 content_hashes,
                 now,
-            );
-
-            // If the worker count at the jump destination matches the active set size,
-            // all active workers are still present — safe to skip intermediate positions.
-            if count == active.len() {
+                &active,
+            ) {
                 current_pos = next_pos;
             } else {
                 Self::linear_scan_drain(
