@@ -70,22 +70,22 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "deepseek-r1/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering and the R1 template \\
+        "the gateway parses tool-call arguments into objects before rendering and the R1 template \
          concatenates them as text, so the render fails (smg-project/smg#2783)",
     ),
     (
         "deepseek-r1/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering and the R1 template \\
+        "the gateway parses tool-call arguments into objects before rendering and the R1 template \
          concatenates them as text, so the render fails (smg-project/smg#2783)",
     ),
     (
         "deepseek-r1/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering and the R1 template \\
+        "the gateway parses tool-call arguments into objects before rendering and the R1 template \
          concatenates them as text, so the render fails (smg-project/smg#2783)",
     ),
     (
         "deepseek-r1/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering and the R1 template \\
+        "the gateway parses tool-call arguments into objects before rendering and the R1 template \
          concatenates them as text, so the render fails (smg-project/smg#2783)",
     ),
     (
