@@ -259,8 +259,9 @@ runner-status check and preserves its existing issues.
 
 ### Deploy the hourly trigger
 
-The Python trigger uses only the standard library and the OpenSSL executable bundled in
-its Python bookworm image. It installs no packages at runtime. The CronJob reads the
+The trigger retains the existing `ruby:3.3-slim` image and uses its bundled JSON, HTTP,
+OpenSSL and time libraries. It installs no packages at runtime. The Python health check
+remains in the GitHub workflow. The CronJob reads the
 existing `github-arc-secret` (App ID, installation ID, and private key), and its Kubernetes
 service-account token to list runner status. The App **and its installation** must grant
 **Actions: Read and write** on
