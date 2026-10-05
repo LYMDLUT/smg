@@ -15,6 +15,7 @@ mod common;
 mod event_tree;
 mod path_hash;
 pub mod reference;
+pub mod salt;
 pub mod snapshot;
 mod string_tree;
 mod token_tree;

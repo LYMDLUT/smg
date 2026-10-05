@@ -10,15 +10,22 @@
 //! - `on_worker_removed` — signals graceful shutdown, task cleans up indexer
 //! - `stop` — signals shutdown to all tasks, clears state
 
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use futures::FutureExt as _;
 use kv_index::{
-    compute_content_hash, ApplyError, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
+    salt::{content_hash_with_seed, namespace_seed},
+    ApplyError, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
 };
 use smg_grpc_client::common_proto::{
-    kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvEventBatch,
+    kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvCacheLocality,
+    KvCacheTier, KvEventBatch,
 };
 use tokio::{
     sync::{oneshot, Mutex, Semaphore},
@@ -419,15 +426,25 @@ impl KvEventMonitor {
     async fn remove_indexer_worker(
         indexer: Arc<PositionalIndexer>,
         worker_id: u32,
-        worker_blocks: WorkerBlockMap,
+        worker_blocks: WorkerIndexState,
     ) {
         let Ok(permit) = INDEX_REMOVAL_PERMITS.acquire().await else {
             error!(worker_id, "Positional-index cleanup semaphore closed");
             return;
         };
+        let WorkerIndexState {
+            blocks, skipped, ..
+        } = worker_blocks;
+        if skipped != SkippedEvents::default() {
+            debug!(
+                worker_id,
+                ?skipped,
+                "KV events the positional index skipped"
+            );
+        }
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            indexer.remove_worker(worker_id, worker_blocks);
+            indexer.remove_worker(worker_id, blocks);
         })
         .await;
 
@@ -457,7 +474,7 @@ impl KvEventMonitor {
                 return;
             }
         };
-        let mut worker_blocks = WorkerBlockMap::default();
+        let mut worker_blocks = WorkerIndexState::default();
         let mut last_seq: u64 = 0;
         let mut reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
         let mut block_size_learned = false;
@@ -544,7 +561,7 @@ impl KvEventMonitor {
                             last_seq = last_seq,
                             "KV event replay cursor expired; clearing worker state and requesting a current snapshot"
                         );
-                        indexer.apply_cleared(worker_id, &mut worker_blocks);
+                        Self::apply_cleared(worker_id, &indexer, &mut worker_blocks);
                         last_seq = 0;
                         reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                         continue;
@@ -615,7 +632,7 @@ impl KvEventMonitor {
                             last_seq = last_seq,
                             "KV event subscriber fell behind; clearing worker state and requesting a current snapshot"
                         );
-                        indexer.apply_cleared(worker_id, &mut worker_blocks);
+                        Self::apply_cleared(worker_id, &indexer, &mut worker_blocks);
                         last_seq = 0;
                         reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
                         continue;
@@ -660,7 +677,7 @@ impl KvEventMonitor {
         worker_url: &str,
         worker_id: u32,
         indexer: &PositionalIndexer,
-        worker_blocks: &mut WorkerBlockMap,
+        worker_blocks: &mut WorkerIndexState,
         last_seq: &mut u64,
         mut on_batch: impl FnMut(&KvEventBatch),
     ) -> StreamResult {
@@ -708,7 +725,7 @@ impl KvEventMonitor {
         event: &KvCacheEvent,
         worker_id: u32,
         indexer: &PositionalIndexer,
-        worker_blocks: &mut WorkerBlockMap,
+        worker_blocks: &mut WorkerIndexState,
     ) {
         let Some(ref data) = event.data else {
             return;
@@ -721,28 +738,63 @@ impl KvEventMonitor {
             kv_cache_event::Data::Removed(removed) => {
                 Self::apply_removed(removed, worker_id, indexer, worker_blocks);
             }
-            kv_cache_event::Data::Cleared(_) => {
-                indexer.apply_cleared(worker_id, worker_blocks);
+            kv_cache_event::Data::Cleared(cleared) => {
+                if worker_blocks.admits(None, None, None, cleared.ownership.as_deref()) {
+                    Self::apply_cleared(worker_id, indexer, worker_blocks);
+                }
             }
         }
     }
 
     /// Convert proto `KvBlocksStored` and apply to the indexer.
+    ///
+    /// Blocks on the disk and external tiers, in cache groups other than main
+    /// attention, not local to the worker, or owned by a residency agent are
+    /// counted and skipped. Content hashes are computed under the event's
+    /// LoRA name and cache salt, so a salted block matches only a request
+    /// hashed under the same namespace.
     fn apply_stored(
         stored: &KvBlocksStored,
         worker_id: u32,
         indexer: &PositionalIndexer,
-        worker_blocks: &mut WorkerBlockMap,
+        worker_blocks: &mut WorkerIndexState,
     ) {
-        let blocks: Vec<StoredBlock> = stored.blocks.iter().map(convert_kv_block).collect();
+        if !worker_blocks.admits(
+            stored.kv_cache_spec_kind.as_deref(),
+            stored.group_idx,
+            stored.locality,
+            stored.ownership.as_deref(),
+        ) {
+            return;
+        }
+        let first_level = stored.blocks.first().and_then(|block| block.cache_level);
+        let Some(tier) = indexed_tier(stored.tier, first_level) else {
+            worker_blocks.skipped.untracked_tier += 1;
+            return;
+        };
+
+        let seed = namespace_seed(stored.lora_name.as_deref(), stored.cache_salt.as_deref());
+        let blocks: Vec<StoredBlock> = stored
+            .blocks
+            .iter()
+            .map(|block| convert_kv_block(block, seed))
+            .collect();
+        worker_blocks.note_stored(&blocks, tier);
 
         let parent_seq_hash = stored.parent_block_hash.map(SequenceHash::from);
 
-        match indexer.apply_stored(worker_id, &blocks, parent_seq_hash, worker_blocks) {
+        match indexer.apply_stored(
+            worker_id,
+            &blocks,
+            parent_seq_hash,
+            &mut worker_blocks.blocks,
+        ) {
             Ok(()) => {}
             Err(ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound) => {
                 // Cold start or parent evicted — retry without parent to start a new chain.
-                if let Err(e) = indexer.apply_stored(worker_id, &blocks, None, worker_blocks) {
+                if let Err(e) =
+                    indexer.apply_stored(worker_id, &blocks, None, &mut worker_blocks.blocks)
+                {
                     warn!(
                         worker_id = worker_id,
                         error = %e,
@@ -754,27 +806,225 @@ impl KvEventMonitor {
     }
 
     /// Convert proto `KvBlocksRemoved` and apply to the indexer.
+    ///
+    /// A removal names one tier; a block leaves the index only when no
+    /// indexed copy remains on another tier.
     fn apply_removed(
         removed: &KvBlocksRemoved,
         worker_id: u32,
         indexer: &PositionalIndexer,
-        worker_blocks: &mut WorkerBlockMap,
+        worker_blocks: &mut WorkerIndexState,
     ) {
-        let seq_hashes: Vec<SequenceHash> = removed
-            .block_hashes
-            .iter()
-            .map(|&h| SequenceHash::from(h))
-            .collect();
+        if !worker_blocks.admits(
+            None,
+            removed.group_idx,
+            removed.locality,
+            removed.ownership.as_deref(),
+        ) {
+            return;
+        }
+        let Some(tier) = indexed_tier(removed.tier, removed.cache_level) else {
+            worker_blocks.skipped.untracked_tier += 1;
+            return;
+        };
 
-        indexer.apply_removed(worker_id, &seq_hashes, worker_blocks);
+        let hashes = removed.block_hashes.iter().map(|&h| SequenceHash::from(h));
+        let seq_hashes: Vec<SequenceHash> =
+            if tier == IndexedTier::Device && worker_blocks.tiers.is_empty() {
+                hashes.collect()
+            } else {
+                hashes
+                    .filter(|&seq_hash| worker_blocks.release(seq_hash, tier))
+                    .collect()
+            };
+
+        indexer.apply_removed(worker_id, &seq_hashes, &mut worker_blocks.blocks);
+    }
+
+    /// Drop every block of a worker from the indexer and forget its residency.
+    fn apply_cleared(
+        worker_id: u32,
+        indexer: &PositionalIndexer,
+        worker_blocks: &mut WorkerIndexState,
+    ) {
+        indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
+        worker_blocks.tiers.clear();
     }
 }
 
-/// Convert a proto `KvBlock` to a kv-index `StoredBlock`.
-fn convert_kv_block(block: &KvBlock) -> StoredBlock {
+/// Convert a proto `KvBlock` to a kv-index `StoredBlock`, hashing its tokens
+/// under `seed` (see [`namespace_seed`]).
+fn convert_kv_block(block: &KvBlock, seed: u64) -> StoredBlock {
     StoredBlock {
         seq_hash: SequenceHash::from(block.block_hash),
-        content_hash: compute_content_hash(&block.token_ids),
+        content_hash: content_hash_with_seed(&block.token_ids, seed),
+    }
+}
+
+/// The residency tiers the index tracks: the device, and the host cache the
+/// engine restores from without recompute. Disk and external copies are not
+/// indexed; a hit there costs an engine-side fetch the router cannot price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexedTier {
+    Device,
+    Host,
+}
+
+impl IndexedTier {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Device => 1,
+            Self::Host => 2,
+        }
+    }
+}
+
+/// The tier an event names: its `tier` when set, else a block's
+/// `cache_level` (absent means the device). `None` when the index does not
+/// track that tier.
+fn indexed_tier(tier: Option<i32>, cache_level: Option<i32>) -> Option<IndexedTier> {
+    let tier = match tier.and_then(|tier| KvCacheTier::try_from(tier).ok()) {
+        Some(KvCacheTier::Unspecified) | None => match cache_level.unwrap_or(0) {
+            0 => KvCacheTier::Device,
+            1 => KvCacheTier::Host,
+            2 => KvCacheTier::Disk,
+            _ => KvCacheTier::External,
+        },
+        Some(tier) => tier,
+    };
+    match tier {
+        KvCacheTier::Unspecified | KvCacheTier::Device => Some(IndexedTier::Device),
+        KvCacheTier::Host => Some(IndexedTier::Host),
+        KvCacheTier::Disk | KvCacheTier::External => None,
+    }
+}
+
+/// Cache-group kinds whose blocks hold the main attention KV, the ones
+/// prefix matching is about. Sliding-window and Mamba groups are skipped.
+const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
+
+/// Events the positional index skipped, by reason; logged when the worker's
+/// subscription ends.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SkippedEvents {
+    /// Stores and removals on tiers the index does not track.
+    pub(crate) untracked_tier: u64,
+    /// Events for cache groups other than main attention.
+    pub(crate) non_main_group: u64,
+    /// Events for blocks not local to the worker.
+    pub(crate) remote: u64,
+    /// Events owned by a residency agent rather than the engine.
+    pub(crate) foreign_owner: u64,
+    /// Removals on a tier that never reported the block.
+    pub(crate) unknown_copy: u64,
+}
+
+/// A worker's share of the positional index: the indexer's reverse map plus
+/// the tiers each block is resident on, once the worker reports a tier other
+/// than the device.
+///
+/// Residency is sparse. A block gets an entry in `tiers` only when a host
+/// copy is stored, so a device-only worker pays nothing beyond the reverse
+/// map, and an indexed block without an entry is a device-only copy. That
+/// invariant lets a removal on one tier evict the block only when no indexed
+/// copy remains.
+#[derive(Default)]
+pub(crate) struct WorkerIndexState {
+    /// The indexer's caller-owned reverse map for this worker.
+    pub(crate) blocks: WorkerBlockMap,
+    /// Residency bits ([`IndexedTier::bit`]) of blocks with a host copy.
+    tiers: HashMap<SequenceHash, u8>,
+    /// Cache groups whose kind is not main attention.
+    non_main_groups: Vec<u32>,
+    pub(crate) skipped: SkippedEvents,
+}
+
+impl WorkerIndexState {
+    /// Whether an event with these attributes belongs in the index. A store
+    /// names its group's kind; later events for that group may omit it, so
+    /// non-main groups are remembered.
+    fn admits(
+        &mut self,
+        kind: Option<&str>,
+        group_idx: Option<u32>,
+        locality: Option<i32>,
+        ownership: Option<&str>,
+    ) -> bool {
+        if ownership.is_some_and(|owner| owner.eq_ignore_ascii_case("kvcr")) {
+            self.skipped.foreign_owner += 1;
+            return false;
+        }
+        if locality.is_some_and(|locality| locality == KvCacheLocality::Remote as i32) {
+            self.skipped.remote += 1;
+            return false;
+        }
+        let main = match kind {
+            Some(kind) => {
+                let main = MAIN_ATTENTION_KINDS.contains(&kind);
+                if let Some(group) = group_idx {
+                    if main {
+                        self.non_main_groups.retain(|&known| known != group);
+                    } else if !self.non_main_groups.contains(&group) {
+                        self.non_main_groups.push(group);
+                    }
+                }
+                main
+            }
+            None => !group_idx.is_some_and(|group| self.non_main_groups.contains(&group)),
+        };
+        if !main {
+            self.skipped.non_main_group += 1;
+        }
+        main
+    }
+
+    /// Record a store on `tier`. A host store opens the block's residency
+    /// entry, crediting a device copy already in the index; a device store
+    /// only updates an entry a host store opened.
+    fn note_stored(&mut self, blocks: &[StoredBlock], tier: IndexedTier) {
+        match tier {
+            IndexedTier::Host => {
+                for block in blocks {
+                    let indexed = self.blocks.contains_key(&block.seq_hash);
+                    let mask = self.tiers.entry(block.seq_hash).or_insert(0);
+                    if *mask == 0 && indexed {
+                        *mask |= IndexedTier::Device.bit();
+                    }
+                    *mask |= IndexedTier::Host.bit();
+                }
+            }
+            IndexedTier::Device if !self.tiers.is_empty() => {
+                for block in blocks {
+                    if let Some(mask) = self.tiers.get_mut(&block.seq_hash) {
+                        *mask |= IndexedTier::Device.bit();
+                    }
+                }
+            }
+            IndexedTier::Device => {}
+        }
+    }
+
+    /// Drop `tier`'s copy of a block; `true` when no indexed copy remains and
+    /// the block should leave the index.
+    fn release(&mut self, seq_hash: SequenceHash, tier: IndexedTier) -> bool {
+        match self.tiers.entry(seq_hash) {
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() &= !tier.bit();
+                if *entry.get() == 0 {
+                    entry.remove();
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(_) => match tier {
+                IndexedTier::Device => true,
+                IndexedTier::Host => {
+                    self.skipped.unknown_copy += 1;
+                    false
+                }
+            },
+        }
     }
 }
 
@@ -801,6 +1051,12 @@ impl fmt::Debug for KvEventMonitor {
 
 #[cfg(test)]
 mod tests {
+    use kv_index::{
+        compute_content_hash, compute_request_content_hashes,
+        salt::namespaced_request_content_hashes, ContentHash, XXH3_SEED,
+    };
+    use smg_grpc_client::common_proto::KvCacheCleared;
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -817,7 +1073,7 @@ mod tests {
             cache_level: None,
             ..Default::default()
         };
-        let stored = convert_kv_block(&block);
+        let stored = convert_kv_block(&block, XXH3_SEED);
         assert_eq!(stored.seq_hash, SequenceHash::from(42i64));
         assert_eq!(stored.content_hash, compute_content_hash(&[1, 2, 3, 4]));
     }
@@ -832,7 +1088,7 @@ mod tests {
             cache_level: None,
             ..Default::default()
         };
-        let stored = convert_kv_block(&block);
+        let stored = convert_kv_block(&block, XXH3_SEED);
         assert_eq!(stored.seq_hash, SequenceHash(u64::MAX));
     }
 
@@ -846,7 +1102,7 @@ mod tests {
             cache_level: None,
             ..Default::default()
         };
-        let stored = convert_kv_block(&block);
+        let stored = convert_kv_block(&block, XXH3_SEED);
         assert_eq!(stored.seq_hash, SequenceHash::from(100i64));
         assert_eq!(stored.content_hash, compute_content_hash(&[]));
     }
@@ -859,7 +1115,7 @@ mod tests {
     fn test_apply_stored_no_parent() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerIndexState::default();
         let stored = KvBlocksStored {
             blocks: vec![
                 KvBlock {
@@ -891,7 +1147,7 @@ mod tests {
     fn test_apply_stored_with_parent() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerIndexState::default();
 
         let stored1 = KvBlocksStored {
             blocks: vec![KvBlock {
@@ -927,7 +1183,7 @@ mod tests {
     fn test_apply_stored_fallback_on_worker_not_tracked() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://new-worker:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerIndexState::default();
 
         // Pass parent_block_hash for an untracked worker — should fallback to no parent.
         let stored = KvBlocksStored {
@@ -950,7 +1206,7 @@ mod tests {
     fn test_apply_removed() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerIndexState::default();
 
         let stored = KvBlocksStored {
             blocks: vec![
@@ -989,7 +1245,7 @@ mod tests {
     fn test_apply_cleared_event() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerIndexState::default();
 
         let stored = KvBlocksStored {
             blocks: vec![KvBlock {
@@ -1006,7 +1262,7 @@ mod tests {
         KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 1);
 
-        indexer.apply_cleared(w1, &mut wb);
+        KvEventMonitor::apply_cleared(w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 0);
     }
 
@@ -1014,7 +1270,7 @@ mod tests {
     fn test_apply_event_dispatch_stored() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerIndexState::default();
         let event = KvCacheEvent {
             event_id: 1,
             data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
@@ -1039,7 +1295,7 @@ mod tests {
     fn test_apply_event_dispatch_removed() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerIndexState::default();
 
         let stored_event = KvCacheEvent {
             event_id: 1,
@@ -1074,7 +1330,7 @@ mod tests {
     fn test_apply_event_dispatch_cleared() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerIndexState::default();
 
         KvEventMonitor::apply_event(
             &KvCacheEvent {
@@ -1101,9 +1357,7 @@ mod tests {
         KvEventMonitor::apply_event(
             &KvCacheEvent {
                 event_id: 2,
-                data: Some(kv_cache_event::Data::Cleared(
-                    smg_grpc_client::common_proto::KvCacheCleared::default(),
-                )),
+                data: Some(kv_cache_event::Data::Cleared(KvCacheCleared::default())),
             },
             w1,
             &indexer,
@@ -1116,7 +1370,7 @@ mod tests {
     fn test_apply_event_no_data() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut wb = WorkerBlockMap::default();
+        let mut wb = WorkerIndexState::default();
         let event = KvCacheEvent {
             event_id: 1,
             data: None,
@@ -1163,7 +1417,7 @@ mod tests {
     async fn test_remove_indexer_worker_runs_cleanup_off_runtime() {
         let indexer = Arc::new(PositionalIndexer::new(64));
         let worker_id = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut worker_blocks = WorkerBlockMap::default();
+        let mut worker_blocks = WorkerIndexState::default();
         indexer
             .apply_stored(
                 worker_id,
@@ -1172,7 +1426,7 @@ mod tests {
                     content_hash: compute_content_hash(&[1, 2, 3]),
                 }],
                 None,
-                &mut worker_blocks,
+                &mut worker_blocks.blocks,
             )
             .unwrap();
 
@@ -1226,7 +1480,7 @@ mod tests {
         for i in 0u64..10 {
             let block = StoredBlock {
                 seq_hash: SequenceHash(1000 + i),
-                content_hash: kv_index::ContentHash(2000 + i),
+                content_hash: ContentHash(2000 + i),
             };
             indexer
                 .apply_stored(worker, &[block], None, &mut worker_blocks)
@@ -1259,5 +1513,236 @@ mod tests {
 
         monitor.start_prune_task(60, 0);
         assert!(monitor.prune_task.lock().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tiers, namespaces and cache groups
+    // -----------------------------------------------------------------------
+
+    const TOKENS: [u32; 4] = [10, 20, 30, 40];
+
+    fn stored_event(hash: i64, tokens: &[u32]) -> KvBlocksStored {
+        KvBlocksStored {
+            blocks: vec![KvBlock {
+                block_hash: hash,
+                token_ids: tokens.to_vec(),
+                block_size: tokens.len() as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn removed_event(hash: i64) -> KvBlocksRemoved {
+        KvBlocksRemoved {
+            block_hashes: vec![hash],
+            ..Default::default()
+        }
+    }
+
+    fn routable(indexer: &PositionalIndexer, worker: u32, hashes: &[ContentHash]) -> bool {
+        indexer
+            .find_matches(hashes, false)
+            .scores
+            .get(&worker)
+            .is_some_and(|&depth| depth > 0)
+    }
+
+    #[test]
+    fn salted_stores_match_only_their_namespace() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let mut stored = stored_event(1, &TOKENS);
+        stored.lora_name = Some("adapter".to_string());
+        stored.cache_salt = Some("tenant-a".to_string());
+        KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
+
+        let same = namespaced_request_content_hashes(&TOKENS, 4, Some("adapter"), Some("tenant-a"));
+        assert!(routable(&indexer, w1, &same));
+        let plain = compute_request_content_hashes(&TOKENS, 4);
+        assert!(!routable(&indexer, w1, &plain));
+        let lora_only = namespaced_request_content_hashes(&TOKENS, 4, Some("adapter"), None);
+        assert!(!routable(&indexer, w1, &lora_only));
+    }
+
+    #[test]
+    fn device_removal_keeps_a_block_still_on_the_host() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        let mut on_host = stored_event(1, &TOKENS);
+        on_host.tier = Some(KvCacheTier::Host as i32);
+        KvEventMonitor::apply_stored(&on_host, w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 1);
+
+        KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        assert!(
+            routable(&indexer, w1, &hashes),
+            "the host copy keeps the block routable"
+        );
+
+        let mut from_host = removed_event(1);
+        from_host.tier = Some(KvCacheTier::Host as i32);
+        KvEventMonitor::apply_removed(&from_host, w1, &indexer, &mut wb);
+        assert!(!routable(&indexer, w1, &hashes));
+        assert_eq!(indexer.current_size(), 0);
+        assert!(wb.tiers.is_empty());
+    }
+
+    #[test]
+    fn cache_level_stands_in_for_the_tier() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+
+        let mut on_host = stored_event(1, &TOKENS);
+        on_host.blocks[0].cache_level = Some(1);
+        KvEventMonitor::apply_stored(&on_host, w1, &indexer, &mut wb);
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+
+        let mut from_host = removed_event(1);
+        from_host.cache_level = Some(1);
+        KvEventMonitor::apply_removed(&from_host, w1, &indexer, &mut wb);
+        assert!(
+            routable(&indexer, w1, &hashes),
+            "the device copy keeps the block routable"
+        );
+
+        KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        assert!(!routable(&indexer, w1, &hashes));
+    }
+
+    #[test]
+    fn host_removal_without_a_host_copy_evicts_nothing() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        let mut from_host = removed_event(1);
+        from_host.tier = Some(KvCacheTier::Host as i32);
+        KvEventMonitor::apply_removed(&from_host, w1, &indexer, &mut wb);
+        assert!(routable(&indexer, w1, &hashes));
+        assert_eq!(wb.skipped.unknown_copy, 1);
+    }
+
+    #[test]
+    fn disk_and_external_tiers_are_counted_not_indexed() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+
+        let mut on_disk = stored_event(1, &TOKENS);
+        on_disk.tier = Some(KvCacheTier::Disk as i32);
+        KvEventMonitor::apply_stored(&on_disk, w1, &indexer, &mut wb);
+        let mut external = stored_event(2, &TOKENS);
+        external.blocks[0].cache_level = Some(3);
+        KvEventMonitor::apply_stored(&external, w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 0);
+
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        let mut from_disk = removed_event(1);
+        from_disk.tier = Some(KvCacheTier::Disk as i32);
+        KvEventMonitor::apply_removed(&from_disk, w1, &indexer, &mut wb);
+        assert_eq!(
+            indexer.current_size(),
+            1,
+            "a disk removal does not touch the device copy"
+        );
+        assert_eq!(wb.skipped.untracked_tier, 3);
+    }
+
+    #[test]
+    fn non_main_attention_groups_are_skipped_once_their_kind_is_known() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+
+        let mut sliding = stored_event(1, &TOKENS);
+        sliding.group_idx = Some(1);
+        sliding.kv_cache_spec_kind = Some("sliding_window".to_string());
+        KvEventMonitor::apply_stored(&sliding, w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 0);
+
+        let mut full = stored_event(2, &TOKENS);
+        full.group_idx = Some(0);
+        full.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_stored(&full, w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 1);
+
+        // Later events for group 1 omit the kind; the group is remembered.
+        let mut later = stored_event(3, &[50, 60, 70, 80]);
+        later.group_idx = Some(1);
+        KvEventMonitor::apply_stored(&later, w1, &indexer, &mut wb);
+        let mut removal = removed_event(2);
+        removal.group_idx = Some(1);
+        KvEventMonitor::apply_removed(&removal, w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(wb.skipped.non_main_group, 3);
+
+        removal.group_idx = Some(0);
+        KvEventMonitor::apply_removed(&removal, w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 0);
+    }
+
+    #[test]
+    fn remote_and_residency_agent_events_are_skipped() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+
+        let mut remote = stored_event(1, &TOKENS);
+        remote.locality = Some(KvCacheLocality::Remote as i32);
+        KvEventMonitor::apply_stored(&remote, w1, &indexer, &mut wb);
+        let mut agent = stored_event(1, &TOKENS);
+        agent.ownership = Some("kvcr".to_string());
+        KvEventMonitor::apply_stored(&agent, w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 0);
+
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        let cleared = KvCacheEvent {
+            event_id: 1,
+            data: Some(kv_cache_event::Data::Cleared(KvCacheCleared {
+                ownership: Some("kvcr".to_string()),
+            })),
+        };
+        KvEventMonitor::apply_event(&cleared, w1, &indexer, &mut wb);
+        assert_eq!(
+            indexer.current_size(),
+            1,
+            "an agent's clear leaves the engine's blocks"
+        );
+        assert_eq!(wb.skipped.remote, 1);
+        assert_eq!(wb.skipped.foreign_owner, 2);
+    }
+
+    #[test]
+    fn clearing_forgets_residency() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+
+        let mut on_host = stored_event(1, &TOKENS);
+        on_host.tier = Some(KvCacheTier::Host as i32);
+        KvEventMonitor::apply_stored(&on_host, w1, &indexer, &mut wb);
+        assert!(!wb.tiers.is_empty());
+
+        KvEventMonitor::apply_cleared(w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 0);
+        assert!(wb.tiers.is_empty());
+
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        assert!(
+            !routable(&indexer, w1, &hashes),
+            "no stale host bit survives a clear"
+        );
     }
 }
