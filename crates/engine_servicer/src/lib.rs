@@ -15,6 +15,7 @@ mod engine_link;
 mod error;
 mod health;
 mod kv_events;
+pub mod kv_wire;
 mod proto_json;
 mod requests;
 mod server;

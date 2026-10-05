@@ -1,24 +1,21 @@
-//! `SubscribeKvEvents`: vLLM's ZMQ KV-cache event publisher relayed into the
-//! gRPC stream with the Python servicer's semantics (`kv_events.py`): the
-//! publisher's own sequence numbers, one event-id counter per stream, bad
-//! frames skipped, no replay, and the stream ending with the client.
+//! `SubscribeKvEvents`: an engine's ZMQ KV-cache event publisher relayed into
+//! the gRPC stream: the publisher's own sequence numbers, one event-id
+//! counter per stream, bad frames skipped, no replay, and the stream ending
+//! with the client. The wire format and the normalization each event goes
+//! through live in [`crate::kv_wire`].
 //!
-//! Wire format (`vllm/distributed/kv_events.py`, `ZmqEventPublisher`): one
-//! PUB multipart message per scheduler step, `[topic, sequence as u64
-//! big-endian, msgpack KVEventBatch]`. The batch is a msgspec `array_like`
-//! struct, `[ts, events, data_parallel_rank]`; each event is a tagged map,
-//! `{"type": "BlockStored" | "BlockRemoved" | "AllBlocksCleared", ...}`, whose
-//! block hashes are sha256 bytes or 64-bit ints.
-
-use std::fmt;
+//! A publisher restart is visible only as its sequence counter starting over
+//! (the SUB socket reconnects silently). The relay ends the stream with
+//! `DATA_LOSS` when a sequence goes backwards, so the gateway clears what it
+//! held for the worker and resubscribes from zero instead of discarding the
+//! restarted publisher's batches as stale.
+//!
+//! Framing (`ZmqEventPublisher` in both engines): one PUB multipart message
+//! per scheduler step, `[topic, sequence as u64 big-endian, msgpack batch]`.
 
 use engine_zmq_client::codec::TrailingTolerant;
 use futures::stream;
-use serde::{
-    de::{self, Visitor},
-    Deserialize, Deserializer,
-};
-use smg_grpc_client::common_proto::{self as common, kv_cache_event};
+use smg_grpc_client::common_proto::{self as common};
 use tonic::Status;
 use tracing::{debug, info, warn};
 use zeromq::{
@@ -26,7 +23,10 @@ use zeromq::{
     SocketOptions, SubSocket, ZmqError, ZmqMessage,
 };
 
-use crate::BoxStream;
+use crate::{
+    kv_wire::{low64_big_endian, Normalizer, WireBatch},
+    BoxStream,
+};
 
 /// The Python vLLM servicer's refusal when vLLM runs without a ZMQ publisher.
 pub(crate) const VLLM_DISABLED_MESSAGE: &str = "KV cache events not enabled. Start vLLM with \
@@ -100,7 +100,7 @@ fn relay(endpoint: String, topic: String) -> BoxStream<common::KvEventBatch> {
 
 enum Relay {
     Connecting { endpoint: String, topic: String },
-    Live(Live),
+    Live(Box<Live>),
     Ended,
 }
 
@@ -110,11 +110,13 @@ impl Relay {
         let mut live = match self {
             Self::Ended => return None,
             Self::Connecting { endpoint, topic } => match connect(&endpoint, &topic).await {
-                Ok(socket) => Live {
+                Ok(socket) => Box::new(Live {
                     endpoint,
                     socket,
                     event_id: 0,
-                },
+                    last_sequence: None,
+                    normalizer: Normalizer::new(),
+                }),
                 Err(status) => return Some((Err(status), Self::Ended)),
             },
             Self::Live(live) => live,
@@ -133,6 +135,10 @@ struct Live {
     /// Advances once per publisher event, convertible or not, so ids stay
     /// monotonic as the Python relay's do.
     event_id: u64,
+    /// The last sequence number relayed, to notice a publisher restart.
+    last_sequence: Option<u64>,
+    /// Per-stream normalization state (seen hashes, cache groups, salts).
+    normalizer: Normalizer,
 }
 
 impl Drop for Live {
@@ -155,6 +161,14 @@ impl Live {
             let Some((sequence_number, payload)) = split_frames(&message) else {
                 continue;
             };
+            if let Some(last) = self.last_sequence.filter(|&last| sequence_number < last) {
+                return Err(Status::data_loss(format!(
+                    "SubscribeKvEvents: publisher at {} restarted its sequence at \
+                     {sequence_number} after {last}; resubscribe from zero",
+                    self.endpoint
+                )));
+            }
+            self.last_sequence = Some(sequence_number);
             let batch = match rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(payload) {
                 Ok(batch) => batch.0,
                 Err(error) => {
@@ -162,7 +176,9 @@ impl Live {
                     continue;
                 }
             };
-            return Ok(convert_batch(batch, sequence_number, &mut self.event_id));
+            return Ok(self
+                .normalizer
+                .normalize_batch(batch, sequence_number, &mut self.event_id));
         }
     }
 }
@@ -199,172 +215,6 @@ fn split_frames(message: &ZmqMessage) -> Option<(u64, &[u8])> {
     let sequence = message.get(1)?;
     let payload = message.get(2)?;
     Some((low64_big_endian(sequence), payload.as_ref()))
-}
-
-/// `int.from_bytes(bytes, "big")` kept to 64 bits: the whole value for the
-/// publisher's eight-byte sequence frame, the low 64 bits of a longer hash.
-fn low64_big_endian(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .fold(0, |value, &byte| (value << 8) | u64::from(byte))
-}
-
-/// vLLM's `KVEventBatch`, a msgspec `array_like` struct: `[ts, events,
-/// data_parallel_rank]`, the rank omittable and later fields tolerated.
-#[derive(Deserialize)]
-struct WireBatch {
-    ts: f64,
-    events: Vec<WireEvent>,
-    #[serde(default)]
-    data_parallel_rank: Option<i32>,
-}
-
-/// vLLM's `KVCacheEvent` subclasses (msgspec `tag=True`, map layout): the
-/// class name under `"type"`; fields without a default are always present
-/// (so `medium` and `lora_name` ride along), defaulted ones may be omitted.
-/// Only what the relay converts is declared; the rest is ignored.
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-enum WireEvent {
-    BlockStored {
-        block_hashes: Vec<BlockHash>,
-        parent_block_hash: Option<BlockHash>,
-        token_ids: Vec<u32>,
-        block_size: i64,
-        lora_id: Option<i64>,
-    },
-    BlockRemoved {
-        block_hashes: Vec<BlockHash>,
-    },
-    AllBlocksCleared,
-    /// An event type this relay does not convert (one a newer vLLM added):
-    /// skipped on its own, like the Python relay's unknown types, so the
-    /// batch's other events still go through.
-    #[serde(other)]
-    Unknown,
-}
-
-/// A block hash as the proto's signed 64-bit identity (the Python relay's
-/// `to_int64`): sha256 bytes keep their low 64 bits read big-endian; an int
-/// is already masked to 64 bits by vLLM.
-#[derive(Clone, Copy)]
-struct BlockHash(i64);
-
-impl<'de> Deserialize<'de> for BlockHash {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct HashVisitor;
-
-        impl Visitor<'_> for HashVisitor {
-            type Value = BlockHash;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a block hash as bytes or an integer")
-            }
-
-            fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
-                Ok(BlockHash(low64_big_endian(bytes) as i64))
-            }
-
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(BlockHash(value as i64))
-            }
-
-            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(BlockHash(value))
-            }
-        }
-
-        deserializer.deserialize_any(HashVisitor)
-    }
-}
-
-/// The proto batch under the publisher's sequence number, `event_id`
-/// advancing once per event whether or not it converts.
-fn convert_batch(
-    batch: WireBatch,
-    sequence_number: u64,
-    event_id: &mut u64,
-) -> common::KvEventBatch {
-    let mut events = Vec::with_capacity(batch.events.len());
-    for event in batch.events {
-        *event_id += 1;
-        if let Some(converted) = convert_event(event, *event_id) {
-            events.push(converted);
-        }
-    }
-    common::KvEventBatch {
-        sequence_number,
-        timestamp: batch.ts,
-        events,
-        dp_rank: batch.data_parallel_rank,
-    }
-}
-
-/// One event as its proto, or `None` for a store whose hashes and tokens do
-/// not form whole blocks (ordinal slicing needs dense, complete blocks).
-fn convert_event(event: WireEvent, event_id: u64) -> Option<common::KvCacheEvent> {
-    let data = match event {
-        WireEvent::BlockStored {
-            block_hashes,
-            parent_block_hash,
-            token_ids,
-            block_size,
-            lora_id,
-        } => {
-            let width = usize::try_from(block_size).ok().filter(|&width| {
-                width > 0
-                    && i32::try_from(width).is_ok()
-                    && block_hashes.len().checked_mul(width) == Some(token_ids.len())
-            });
-            let Some(width) = width else {
-                warn!(
-                    hashes = block_hashes.len(),
-                    block_size,
-                    tokens = token_ids.len(),
-                    "Skipping BlockStored: the hashes of this block size cannot map to the tokens"
-                );
-                return None;
-            };
-            let blocks = block_hashes
-                .iter()
-                .zip(token_ids.chunks_exact(width))
-                .map(|(hash, tokens)| common::KvBlock {
-                    block_hash: hash.0,
-                    token_ids: tokens.to_vec(),
-                    block_size: i32::try_from(width).unwrap_or(i32::MAX),
-                    lora_id,
-                    cache_level: None,
-                    ..Default::default()
-                })
-                .collect();
-            kv_cache_event::Data::Stored(common::KvBlocksStored {
-                blocks,
-                parent_block_hash: parent_block_hash.map(|hash| hash.0),
-                ..Default::default()
-            })
-        }
-        WireEvent::BlockRemoved { block_hashes } => {
-            kv_cache_event::Data::Removed(common::KvBlocksRemoved {
-                block_hashes: block_hashes.into_iter().map(|hash| hash.0).collect(),
-                cache_level: None,
-                ..Default::default()
-            })
-        }
-        WireEvent::AllBlocksCleared => {
-            kv_cache_event::Data::Cleared(common::KvCacheCleared::default())
-        }
-        WireEvent::Unknown => {
-            debug!(
-                event_id,
-                "Skipping a KV event of a type this relay does not convert"
-            );
-            return None;
-        }
-    };
-    Some(common::KvCacheEvent {
-        event_id,
-        data: Some(data),
-    })
 }
 
 /// Golden publisher payloads encoded by vLLM 0.30.1rc1 (msgspec 0.22) with
@@ -408,15 +258,25 @@ mod tests {
     use std::time::Duration;
 
     use futures::StreamExt;
+    use smg_grpc_client::common_proto::{kv_cache_event, KvCacheLocality, KvCacheTier};
     use tokio::time::timeout;
     use zeromq::{prelude::*, PubSocket, SocketEvent};
 
     use super::{golden, *};
+    use crate::kv_wire::WireBatch;
 
     fn decode(hex: &str) -> WireBatch {
         rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(&golden::bytes(hex))
             .expect("golden batch decodes")
             .0
+    }
+
+    fn convert_batch(
+        batch: WireBatch,
+        sequence_number: u64,
+        event_id: &mut u64,
+    ) -> common::KvEventBatch {
+        Normalizer::new().normalize_batch(batch, sequence_number, event_id)
     }
 
     fn stored(event: &common::KvCacheEvent) -> &common::KvBlocksStored {
@@ -490,6 +350,9 @@ mod tests {
             Some(kv_cache_event::Data::Removed(common::KvBlocksRemoved {
                 block_hashes: vec![0x1234, -1],
                 cache_level: None,
+                tier: Some(KvCacheTier::Device as i32),
+                medium: Some("GPU".to_string()),
+                locality: Some(KvCacheLocality::Local as i32),
                 ..Default::default()
             }))
         );
@@ -520,13 +383,13 @@ mod tests {
             .unwrap()
             .0;
         assert!(batch.events.is_empty());
-        assert_eq!(batch.data_parallel_rank, None);
+        assert_eq!(batch.dp_rank, None);
 
         let long = rmp_serde::to_vec(&(1.5f64, Vec::<u8>::new(), 2i32, "future")).unwrap();
         let batch = rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(&long)
             .unwrap()
             .0;
-        assert_eq!(batch.data_parallel_rank, Some(2));
+        assert_eq!(batch.dp_rank, Some(2));
 
         let unknown = rmp_serde::to_vec(&serde_json::json!([
             1.5,
@@ -631,6 +494,26 @@ mod tests {
         assert_eq!(next.sequence_number, 4);
         assert_eq!(next.dp_rank, Some(1));
         assert_eq!(stored(&next.events[0]).blocks[0].block_hash, 42);
+
+        // A publisher restart (its counter starts over) ends the stream with
+        // DATA_LOSS, which the gateway answers by clearing and resubscribing.
+        publisher
+            .send(golden::frame(b"kv", 1, &batch2))
+            .await
+            .expect("publish");
+        let status = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("an item in time")
+            .expect("stream open")
+            .expect_err("a restart is an error");
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(status
+            .message()
+            .contains("restarted its sequence at 1 after 4"));
+        assert!(timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the end in time")
+            .is_none());
 
         drop(stream);
         let disconnected = timeout(Duration::from_secs(5), async {
