@@ -10,9 +10,11 @@
 //! Ported from `crates/tool_parser/src/partial_json.rs` (smg 897ef9a9) under ground rule 27. What
 //! changed in form: an error type of its own, `is_complete` as a function of this module, the
 //! cursor's literal parsing shared by `true`, `false` and `null`, names and documentation. What
-//! changed in behaviour, once: a word of letters that is no literal never advances the cursor, where
-//! the original let `false` followed by letters advance it before rejecting the word (`[1, falsex`
-//! consumed ten bytes there and consumes four here). Everything else behaves as before, since the
+//! changed in behaviour, once: a word of letters that is no literal never advances the cursor. The
+//! original looked ahead over at most the longest literal of the kind (five bytes for either boolean,
+//! four for `null`), so `truex` was rejected unseen but `false` or `null` followed by letters passed
+//! the look-ahead, was consumed, and was rejected only then: `[1, falsex` consumed ten bytes there
+//! and `[1, nullx` nine, both consume four here. Everything else behaves as before, since the
 //! ported streaming parser must reproduce the old one until bellwether's fixtures judge otherwise;
 //! the choices worth a second look are named here so that the parity review finds them: an unknown
 //! escape keeps the escaped character, an unfinished `\u` escape becomes U+FFFD, a number that
@@ -344,10 +346,11 @@ impl Cursor<'_> {
     /// `true`, `false` or `null` (`expected`), or in prefix mode a prefix of it.
     ///
     /// The whole run of letters is looked at before anything is consumed, so a word that is no
-    /// literal leaves the position where it was and the enclosing value closes before it: `[1, truex`
-    /// and `[1, falsex` both give `[1]` after four bytes. The original looked ahead over at most the
-    /// literal's length, which let `false` followed by letters advance the cursor before the word was
-    /// rejected; that is the one behaviour this port changes.
+    /// literal leaves the position where it was and the enclosing value closes before it: `[1, truex`,
+    /// `[1, falsex` and `[1, nullx` all give `[1]` after four bytes. The original looked ahead over
+    /// at most the longest literal of the kind (five bytes for either boolean, four for `null`), which
+    /// let `false` or `null` followed by letters advance the cursor before the word was rejected;
+    /// that is the one behaviour this port changes.
     fn literal(&mut self, expected: &'static str, value: Value) -> Parsed<Value> {
         let word: String = self
             .chars
