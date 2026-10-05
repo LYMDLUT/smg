@@ -44,6 +44,16 @@ pub struct Config {
     /// Context length advertised to the gateway (`max_context_length`,
     /// `max_req_input_len`, `max_model_len`).
     pub context_length: u32,
+    /// vLLM-wire ZMQ KV-event publishers (realistic engines only): the first
+    /// PUB port; worker `i` publishes on `base + 2i` and answers replay on
+    /// `base + 2i + 1`. Off when `None`.
+    pub kv_events_zmq_base_port: Option<u16>,
+    /// Whether the publishers serve replay requests (ROUTER at `port + 1`).
+    pub kv_events_replay: bool,
+    /// Topic frame of every published message (vLLM's default is empty).
+    pub kv_events_topic: String,
+    /// Batches each publisher keeps for replay.
+    pub kv_events_buffer_steps: usize,
 }
 
 /// Timing flags collected while parsing; resolved into one [`TimingModel`]
@@ -117,6 +127,10 @@ impl Config {
             engine: EngineParams::default(),
             admin_port: None,
             context_length: 32768,
+            kv_events_zmq_base_port: None,
+            kv_events_replay: true,
+            kv_events_topic: String::new(),
+            kv_events_buffer_steps: 10_000,
         };
         let mut timing = TimingFlags::default();
         let mut kv_blocks: Option<u64> = None;
@@ -179,6 +193,16 @@ impl Config {
                 "--context-length" => {
                     cfg.context_length = parse(value(&mut args, &flag)?, &flag)?;
                 }
+                "--kv-events-zmq-base-port" => {
+                    cfg.kv_events_zmq_base_port = Some(parse(value(&mut args, &flag)?, &flag)?);
+                }
+                "--kv-events-replay" => {
+                    cfg.kv_events_replay = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--kv-events-topic" => cfg.kv_events_topic = value(&mut args, &flag)?,
+                "--kv-events-buffer-steps" => {
+                    cfg.kv_events_buffer_steps = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--block-size" => cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?,
                 "--admin-port" => cfg.admin_port = Some(parse(value(&mut args, &flag)?, &flag)?),
                 "--prefix-cache" => {
@@ -212,6 +236,26 @@ impl Config {
             return Err("--zmq-handshake <ipc://…> is required when --zmq-count > 0".to_string());
         }
         Ok(cfg)
+    }
+}
+
+impl Config {
+    /// The KV-event publisher of worker number `index` (gRPC workers first,
+    /// then ZMQ ranks), when publishing is on and the engine is realistic.
+    pub fn kv_zmq_for(&self, index: u16) -> Option<crate::kv_zmq::KvZmqConfig> {
+        if !self.realistic {
+            return None;
+        }
+        let base = self.kv_events_zmq_base_port?;
+        let port = base.checked_add(index.checked_mul(2)?)?;
+        Some(crate::kv_zmq::KvZmqConfig {
+            host: self.host.clone(),
+            port,
+            replay: self.kv_events_replay,
+            topic: self.kv_events_topic.clone(),
+            buffer_steps: self.kv_events_buffer_steps,
+            dp_rank: 0,
+        })
     }
 }
 
@@ -259,6 +303,11 @@ fn usage() -> String {
        --prefix-cache <bool>    enable prefix caching + KV events (default true)\n\
        --prefill-first <bool>   SGLang-style: a pass with prefill runs prefill only (default false)\n\
        --context-length <n>     advertised context length (default 32768)\n\
+       --kv-events-zmq-base-port <port>  vLLM-wire ZMQ KV-event publishers: worker i publishes\n\
+                                on base+2i (PUB) and replays on base+2i+1 (ROUTER) (default off)\n\
+       --kv-events-replay <bool>  serve replay requests on the ROUTER port (default true)\n\
+       --kv-events-topic <s>    topic frame (default empty, as vLLM)\n\
+       --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)"
         .to_string()

@@ -53,7 +53,21 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
     tracing::info!("zmq mock engine {engine_index} connected to {handshake_address}");
 
     let (mut input, output) = mock.split();
-    let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
+    let engine = cfg
+        .realistic
+        .then(|| Engine::spawn_named(cfg.engine.clone(), format!("zmq:{engine_index}"), true));
+    // The rank's KV-event publisher, numbered after the gRPC workers.
+    let publisher = engine.as_ref().and_then(|engine| {
+        let index = cfg
+            .grpc_count
+            .checked_add(u16::try_from(engine_index).ok()?)?;
+        cfg.kv_zmq_for(index).map(|kv| (engine.clone(), kv))
+    });
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "publisher self-terminates when the engine's event channel closes"
+    )]
+    let _publisher = publisher.map(|(engine, kv)| tokio::spawn(crate::kv_zmq::serve(engine, kv)));
 
     // A single writer owns the output PUSH socket; per-request forwarders funnel
     // their outputs here so concurrent requests serialize onto the one socket.
@@ -301,6 +315,10 @@ mod tests {
             grpc_count: 0,
             admin_port: None,
             context_length: 32768,
+            kv_events_zmq_base_port: None,
+            kv_events_replay: true,
+            kv_events_topic: String::new(),
+            kv_events_buffer_steps: 10_000,
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,

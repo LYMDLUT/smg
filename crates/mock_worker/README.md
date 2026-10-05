@@ -94,6 +94,7 @@ replay, which models the same loop):
 | `--prefill-first` | false | SGLang-style prefill-only passes |
 | `--context-length` | 32768 | advertised context length |
 | `--admin-port` | off | process-wide admin API (below) |
+| `--kv-events-zmq-base-port` | off | vLLM-wire ZMQ KV-event publishers (below) |
 
 ```bash
 cargo run --release -p mock-worker -- \
@@ -105,6 +106,34 @@ agreement for these polynomials (mean absolute percentage error 48.5% on TTFT,
 28.9% on TPOT) was measured with prefix caching disabled, so cache-hit and
 routing effects have no published validation. Treat the simulator as a relative
 A/B harness for policies and validate absolute numbers on GPUs.
+
+### vLLM-wire KV-event publisher (ZMQ)
+
+`--kv-events-zmq-base-port <port>` gives every realistic engine the publisher
+vLLM runs (`ZmqEventPublisher` in `vllm/distributed/kv_events.py`), so the
+servicers' relays (`crates/engine_servicer`, the Python servicer) can be
+exercised end to end without a GPU: worker `i` (gRPC workers by port offset,
+then ZMQ ranks) publishes on `base + 2i` and answers replay on `base + 2i + 1`.
+
+- PUB frames: `[topic, sequence as u64 big-endian, msgpack]`, the sequence
+  counting from 0 per publisher (`--kv-events-topic`, empty by default as
+  vLLM's).
+- Payload: vLLM's `EventBatch`, `[ts, events, data_parallel_rank]`; events are
+  tagged maps in vLLM's field order with its `omit_defaults`: `BlockStored`
+  (`type`, `block_hashes`, `parent_block_hash`, `token_ids`, `block_size`,
+  `lora_id`, `medium: "GPU"`, `lora_name`, `group_idx: 0`,
+  `kv_cache_spec_kind: "full_attention"`), `BlockRemoved` (`type`,
+  `block_hashes`, `medium`, `group_idx`), `AllBlocksCleared` (`type`). Block
+  hashes are unsigned 64-bit integers (vLLM's int form of the same bits the
+  gRPC stream carries signed).
+- Replay (`--kv-events-replay`, on by default): a DEALER sends
+  `[b"", start as 8 bytes big-endian]`; the ROUTER answers every buffered
+  batch from `start` as `[b"", topic, seq, payload]` and then
+  `[b"", b"", END, b""]` with END = eight 0xff bytes; the last
+  `--kv-events-buffer-steps` (10000) batches are kept.
+
+The unit tests decode the frames with the Rust relay's own normalizer
+(`engine_servicer::kv_wire`), so a change on either side shows up here.
 
 ### Admin API
 

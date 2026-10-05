@@ -24,6 +24,10 @@ serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rmpv.workspace = true
+zeromq.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+engine-servicer = { path = "../engine_servicer" }
+rmp-serde.workspace = true

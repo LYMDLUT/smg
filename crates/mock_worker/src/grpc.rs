@@ -51,13 +51,28 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
     let engine = cfg
         .realistic
         .then(|| Engine::spawn_named(cfg.engine.clone(), name, true));
+    // The worker's vLLM-wire KV-event publisher, numbered by its port offset.
+    let publisher = engine.as_ref().and_then(|engine| {
+        let port = addr.map(|a| a.port())?;
+        let index = port.checked_sub(cfg.grpc_base_port)?;
+        cfg.kv_zmq_for(index)
+            .map(|kv| crate::kv_zmq::serve(engine.clone(), kv))
+    });
     let service = MockScheduler { cfg, engine };
-    if let Err(e) = Server::builder()
-        .add_service(TokenSpeedSchedulerServer::new(service))
-        .serve_with_incoming(TcpListenerStream::new(listener))
-        .await
-    {
-        tracing::error!("grpc worker {addr:?} stopped: {e}");
+    let server = async {
+        if let Err(e) = Server::builder()
+            .add_service(TokenSpeedSchedulerServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+        {
+            tracing::error!("grpc worker {addr:?} stopped: {e}");
+        }
+    };
+    match publisher {
+        Some(publisher) => {
+            tokio::join!(server, publisher);
+        }
+        None => server.await,
     }
 }
 
