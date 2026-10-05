@@ -36,6 +36,23 @@ rather than a share of profile samples.
 slot per run, so the slot count is fixed up front (at most 1024); slots are reused after a worker
 is removed.
 
+## Lanes: `kv_index::LanePool`
+
+`smg_run.rs` runs the harness's lane threads as lanes of SMG's `LanePool` (`src/lane_pool.rs`):
+each lane drains its channel into per-worker queues and serves ready workers from any lane's list,
+whole workers at a time, so events of one worker keep their order while a quiet lane works off a
+busy lane's backlog. `SmgRun::new(max_workers, lanes)` takes the harness's `--num-event-workers`
+as `lanes`; thread counts, pinning and the per-lane CPU accounting stay the harness's, and the
+other backends' dispatch is untouched. A worker's queue holds at most 2048 events; past that the
+lane keeps the next ones back and reads no further from its channel until they are in, so the
+harness's channel is the overflow and its `queue_depth_at_stop` row still measures it. Flush, seal,
+stats and worker removal travel as barriers behind every worker the channel has fed, answered by
+whichever lane applies the last one; observation records go to the completion writer of the
+channel the event arrived on, which keeps each lane's buffer at the capacity the harness planned.
+The report's `pool:` line gives events enqueued, applied and refused by the cap, whole-worker
+steals, the deepest worker queue and the most events queued at once; `lanes:` gives apply time and
+wait time summed over lanes.
+
 ## Memory rows: `memory_accounting.patch`
 
 Whole-process RSS says nothing about an indexer inside this harness (the generator's simulated

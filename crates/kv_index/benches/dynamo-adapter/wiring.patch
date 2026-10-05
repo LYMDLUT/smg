@@ -112,7 +112,7 @@ index d816081cd3..0818846a42 100644
 +        }
 +        MooncakeIndexerKind::SmgRun => {
 +            let indexer = Arc::new(ThreadPoolIndexer::new_with_metrics(
-+                SmgRun::new(config.jump_size),
++                SmgRun::new(config.jump_size, config.num_event_workers),
 +                config.num_event_workers,
 +                args.common.block_size,
 +                metrics(),
@@ -275,7 +275,7 @@ index b5f52c324a..0b36dacb68 100644
 +                Some(metrics),
 +            )),
 +            MooncakeIndexerKind::SmgRun => Arc::new(ThreadPoolIndexer::new_with_metrics(
-+                SmgRun::new(self.jump_size),
++                SmgRun::new(self.jump_size, self.num_event_workers),
 +                self.num_event_workers,
 +                block_size,
 +                Some(metrics),
