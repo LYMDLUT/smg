@@ -7,10 +7,13 @@
 //! lookups built from live chains and from mutated chains must score identically in both; at the
 //! end, the production index must hold exactly the reference's blocks.
 //!
-//! The corpus evicts tails and whole chains only, never a block in the middle of a chain the
-//! worker keeps extending, because the production jump search assumes chains have no holes (an
-//! engine with prefix caching cannot reuse a block whose predecessors are gone). Scale with
-//! `KV_INDEX_EXACTNESS_EVENTS` (default 20000) and `KV_INDEX_EXACTNESS_SEED`.
+//! Two corpora run. One evicts tails and whole chains only, which is what a radix-tree cache such
+//! as SGLang's produces (it evicts leaves). The other also evicts single blocks from the middle of
+//! chains the worker keeps, which vLLM produces: a request that re-hits a shared prefix takes those
+//! blocks out of the free queue and, when it finishes, re-queues them behind the unshared tail of
+//! an earlier request, so that request's middle blocks fall out of the LRU before its later blocks
+//! do. The engine's prefix match stops at the hole, so a worker's score must end there too. Scale
+//! with `KV_INDEX_EXACTNESS_EVENTS` (default 20000) and `KV_INDEX_EXACTNESS_SEED`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -78,12 +81,23 @@ struct Held {
     contents: Vec<ContentHash>,
 }
 
+/// A chain as it was when one of its middle blocks was evicted; its blocks after `hole` stay in
+/// the index but are unreachable through the chain, so lookups along it must stop at `hole`.
+struct Holed {
+    worker: u32,
+    contents: Vec<ContentHash>,
+    hole: usize,
+}
+
 struct Harness {
     production: PositionalIndexer,
     reference: ReferenceIndexer,
     maps: FxHashMap<u32, WorkerBlockMap>,
     workers: Vec<u32>,
     held: Vec<Held>,
+    /// Whether the corpus evicts middle blocks (see the module doc).
+    holes: bool,
+    holed: Vec<Holed>,
     prompts: Vec<Vec<ContentHash>>,
     next_stream: u64,
     next_worker: u32,
@@ -100,17 +114,22 @@ enum QueryKind {
     SuffixReplaced,
     Extended,
     Unknown,
+    /// A full chain through a block the worker evicted from its middle.
+    AcrossHole,
+    /// A prefix of such a chain that ends after the hole.
+    PastHole,
 }
 
 #[derive(Default)]
 struct Mismatches {
     by_kind: BTreeMap<QueryKind, usize>,
+    issued: BTreeMap<QueryKind, usize>,
     examples: Vec<String>,
     lookups: usize,
 }
 
 impl Harness {
-    fn new(seed: u64, jump_size: usize, workers: usize) -> Self {
+    fn new(seed: u64, jump_size: usize, workers: usize, holes: bool) -> Self {
         let mut rng = Rng::new(seed);
         let production = PositionalIndexer::new(jump_size);
         let mut harness = Self {
@@ -119,6 +138,8 @@ impl Harness {
             maps: FxHashMap::default(),
             workers: Vec::new(),
             held: Vec::new(),
+            holes,
+            holed: Vec::new(),
             prompts: Vec::new(),
             next_stream: 1,
             next_worker: 0,
@@ -287,6 +308,55 @@ impl Harness {
         self.events += 1;
     }
 
+    /// Evict one block from the middle of a chain while the blocks after it stay (the vLLM case in
+    /// the module doc). Every held chain of the worker that runs through the block loses it; the
+    /// full chains are kept aside so lookups can run across the hole.
+    fn remove_middle(&mut self) {
+        let Some(index) = self.pick_held() else {
+            return;
+        };
+        if self.held[index].contents.len() < 3 {
+            return;
+        }
+        let worker = self.held[index].worker;
+        let contents = self.held[index].contents.clone();
+        let hole = self.rng.range(1, contents.len() - 2);
+        let evicted = blocks_of(&contents)[hole].seq_hash;
+        for held in self.held.iter_mut().filter(|h| h.worker == worker) {
+            let shared = held
+                .contents
+                .iter()
+                .zip(&contents)
+                .take_while(|(a, b)| a == b)
+                .count();
+            if shared > hole {
+                self.holed.push(Holed {
+                    worker,
+                    contents: held.contents.clone(),
+                    hole,
+                });
+                held.contents.truncate(hole);
+            }
+        }
+        let map = self.maps.get_mut(&worker).expect("worker map");
+        self.production.apply_removed(worker, &[evicted], map);
+        self.reference.apply_removed(worker, &[evicted]);
+        self.events += 1;
+    }
+
+    fn pick_holed(&mut self) -> Option<usize> {
+        if self.holed.is_empty() {
+            return None;
+        }
+        let index = self.rng.below(self.holed.len());
+        if self.maps.contains_key(&self.holed[index].worker) {
+            Some(index)
+        } else {
+            self.holed.swap_remove(index);
+            None
+        }
+    }
+
     fn clear_worker(&mut self) {
         let worker = self.random_worker();
         let map = self.maps.get_mut(&worker).expect("worker map");
@@ -353,7 +423,13 @@ impl Harness {
                 let worker = self.random_worker();
                 self.store(worker, contents);
             }
-            800..=899 => self.remove_tail(),
+            800..=899 => {
+                if self.holes && self.rng.chance(1, 2) {
+                    self.remove_middle();
+                } else {
+                    self.remove_tail();
+                }
+            }
             900..=949 => self.remove_chain(),
             950..=984 => {
                 if self.workers.len() < 64 && self.rng.chance(1, 4) {
@@ -385,6 +461,7 @@ impl Harness {
             return;
         }
         out.lookups += 1;
+        *out.issued.entry(kind).or_default() += 1;
         let produced = self.production_scores(&query);
         let expected = self.reference.find_matches(&query);
         if produced != expected {
@@ -461,6 +538,20 @@ impl Harness {
             extended.extend((0..extra).map(|p| content(stream, p)));
             self.check_lookup(QueryKind::Extended, extended, out);
         }
+        if self.holes {
+            for _ in 0..4 {
+                let Some(index) = self.pick_holed() else {
+                    break;
+                };
+                let (full, hole) = {
+                    let holed = &self.holed[index];
+                    (holed.contents.clone(), holed.hole)
+                };
+                let past = self.rng.range(hole + 1, full.len());
+                self.check_lookup(QueryKind::PastHole, full[..past].to_vec(), out);
+                self.check_lookup(QueryKind::AcrossHole, full, out);
+            }
+        }
         let stream = self.fresh_stream();
         let len = self.rng.range(1, 32);
         let unknown: Vec<ContentHash> = (0..len).map(|p| content(stream, p)).collect();
@@ -479,8 +570,14 @@ fn env_or(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn run_corpus(seed: u64, jump_size: usize, workers: usize, events: usize) -> (Harness, Mismatches) {
-    let mut harness = Harness::new(seed, jump_size, workers);
+fn run_corpus(
+    seed: u64,
+    jump_size: usize,
+    workers: usize,
+    events: usize,
+    holes: bool,
+) -> (Harness, Mismatches) {
+    let mut harness = Harness::new(seed, jump_size, workers, holes);
     let mut mismatches = Mismatches::default();
     while harness.events < events {
         harness.step();
@@ -508,10 +605,12 @@ fn assert_exact(harness: &Harness, mismatches: &Mismatches, label: &str) {
     );
     assert!(
         mismatches.by_kind.is_empty(),
-        "{label}: {} of {} lookups scored differently from the reference, by query kind {:?}; examples:\n{}",
+        "{label}: {} of {} lookups scored differently from the reference, by query kind {:?} \
+         (issued {:?}); examples:\n{}",
         mismatches.by_kind.values().sum::<usize>(),
         mismatches.lookups,
         mismatches.by_kind,
+        mismatches.issued,
         mismatches.examples.join("\n")
     );
 }
@@ -521,7 +620,7 @@ fn replayed_corpus_matches_the_reference() {
     let events = env_or("KV_INDEX_EXACTNESS_EVENTS", 20_000) as usize;
     let seed = env_or("KV_INDEX_EXACTNESS_SEED", 20261005);
     for (jump, workers) in [(8usize, 16usize), (64, 2), (3, 64)] {
-        let (harness, mismatches) = run_corpus(seed ^ jump as u64, jump, workers, events);
+        let (harness, mismatches) = run_corpus(seed ^ jump as u64, jump, workers, events, false);
         assert_exact(
             &harness,
             &mismatches,
@@ -534,6 +633,56 @@ fn replayed_corpus_matches_the_reference() {
             events
         );
     }
+}
+
+/// The vLLM corpus: middle blocks get evicted while later blocks stay, and lookups run across and
+/// past the holes. Before every position was verified, the jump search landed past a hole on an
+/// entry that still named the worker and scored the whole chain.
+#[test]
+fn replayed_corpus_with_holes_matches_the_reference() {
+    let events = env_or("KV_INDEX_EXACTNESS_EVENTS", 20_000) as usize;
+    let seed = env_or("KV_INDEX_EXACTNESS_SEED", 20261005);
+    for (jump, workers) in [(8usize, 16usize), (64, 2), (3, 64)] {
+        let (harness, mismatches) = run_corpus(seed ^ jump as u64, jump, workers, events, true);
+        assert_exact(
+            &harness,
+            &mismatches,
+            &format!("holes, jump {jump}, {workers} workers, seed {seed}"),
+        );
+        let across = mismatches
+            .issued
+            .get(&QueryKind::AcrossHole)
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            across >= 64,
+            "hole corpus too small to mean anything: {across} lookups across holes"
+        );
+    }
+}
+
+/// A worker holds [A ..= J] (ten blocks) and evicts E while F ..= J stay, as vLLM's free queue
+/// can order it. A request for the full chain hits A ..= D in the engine and recomputes the rest,
+/// so the score is 4; the entries at F ..= J still name the worker and must not count.
+#[test]
+fn evicted_middle_block_ends_the_match() {
+    let index = PositionalIndexer::new(8);
+    let worker = index
+        .intern_worker("http://worker-0:8000")
+        .expect("worker id");
+    let mut map = WorkerBlockMap::default();
+    let contents: Vec<ContentHash> = (0..10).map(|p| content(7, p)).collect();
+    let blocks = blocks_of(&contents);
+    index
+        .apply_stored(worker, &blocks, None, &mut map)
+        .expect("store");
+    index.apply_removed(worker, &[blocks[4].seq_hash], &mut map);
+    let scores = index.find_matches(&contents, false).scores;
+    assert_eq!(scores.get(&worker).copied(), Some(4), "scores {scores:?}");
+    let past = index.find_matches(&contents[..7], false).scores;
+    assert_eq!(past.get(&worker).copied(), Some(4), "scores {past:?}");
+    let before = index.find_matches(&contents[..4], false).scores;
+    assert_eq!(before.get(&worker).copied(), Some(4), "scores {before:?}");
 }
 
 /// A worker holds [A, B, C]; a request [A, X, C] shares only A with it. The jump search lands on
