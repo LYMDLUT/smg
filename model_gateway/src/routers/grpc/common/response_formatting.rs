@@ -46,12 +46,17 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
 /// The version to report on a generate response: what the engine stamped on
 /// this very response beats the dispatch-time label (M2's table, then the
 /// registration label), which beats the historical `"default"`.
-pub(crate) fn effective_weight_version(reported: Option<&str>, dispatch: Option<&str>) -> String {
+///
+/// Borrowed on purpose: the SSE call sites run once per chunk and serialize
+/// the value straight into the event, so no per-chunk allocation.
+pub(crate) fn effective_weight_version<'a>(
+    reported: Option<&'a str>,
+    dispatch: Option<&'a str>,
+) -> &'a str {
     reported
         .filter(|v| !v.is_empty())
         .or(dispatch)
         .unwrap_or("default")
-        .to_string()
 }
 
 /// Tracks per-index completion token counts across streaming chunks.
