@@ -140,6 +140,7 @@ async fn fleet(State(state): State<Arc<AdminState>>) -> Json<Value> {
                 "cache_hit_rate": load.cache_hit_rate,
                 "num_cached_blocks": load.num_cached_blocks,
                 "num_preemptions": load.num_preemptions,
+                "num_kv_batches": load.num_kv_batches,
             })
         })
         .collect();

@@ -32,3 +32,25 @@ The mock fleet it is meant for is `mock-worker --engine realistic --admin-port`;
 see `crates/mock_worker/README.md` for the engine's scheduler, KV pool and
 timing model (and the caveat that its timing polynomials were validated against
 hardware only with prefix caching off).
+
+## Soak (guardrail 3)
+
+`~/smg-perf/replay/soak.sh --label L --hours 24` keeps one gateway and one mock
+fleet up for the whole run and replays the trace window by window (one
+measurement-lock acquisition per window, released between windows), while:
+
+- `soak-faults.py` fires the mock's fault hooks on a schedule, cycling over
+  the workers: drop 20 batches, 1000 ms publishing delay for 60 s, publisher
+  restart, pause 30 s then resume, and a worker restart (cache reset plus
+  publisher restart, what the index sees when an engine restarts);
+- `soak-sampler.py` appends one row per minute to `samples.csv`: gateway RSS,
+  its cache-aware branch counters, match-ratio mean, engine cache-hit gauge
+  and KV-subscription failures from `/metrics`, and from the mock's admin API
+  the last minute's requests, hit/oracle, prefix reuse, per-worker balance,
+  preemptions and KV batches.
+
+`soak-report.py DIR` prints RSS at hour 1 and at the end with the ratio the
+guardrail asks for (within 5%), hit/oracle, reuse and balance in the five
+minutes before and after each fault, the counters, and the per-window table.
+The run is restartable: `--resume` continues the window position and the fault
+cycle in a new segment (a restarted gateway is a new RSS baseline).

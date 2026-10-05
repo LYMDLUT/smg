@@ -219,6 +219,8 @@ pub struct LoadSnapshot {
     pub num_cached_blocks: i32,
     /// Requests preempted so far (LIFO, on KV exhaustion).
     pub num_preemptions: i64,
+    /// KV-event batches produced so far (the current gRPC sequence number).
+    pub num_kv_batches: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1090,7 @@ impl SchedulerState {
             cache_hit_rate: self.cache_hit_ewma,
             num_cached_blocks: self.pool.cached().min(i32::MAX as usize) as i32,
             num_preemptions: self.preemptions.min(i64::MAX as u64) as i64,
+            num_kv_batches: self.kv_seq.min(i64::MAX as u64) as i64,
         }
     }
 
@@ -1649,6 +1652,7 @@ impl LoadSnapshot {
             cache_hit_rate: 0.0,
             num_cached_blocks: 0,
             num_preemptions: 0,
+            num_kv_batches: 0,
         }
     }
 }
