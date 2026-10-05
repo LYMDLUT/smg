@@ -1,0 +1,22 @@
+//! Cost-function worker selection.
+//!
+//! Cache-aware routing gathers, once per request, what it knows about every eligible worker (prefix
+//! overlap by tier, in-flight requests, the backend's waiting-prefill and KV-usage reports, anything
+//! the router booked optimistically since) and hands that to a *selection policy*: a pipeline of
+//! filters, additive cost scorers and one picker, registered by name with its own parameters.
+//!
+//! - [`catalog::DEFAULT_POLICY`] reproduces the pre-policy cache-aware decision exactly (an affinity
+//!   group that the host resolves with its pressure gate and expected-wait selector).
+//!
+//! The cost of the stage itself is measured by `benches/policy_selection.rs`.
+
+pub mod catalog;
+pub mod inputs;
+pub mod policy;
+pub mod softmax;
+
+mod default;
+
+pub use catalog::{build, default_policy, CatalogError, DEFAULT_POLICY, POLICY_NAMES};
+pub use inputs::{CandidateInputs, RequestInputs};
+pub use policy::{Needs, Pick, WorkerFilter, WorkerPicker, WorkerScorer, WorkerSelectionPolicy};

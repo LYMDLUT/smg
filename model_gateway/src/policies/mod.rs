@@ -16,6 +16,7 @@ mod bucket;
 mod cache_aware;
 mod cache_namespace;
 mod consistent_hashing;
+pub mod cost;
 mod dp_min_token;
 mod factory;
 mod least_load;
