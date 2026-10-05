@@ -27,6 +27,11 @@ lane has drained, which is the corpus plus the backend's index. Read a backend's
 as its figure minus the `null-indexer` run's at the same settings; peak RSS from `time` is taken
 during corpus generation and says nothing about the index.
 
+`lane_cpu.patch` (applied after `wiring.patch`) names the thread-pool lanes `kv-lane-<n>` and adds
+`backend_lane_cpu_ns` to the result JSON: the user plus system time of those threads read from
+`/proc/self/task` when the run ends, so a backend's lane cost per block op is a measured number
+rather than a share of profile samples.
+
 `smg-run` takes `--max-workers` (default 256): the run index keeps one coverage bit per worker
 slot per run, so the slot count is fixed up front (at most 1024); slots are reused after a worker
 is removed.
