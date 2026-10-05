@@ -90,6 +90,8 @@ const MIN_TABLE_SLOTS: usize = 2;
 const TABLE_CLASSES: usize = 27;
 /// Coverage words per run at most: 1024 workers.
 const MAX_WORDS: usize = 16;
+/// Partial holders a lookup can buffer per run: every worker at most.
+const MAX_PARTIAL: usize = MAX_WORDS * 64;
 
 /// Where one of a worker's blocks lives: the run and the offset of the block within it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +141,7 @@ struct WordArena {
     next: AtomicU64,
     free_arrays: Vec<SegQueue<u32>>,
     free_tables: Vec<SegQueue<u32>>,
+    free_partials: Vec<SegQueue<u32>>,
 }
 
 impl WordArena {
@@ -148,6 +151,7 @@ impl WordArena {
             next: AtomicU64::new(1),
             free_arrays: (0..ARRAY_CLASSES).map(|_| SegQueue::new()).collect(),
             free_tables: (0..TABLE_CLASSES).map(|_| SegQueue::new()).collect(),
+            free_partials: (0..TABLE_CLASSES).map(|_| SegQueue::new()).collect(),
         }
     }
 
@@ -212,7 +216,13 @@ impl WordArena {
             .enumerate()
             .map(|(class, list)| list.len() * (2 + 2 * (MIN_TABLE_SLOTS << class)))
             .sum();
-        arrays + tables
+        let partials: usize = self
+            .free_partials
+            .iter()
+            .enumerate()
+            .map(|(class, list)| list.len() * (2 + (MIN_TABLE_SLOTS << class)))
+            .sum();
+        arrays + tables + partials
     }
 
     // ---- hash arrays: [used | capacity << 32][refs][hash; capacity], data = start + 2 ----
@@ -406,6 +416,153 @@ impl WordArena {
     }
 }
 
+impl WordArena {
+    // ---- partial holders: [slots | used << 32][live][(worker | cutoff << 32); slots] ----
+    // Entries are appended in slot order; a removed entry is a tombstone. A worker listed here
+    // holds the run's blocks `[0, cutoff)` with `0 < cutoff < len`.
+
+    fn alloc_partials(&self, slots: usize) -> u32 {
+        let class = table_class(slots);
+        let recycled = self.free_partials[class].pop();
+        let table = recycled.unwrap_or_else(|| self.bump(2 + slots));
+        for word in self.words(table + 2, slots) {
+            word.store(0, Ordering::Relaxed);
+        }
+        self.word(table + 1).store(0, Ordering::Relaxed);
+        self.word(table).store(slots as u64, Ordering::Release);
+        table
+    }
+
+    fn free_partials(&self, table: u32) {
+        if table == NONE {
+            return;
+        }
+        let slots = self.word(table).load(Ordering::Relaxed) as u32 as usize;
+        self.free_partials[table_class(slots)].push(table);
+    }
+
+    /// `(slots, used)` of a partial table.
+    #[inline]
+    fn partials_shape(&self, table: u32) -> (usize, usize) {
+        let header = self.word(table).load(Ordering::Relaxed);
+        (header as u32 as usize, (header >> 32) as usize)
+    }
+
+    fn partials_live(&self, table: u32) -> usize {
+        if table == NONE {
+            0
+        } else {
+            self.word(table + 1).load(Ordering::Relaxed) as usize
+        }
+    }
+
+    /// Live `(worker, cutoff)` entries, in slot order.
+    fn partial_entries(&self, table: u32) -> Vec<(u32, u32)> {
+        if table == NONE {
+            return Vec::new();
+        }
+        let (_, used) = self.partials_shape(table);
+        self.words(table + 2, used)
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .filter(|entry| *entry != 0 && *entry != TOMB)
+            .map(|entry| (entry as u32, (entry >> 32) as u32))
+            .collect()
+    }
+
+    /// The slot and cutoff of `worker`, if it is a partial holder.
+    fn partial_find(&self, table: u32, worker: u32) -> Option<(usize, u32)> {
+        if table == NONE {
+            return None;
+        }
+        let (_, used) = self.partials_shape(table);
+        self.words(table + 2, used)
+            .iter()
+            .enumerate()
+            .find_map(|(index, slot)| {
+                let entry = slot.load(Ordering::Relaxed);
+                (entry != 0 && entry != TOMB && entry as u32 == worker)
+                    .then_some((index, (entry >> 32) as u32))
+            })
+    }
+
+    /// The largest cutoff among the partial holders (0 when there are none).
+    fn partial_max(&self, table: u32) -> usize {
+        if table == NONE {
+            return 0;
+        }
+        let (_, used) = self.partials_shape(table);
+        self.words(table + 2, used)
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .filter(|entry| *entry != 0 && *entry != TOMB)
+            .map(|entry| (entry >> 32) as usize)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn partial_set(&self, table: u32, slot: usize, worker: u32, cutoff: u32) {
+        self.word(table + 2 + slot as u32).store(
+            u64::from(worker) | (u64::from(cutoff) << 32),
+            Ordering::Release,
+        );
+    }
+
+    /// Append an entry; `false` when the table is full.
+    fn partial_put(&self, table: u32, worker: u32, cutoff: u32) -> bool {
+        if table == NONE {
+            return false;
+        }
+        let (slots, used) = self.partials_shape(table);
+        if used >= slots {
+            return false;
+        }
+        self.partial_set(table, used, worker, cutoff);
+        self.word(table)
+            .store(slots as u64 | ((used as u64 + 1) << 32), Ordering::Relaxed);
+        self.word(table + 1).fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Tombstone a slot; returns the live count left.
+    fn partial_remove(&self, table: u32, slot: usize) -> usize {
+        self.word(table + 2 + slot as u32)
+            .store(TOMB, Ordering::Release);
+        self.word(table + 1).fetch_sub(1, Ordering::Relaxed) as usize - 1
+    }
+
+    /// A partial table holding `entries`; `NONE` for none.
+    fn partials_from(&self, entries: &[(u32, u32)]) -> u32 {
+        if entries.is_empty() {
+            return NONE;
+        }
+        let mut slots = MIN_TABLE_SLOTS;
+        while slots < 2 * entries.len() {
+            slots *= 2;
+        }
+        let table = self.alloc_partials(slots);
+        for &(worker, cutoff) in entries {
+            self.partial_put(table, worker, cutoff);
+        }
+        table
+    }
+
+    /// A new table with the live entries of `table` and room for `extra` more.
+    fn partials_grown(&self, table: u32, extra: usize) -> u32 {
+        let entries = self.partial_entries(table);
+        let needed = entries.len() + extra;
+        let mut slots = MIN_TABLE_SLOTS;
+        while slots < 2 * needed {
+            slots *= 2;
+        }
+        let grown = self.alloc_partials(slots);
+        for (worker, cutoff) in entries {
+            self.partial_put(grown, worker, cutoff);
+        }
+        grown
+    }
+}
+
 #[inline]
 fn pack(used: u32, capacity: u32) -> u64 {
     (u64::from(capacity) << 32) | u64::from(used)
@@ -438,6 +595,8 @@ struct Window {
     len: u32,
     /// Child table, or `NONE`.
     children: u32,
+    /// Partial-holder table, or `NONE`.
+    partials: u32,
 }
 
 struct Run {
@@ -451,6 +610,9 @@ struct Run {
     base: AtomicU32,
     len: AtomicU32,
     children: AtomicU32,
+    /// Workers holding only a prefix of the run, with how much: `(worker, cutoff)` entries in the
+    /// arena. A worker is either in the coverage bitset (whole run) or here, never both.
+    partials: AtomicU32,
     meta: Mutex<RunMeta>,
 }
 
@@ -464,6 +626,7 @@ impl Run {
             base: AtomicU32::new(0),
             len: AtomicU32::new(0),
             children: AtomicU32::new(NONE),
+            partials: AtomicU32::new(NONE),
             meta: Mutex::new(RunMeta::default()),
         }
     }
@@ -499,6 +662,7 @@ impl Run {
                 base: self.base.load(Ordering::Relaxed),
                 len: self.len.load(Ordering::Acquire),
                 children: self.children.load(Ordering::Relaxed),
+                partials: self.partials.load(Ordering::Relaxed),
             };
             fence(Ordering::Acquire);
             if self.version.load(Ordering::Relaxed) == before {
@@ -531,6 +695,7 @@ impl Run {
         self.base.store(window.base, Ordering::Relaxed);
         self.len.store(window.len, Ordering::Relaxed);
         self.children.store(window.children, Ordering::Relaxed);
+        self.partials.store(window.partials, Ordering::Relaxed);
         self.end_update();
     }
 }
@@ -608,6 +773,7 @@ impl RunSlab {
         run.base.store(window.base, Ordering::Relaxed);
         run.len.store(window.len, Ordering::Relaxed);
         run.children.store(window.children, Ordering::Relaxed);
+        run.partials.store(window.partials, Ordering::Relaxed);
         id
     }
 
@@ -727,6 +893,14 @@ impl Default for RunIndex {
     }
 }
 
+/// How a worker holds a run.
+enum Holding {
+    Full,
+    /// The first `cutoff` blocks only.
+    Partial(usize),
+    None,
+}
+
 /// Outcome of one attempt to walk a store into the tree.
 enum Walk {
     Done,
@@ -783,6 +957,7 @@ impl RunIndex {
                 base: 0,
                 len: 0,
                 children: NONE,
+                partials: NONE,
             },
         );
         debug_assert_eq!(root, ROOT);
@@ -970,13 +1145,16 @@ impl RunIndex {
     fn kill(&self, run_id: u32, meta: &mut RunMeta, freed: &mut Vec<u32>) {
         let run = self.slab.run(run_id);
         let block = run.block.load(Ordering::Relaxed);
+        let partials = run.partials.load(Ordering::Relaxed);
         run.begin_update();
         run.block.store(NONE, Ordering::Relaxed);
         run.base.store(0, Ordering::Relaxed);
         run.len.store(0, Ordering::Relaxed);
         run.children.store(NONE, Ordering::Relaxed);
+        run.partials.store(NONE, Ordering::Relaxed);
         run.end_update();
         self.arena.array_release(block);
+        self.arena.free_partials(partials);
         meta.dead = true;
         freed.push(run_id);
     }
@@ -990,18 +1168,150 @@ impl RunIndex {
         }
     }
 
-    /// Split `run` (locked by the caller) at `at`: the run keeps `[0, at)`, a new suffix run takes
-    /// `[at, len)` on the same hash array, the run's children and its coverage minus `exclude`.
-    /// A suffix nobody covers and that has no children is not created: the forwarding record
-    /// says the blocks are gone.
-    fn split_locked(
-        &self,
-        worker: u32,
-        run_id: u32,
-        meta: &mut RunMeta,
-        at: usize,
-        exclude: Option<u32>,
-    ) -> u32 {
+    /// How `worker` holds a run: all of it, a prefix of it, or nothing.
+    fn holding(&self, run_id: u32, worker: u32) -> Holding {
+        if has(self.slab.coverage(run_id), worker) {
+            return Holding::Full;
+        }
+        let table = self.slab.run(run_id).partials.load(Ordering::Relaxed);
+        match self.arena.partial_find(table, worker) {
+            Some((_, cutoff)) => Holding::Partial(cutoff as usize),
+            None => Holding::None,
+        }
+    }
+
+    /// Blocks of a run that `worker` holds.
+    fn held_by(&self, run_id: u32, worker: u32) -> usize {
+        match self.holding(run_id, worker) {
+            Holding::Full => self.slab.run(run_id).len(),
+            Holding::Partial(cutoff) => cutoff,
+            Holding::None => 0,
+        }
+    }
+
+    /// Blocks of a run held by at least one worker: all of them while anybody holds the whole
+    /// run, otherwise the longest partial prefix.
+    fn held_len(&self, run_id: u32) -> usize {
+        let run = self.slab.run(run_id);
+        if coverage_is_empty(self.slab.coverage(run_id)) {
+            self.arena.partial_max(run.partials.load(Ordering::Relaxed))
+        } else {
+            run.len()
+        }
+    }
+
+    fn has_holders(&self, run_id: u32) -> bool {
+        !coverage_is_empty(self.slab.coverage(run_id))
+            || self
+                .arena
+                .partials_live(self.slab.run(run_id).partials.load(Ordering::Relaxed))
+                > 0
+    }
+
+    /// Distinct-block accounting around a change to `run_id` (and the suffix it may have split
+    /// off): the delta of blocks held by anybody, attributed to `worker`.
+    fn settle_distinct(&self, worker: u32, before: usize, run_id: u32, suffix: Option<u32>) {
+        let mut after = self.held_len(run_id);
+        if let Some(suffix) = suffix {
+            if suffix != GONE {
+                after += self.held_len(suffix);
+            }
+        }
+        if after > before {
+            self.distinct_add(worker, after - before);
+        } else {
+            self.distinct_sub(worker, before - after);
+        }
+    }
+
+    /// Make `worker` hold exactly `[0, cutoff)` of the run (the run is locked): the whole run when
+    /// `cutoff` reaches its length, nothing when 0. Readers treat the coverage bit as the truth
+    /// when both forms are visible, so a worker gains its bit before its partial entry goes and
+    /// gains a partial entry before its bit goes.
+    fn set_holding(&self, run_id: u32, worker: u32, cutoff: usize) {
+        let run = self.slab.run(run_id);
+        let coverage = self.slab.coverage(run_id);
+        let len = run.len();
+        let was_full = has(coverage, worker);
+        let table = run.partials.load(Ordering::Relaxed);
+        let entry = if was_full {
+            None
+        } else {
+            self.arena.partial_find(table, worker)
+        };
+        if cutoff >= len {
+            if !was_full {
+                set(coverage, worker);
+            }
+            if let Some((slot, _)) = entry {
+                self.drop_partial(run, table, slot);
+            }
+        } else if cutoff == 0 {
+            if was_full {
+                clear(coverage, worker);
+            }
+            if let Some((slot, _)) = entry {
+                self.drop_partial(run, table, slot);
+            }
+        } else {
+            match entry {
+                Some((slot, old)) => {
+                    if old as usize != cutoff {
+                        self.arena.partial_set(table, slot, worker, cutoff as u32);
+                    }
+                }
+                None if was_full => {
+                    // A reader that saw neither the entry nor the bit would score nothing for a
+                    // worker that holds a prefix: keep the two writes inside one version step.
+                    run.begin_update();
+                    self.add_partial(run, table, worker, cutoff as u32);
+                    clear(coverage, worker);
+                    run.end_update();
+                }
+                None => self.add_partial(run, table, worker, cutoff as u32),
+            }
+        }
+    }
+
+    /// Append a partial entry, growing (and republishing) the table when it is full.
+    fn add_partial(&self, run: &Run, table: u32, worker: u32, cutoff: u32) {
+        if self.arena.partial_put(table, worker, cutoff) {
+            return;
+        }
+        let grown = if table == NONE {
+            self.arena.alloc_partials(MIN_TABLE_SLOTS)
+        } else {
+            self.arena.partials_grown(table, 1)
+        };
+        let placed = self.arena.partial_put(grown, worker, cutoff);
+        debug_assert!(placed);
+        let nested = run.version.load(Ordering::Relaxed) & 1 == 1;
+        if !nested {
+            run.begin_update();
+        }
+        run.partials.store(grown, Ordering::Relaxed);
+        if !nested {
+            run.end_update();
+        }
+        self.arena.free_partials(table);
+    }
+
+    /// Tombstone a partial entry; an emptied table goes away.
+    fn drop_partial(&self, run: &Run, table: u32, slot: usize) {
+        if self.arena.partial_remove(table, slot) == 0 {
+            run.begin_update();
+            run.partials.store(NONE, Ordering::Relaxed);
+            run.end_update();
+            self.arena.free_partials(table);
+        }
+    }
+
+    /// Split `run` (locked by the caller) at `at`: the run keeps `[0, at)`; a new suffix run takes
+    /// `[at, len)` on the same hash array, with the run's children, its full holders and the
+    /// partial holders reaching past `at`; partial holders reaching `at` become full holders of
+    /// the prefix. A suffix nobody would hold is not created when the run has no children: the
+    /// forwarding record says those blocks are gone. No worker's holdings change in total.
+    fn split_locked(&self, run_id: u32, meta: &mut RunMeta, at: usize) -> u32 {
         let run = self.slab.run(run_id);
         let coverage = self.slab.coverage(run_id);
         let len = run.len();
@@ -1009,58 +1319,66 @@ impl RunIndex {
         let block = run.block.load(Ordering::Relaxed);
         let base = run.base.load(Ordering::Relaxed);
         let children = run.children.load(Ordering::Relaxed);
-        let mut suffix_words = [0u64; MAX_WORDS];
-        for (index, word) in coverage.iter().enumerate() {
-            let mut value = word.load(Ordering::Relaxed);
-            if let Some(worker) = exclude {
-                if (worker / 64) as usize == index {
-                    value &= !(1u64 << (worker % 64));
-                }
-            }
-            suffix_words[index] = value;
-        }
-        let uncovered = suffix_words[..self.words].iter().all(|word| *word == 0);
-        if uncovered && !coverage_is_empty(coverage) {
-            // The excluded worker was the last holder of these blocks.
-            self.distinct_sub(worker, len - at);
-        }
-        if uncovered && children == NONE {
+        let partials = self
+            .arena
+            .partial_entries(run.partials.load(Ordering::Relaxed));
+        let beyond: Vec<(u32, u32)> = partials
+            .iter()
+            .filter(|(_, cutoff)| *cutoff as usize > at)
+            .map(|&(worker, cutoff)| (worker, cutoff - at as u32))
+            .collect();
+        let suffix_held = !coverage_is_empty(coverage) || !beyond.is_empty();
+        let suffix_id = if !suffix_held && children == NONE {
             run.begin_update();
             run.len.store(at as u32, Ordering::Relaxed);
             run.end_update();
-            meta.splits.push((at as u32, GONE, 0));
-            return GONE;
+            GONE
+        } else {
+            self.arena.array_retain(block);
+            let suffix_partials = self.arena.partials_from(&beyond);
+            let suffix_id = self.slab.alloc(
+                run.start() + at,
+                run_id,
+                Window {
+                    block,
+                    base: base + at as u32,
+                    len: (len - at) as u32,
+                    children,
+                    partials: suffix_partials,
+                },
+            );
+            let suffix = self.slab.run(suffix_id);
+            for (slot, word) in self.slab.coverage(suffix_id).iter().zip(coverage) {
+                slot.store(word.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            self.arena.for_each_child(children, |child| {
+                self.slab
+                    .run(child)
+                    .parent
+                    .store(suffix_id, Ordering::Release);
+            });
+            let table = self.arena.alloc_table(MIN_TABLE_SLOTS);
+            self.arena
+                .table_put(table, self.hash_at(run, at), suffix_id, suffix.generation());
+            run.begin_update();
+            run.len.store(at as u32, Ordering::Relaxed);
+            run.children.store(table, Ordering::Relaxed);
+            run.end_update();
+            suffix_id
+        };
+        // The prefix is `[0, at)` now: a partial holder that reached it holds all of it. Done
+        // after the truncation so no reader sees a bit for the whole old run.
+        for (worker, cutoff) in partials {
+            if cutoff as usize >= at {
+                self.set_holding(run_id, worker, at);
+            }
         }
-        self.arena.array_retain(block);
-        let suffix_id = self.slab.alloc(
-            run.start() + at,
-            run_id,
-            Window {
-                block,
-                base: base + at as u32,
-                len: (len - at) as u32,
-                children,
-            },
-        );
-        let suffix = self.slab.run(suffix_id);
-        for (slot, value) in self.slab.coverage(suffix_id).iter().zip(suffix_words) {
-            slot.store(value, Ordering::Relaxed);
-        }
-        self.arena.for_each_child(children, |child| {
-            self.slab
-                .run(child)
-                .parent
-                .store(suffix_id, Ordering::Release);
-        });
-        let table = self.arena.alloc_table(MIN_TABLE_SLOTS);
-        self.arena
-            .table_put(table, self.hash_at(run, at), suffix_id, suffix.generation());
-        run.begin_update();
-        run.len.store(at as u32, Ordering::Relaxed);
-        run.children.store(table, Ordering::Relaxed);
-        run.end_update();
-        meta.splits
-            .push((at as u32, suffix_id, suffix.generation()));
+        let generation = if suffix_id == GONE {
+            0
+        } else {
+            self.slab.run(suffix_id).generation()
+        };
+        meta.splits.push((at as u32, suffix_id, generation));
         suffix_id
     }
 
@@ -1084,7 +1402,7 @@ impl RunIndex {
             self.kill(run_id, meta, freed);
             if parent_id != ROOT
                 && parent.children.load(Ordering::Relaxed) == NONE
-                && coverage_is_empty(self.slab.coverage(parent_id))
+                && !self.has_holders(parent_id)
             {
                 self.unlink_locked(parent_id, &mut parent_meta, freed);
             }
@@ -1226,16 +1544,15 @@ impl RunIndex {
         pending: &mut Vec<Placed>,
     ) -> InRun<'b> {
         let run = self.slab.run(run_id);
-        let coverage = self.slab.coverage(run_id);
         let len = run.len();
         if offset >= len {
             return InRun::Continue(remaining);
         }
-        let covered = has(coverage, worker);
-        if !covered && offset > 0 {
-            // The parent entry pointed into a run this worker does not cover (it cannot, unless
-            // the engine re-stored under a stale parent). Cut here and join the suffix instead.
-            let suffix = self.split_locked(worker, run_id, meta, offset, None);
+        let held = self.held_by(run_id, worker);
+        if held < offset {
+            // The parent entry pointed past what this worker holds (it cannot, unless the engine
+            // re-stored under a stale parent). Cut here and join the suffix instead.
+            let suffix = self.split_locked(run_id, meta, offset);
             return InRun::MoveTo(suffix, self.slab.run(suffix).generation());
         }
         let data = run.block.load(Ordering::Relaxed) + run.base.load(Ordering::Relaxed);
@@ -1246,18 +1563,19 @@ impl RunIndex {
             .take_while(|(stored, slot)| stored.content_hash.0 == slot.load(Ordering::Relaxed))
             .count();
         let available = len - offset;
-        if matched < available && (matched < remaining.len() || !covered) {
-            // A divergence inside the run (both branches stay held), or a worker that holds only
-            // a prefix of it: either way the run ends here.
-            self.split_locked(worker, run_id, meta, offset + matched, None);
+        let reach = offset + matched;
+        let before = self.held_len(run_id);
+        let suffix = if matched < available && matched < remaining.len() {
+            // A divergence inside the run: both branches stay held, the run ends here.
+            Some(self.split_locked(run_id, meta, reach))
+        } else {
+            None
+        };
+        if reach > held {
+            self.set_holding(run_id, worker, reach);
+            self.credit(worker, reach - held);
         }
-        if !covered {
-            if coverage_is_empty(coverage) {
-                self.distinct_add(worker, run.len());
-            }
-            set(coverage, worker);
-            self.credit(worker, run.len());
-        }
+        self.settle_distinct(worker, before, run_id, suffix);
         pending.push(Placed {
             run: run_id,
             offset: offset as u32,
@@ -1313,6 +1631,7 @@ impl RunIndex {
                     base: 0,
                     len: contents.len() as u32,
                     children: NONE,
+                    partials: NONE,
                 },
             );
             set(self.slab.coverage(new_id), worker);
@@ -1412,7 +1731,6 @@ impl RunIndex {
             return;
         }
         let run = self.slab.run(removal.run);
-        let coverage = self.slab.coverage(removal.run);
         let mut meta = run.meta.lock();
         if meta.dead
             || removal
@@ -1422,11 +1740,11 @@ impl RunIndex {
             return;
         }
         let offsets = reforward(&meta, removal.offsets, work);
-        if offsets.is_empty() || !has(coverage, worker) {
+        if offsets.is_empty() || self.held_by(removal.run, worker) == 0 {
             return;
         }
         self.remove_ranges(worker, removal.run, &mut meta, offsets);
-        if coverage_is_empty(coverage) && run.children.load(Ordering::Relaxed) == NONE {
+        if !self.has_holders(removal.run) && run.children.load(Ordering::Relaxed) == NONE {
             self.unlink_locked(removal.run, &mut meta, freed);
         }
     }
@@ -1434,11 +1752,10 @@ impl RunIndex {
     /// Drop `worker` from the given offsets of a run it covers, splitting the run so that the
     /// pieces it still covers keep their offsets.
     fn remove_ranges(&self, worker: u32, run_id: u32, meta: &mut RunMeta, mut offsets: Vec<u32>) {
-        let run = self.slab.run(run_id);
         offsets.sort_unstable();
         offsets.dedup();
-        let len = run.len();
-        offsets.retain(|&offset| (offset as usize) < len);
+        let mut held = self.held_by(run_id, worker);
+        offsets.retain(|&offset| (offset as usize) < held);
         // Contiguous ranges, highest first, so earlier ranges keep their offsets after the splits
         // a later range causes.
         let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -1450,26 +1767,14 @@ impl RunIndex {
             }
         }
         for (low, high) in ranges.into_iter().rev() {
-            if high + 1 < run.len() {
-                // The tail beyond the range keeps every worker, this one included.
-                self.split_locked(worker, run_id, meta, high + 1, None);
-            }
-            if low > 0 {
-                // The range becomes its own run without this worker.
-                self.split_locked(worker, run_id, meta, low, Some(worker));
-            } else {
-                self.clear_holder(run_id, worker);
-            }
+            let before = self.held_len(run_id);
+            // Blocks after the range stay held by this worker too: a hole, so the tail becomes
+            // its own run. A range reaching the worker's end only lowers its cutoff.
+            let tail = (high + 1 < held).then(|| self.split_locked(run_id, meta, high + 1));
+            self.set_holding(run_id, worker, low);
             self.debit(worker, high + 1 - low);
-        }
-    }
-
-    /// Drop `worker` from a run it covers, keeping the distinct-block count in step.
-    fn clear_holder(&self, run_id: u32, worker: u32) {
-        let coverage = self.slab.coverage(run_id);
-        clear(coverage, worker);
-        if coverage_is_empty(coverage) {
-            self.distinct_sub(worker, self.slab.run(run_id).len());
+            self.settle_distinct(worker, before, run_id, tail);
+            held = low;
         }
     }
 
@@ -1502,7 +1807,6 @@ impl RunIndex {
                 continue;
             }
             let run = self.slab.run(run_id);
-            let coverage = self.slab.coverage(run_id);
             let mut meta = run.meta.lock();
             if meta.dead || generation.is_some_and(|generation| generation != run.generation()) {
                 continue;
@@ -1513,10 +1817,13 @@ impl RunIndex {
                     work.push((suffix, Some(suffix_generation)));
                 }
             }
-            if has(coverage, worker) {
-                self.clear_holder(run_id, worker);
-                self.debit(worker, run.len());
-                if coverage_is_empty(coverage) && run.children.load(Ordering::Relaxed) == NONE {
+            let held = self.held_by(run_id, worker);
+            if held > 0 {
+                let before = self.held_len(run_id);
+                self.set_holding(run_id, worker, 0);
+                self.debit(worker, held);
+                self.settle_distinct(worker, before, run_id, None);
+                if !self.has_holders(run_id) && run.children.load(Ordering::Relaxed) == NONE {
                     self.unlink_locked(run_id, &mut meta, &mut freed);
                 }
             }
@@ -1568,6 +1875,7 @@ impl RunIndex {
         };
         let words = self.words;
         let mut alive = [0u64; MAX_WORDS];
+        let mut partial = [0u64; MAX_PARTIAL];
         let mut position = 0usize;
         let mut walked = 0usize;
         loop {
@@ -1584,6 +1892,19 @@ impl RunIndex {
                 .zip(hashes)
                 .take_while(|(content, slot)| hash_of(content) == slot.load(Ordering::Relaxed))
                 .count();
+            // Partial holders before the coverage words: a worker moving from a prefix to the
+            // whole run gains its bit before it loses its entry, so this order never misses it.
+            let mut partials = 0usize;
+            if window.partials != NONE {
+                let (_, used) = self.arena.partials_shape(window.partials);
+                for slot in self.arena.words(window.partials + 2, used) {
+                    let entry = slot.load(Ordering::Relaxed);
+                    if entry != 0 && entry != TOMB && partials < MAX_PARTIAL {
+                        partial[partials] = entry;
+                        partials += 1;
+                    }
+                }
+            }
             let coverage = self.slab.coverage(run_id);
             let mut held = [0u64; MAX_WORDS];
             for (word, slot) in held[..words].iter_mut().zip(coverage) {
@@ -1606,18 +1927,35 @@ impl RunIndex {
             }
             if position == 0 {
                 alive = held;
+                for &entry in &partial[..partials] {
+                    let worker = entry as u32;
+                    alive[(worker / 64) as usize] |= 1u64 << (worker % 64);
+                }
                 if early_exit {
                     emit(&alive[..words], 1, &mut report);
                     return walked;
                 }
-            } else {
+            }
+            // A partial holder still alive ends here with the part of the run it holds.
+            for &entry in &partial[..partials] {
+                let worker = entry as u32;
+                let (index, bit) = ((worker / 64) as usize, 1u64 << (worker % 64));
+                if alive[index] & bit != 0 && held[index] & bit == 0 {
+                    let cutoff = (entry >> 32) as usize;
+                    report(worker, (position + cutoff.min(matched)) as u32);
+                    alive[index] &= !bit;
+                }
+            }
+            if position > 0 {
                 for (index, word) in alive[..words].iter_mut().enumerate() {
                     let dropped = *word & !held[index];
                     if dropped != 0 {
                         emit_word(index, dropped, position as u32, &mut report);
                     }
-                    *word &= held[index];
                 }
+            }
+            for (index, word) in alive[..words].iter_mut().enumerate() {
+                *word &= held[index];
             }
             if alive[..words].iter().all(|word| *word == 0) {
                 return walked;
@@ -1651,6 +1989,7 @@ impl RunIndex {
             let (window, _) = run.snapshot();
             let start = run.start();
             let holders = workers(self.slab.coverage(run_id));
+            let partials = self.arena.partial_entries(window.partials);
             let hashes = self
                 .arena
                 .words(window.block + window.base, window.len as usize);
@@ -1662,6 +2001,11 @@ impl RunIndex {
                 };
                 for &worker in &holders {
                     out.insert((worker, start + offset, content, next));
+                }
+                for &(worker, cutoff) in &partials {
+                    if offset < cutoff as usize {
+                        out.insert((worker, start + offset, content, next));
+                    }
                 }
                 prefix = Some(next);
             }
@@ -2004,7 +2348,11 @@ mod tests {
             .apply_stored(v, &blocks[..20], None, &mut mv)
             .expect("join");
         assert_eq!(scores(&index, &held), vec![(w, 40), (v, 20)]);
-        assert_eq!(index.stats().runs_live, 2);
+        assert_eq!(
+            index.stats().runs_live,
+            1,
+            "a prefix holder joins as a partial holder, no split"
+        );
         let more: Vec<ContentHash> = (0..3).map(|p| content(2, p)).collect();
         let mut long = held.clone();
         long.extend(more);
@@ -2013,7 +2361,7 @@ mod tests {
             .apply_stored(w, &long_blocks[40..], Some(blocks[39].seq_hash), &mut mw)
             .expect("extend after join");
         assert_eq!(scores(&index, &long), vec![(w, 43), (v, 20)]);
-        assert_eq!(index.stats().runs_live, 2, "the tail is still w's own leaf");
+        assert_eq!(index.stats().runs_live, 1, "the run is still w's own leaf");
     }
 
     #[test]
@@ -2064,6 +2412,94 @@ mod tests {
                 .apply_stored(w, &blocks_of(chain)[3..], Some(anchor))
                 .expect("ref branch");
         }
+        assert_eq!(index.debug_blocks(), reference.blocks());
+    }
+
+    #[test]
+    fn tail_evictions_and_regrowth_do_not_split() {
+        let index = RunIndex::with_max_workers(8);
+        let w = index.intern_worker("w").expect("id");
+        let v = index.intern_worker("v").expect("id");
+        let (mut mw, mut mv) = (RunBlockMap::default(), RunBlockMap::default());
+        let held: Vec<ContentHash> = (0..40).map(|p| content(1, p)).collect();
+        let blocks = blocks_of(&held);
+        index.apply_stored(w, &blocks, None, &mut mw).expect("w");
+        index.apply_stored(v, &blocks, None, &mut mv).expect("v");
+        let mut reference = ReferenceIndexer::new();
+        reference.apply_stored(w, &blocks, None).expect("ref w");
+        reference.apply_stored(v, &blocks, None).expect("ref v");
+        // v evicts its tail twice: a cutoff, not a split.
+        for keep in [30usize, 12] {
+            let gone: Vec<SequenceHash> = blocks[keep..].iter().map(|b| b.seq_hash).collect();
+            index.apply_removed(v, &gone, &mut mv);
+            reference.apply_removed(v, &gone);
+            assert_eq!(scores(&index, &held), vec![(w, 40), (v, keep as u32)]);
+            assert_eq!(index.stats().runs_live, 1, "tail eviction to {keep}");
+            assert_eq!(index.worker_block_count(v), keep);
+            assert_eq!(index.entry_count(), 40);
+        }
+        // A decode extends v back to the end of the run: full holder again, still one run.
+        index
+            .apply_stored(v, &blocks[12..], Some(blocks[11].seq_hash), &mut mv)
+            .expect("regrow");
+        reference
+            .apply_stored(v, &blocks[12..], Some(blocks[11].seq_hash))
+            .expect("ref regrow");
+        assert_eq!(scores(&index, &held), vec![(w, 40), (v, 40)]);
+        assert_eq!(index.stats().runs_live, 1);
+        assert_eq!(index.debug_blocks(), reference.blocks());
+        // w evicts everything, v keeps a prefix: the run survives with one partial holder.
+        let all: Vec<SequenceHash> = blocks.iter().map(|b| b.seq_hash).collect();
+        index.apply_removed(w, &all, &mut mw);
+        reference.apply_removed(w, &all);
+        index.apply_removed(v, &all[25..], &mut mv);
+        reference.apply_removed(v, &all[25..]);
+        assert_eq!(scores(&index, &held), vec![(v, 25)]);
+        assert_eq!(index.entry_count(), 25);
+        assert_eq!(index.debug_blocks(), reference.blocks());
+        let walked = index.score_into(&held, |c| c.0, false, |_, _| {});
+        assert_eq!(walked, 1);
+    }
+
+    #[test]
+    fn a_staircase_of_prefix_holders_is_one_run() {
+        let index = RunIndex::with_max_workers(128);
+        let held: Vec<ContentHash> = (0..64).map(|p| content(3, p)).collect();
+        let blocks = blocks_of(&held);
+        let mut maps: Vec<RunBlockMap> = (0..64).map(|_| RunBlockMap::default()).collect();
+        let mut reference = ReferenceIndexer::new();
+        for step in 0..64usize {
+            assert_eq!(index.intern_worker(&format!("w{step}")), Ok(step as u32));
+        }
+        // The longest holder stores first (a full prefill); every shorter prefix then joins as a
+        // partial holder, the way evictions and cache hits shape a shared prompt.
+        for step in (0..64usize).rev() {
+            index
+                .apply_stored(step as u32, &blocks[..=step], None, &mut maps[step])
+                .expect("store");
+            reference
+                .apply_stored(step as u32, &blocks[..=step], None)
+                .expect("ref");
+        }
+        assert_eq!(
+            index.stats().runs_live,
+            1,
+            "64 prefixes of one chain share one run"
+        );
+        let expected: Vec<(u32, u32)> = (0..64u32).map(|w| (w, w + 1)).collect();
+        assert_eq!(scores(&index, &held), expected);
+        assert_eq!(index.debug_blocks(), reference.blocks());
+        let walked = index.score_into(&held, |c| c.0, false, |_, _| {});
+        assert_eq!(walked, 1);
+        let mut early: Vec<(u32, u32)> =
+            index.find_matches(&held, true).scores.into_iter().collect();
+        early.sort_unstable();
+        assert_eq!(early, (0..64u32).map(|w| (w, 1)).collect::<Vec<_>>());
+        // A hole in the longest holder's prefix still splits, and only for it.
+        index.apply_removed(63, &[blocks[40].seq_hash], &mut maps[63]);
+        reference.apply_removed(63, &[blocks[40].seq_hash]);
+        assert_eq!(scores(&index, &held)[63], (63, 40));
+        assert_eq!(index.stats().runs_live, 2);
         assert_eq!(index.debug_blocks(), reference.blocks());
     }
 
