@@ -50,11 +50,13 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{fence, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
 };
 
+use crossbeam_queue::SegQueue;
+use crossbeam_utils::CachePadded;
 use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -135,8 +137,8 @@ fn table_class(slots: usize) -> usize {
 struct WordArena {
     dir: Box<[OnceLock<Box<[AtomicU64]>>]>,
     next: AtomicU64,
-    free_arrays: Mutex<Vec<Vec<u32>>>,
-    free_tables: Mutex<Vec<Vec<u32>>>,
+    free_arrays: Vec<SegQueue<u32>>,
+    free_tables: Vec<SegQueue<u32>>,
 }
 
 impl WordArena {
@@ -144,8 +146,8 @@ impl WordArena {
         Self {
             dir: (0..WORD_DIR).map(|_| OnceLock::new()).collect(),
             next: AtomicU64::new(1),
-            free_arrays: Mutex::new(vec![Vec::new(); ARRAY_CLASSES]),
-            free_tables: Mutex::new(vec![Vec::new(); TABLE_CLASSES]),
+            free_arrays: (0..ARRAY_CLASSES).map(|_| SegQueue::new()).collect(),
+            free_tables: (0..TABLE_CLASSES).map(|_| SegQueue::new()).collect(),
         }
     }
 
@@ -200,14 +202,12 @@ impl WordArena {
     fn free_words(&self) -> usize {
         let arrays: usize = self
             .free_arrays
-            .lock()
             .iter()
             .enumerate()
             .map(|(class, list)| list.len() * (class_capacity(class) + 2))
             .sum();
         let tables: usize = self
             .free_tables
-            .lock()
             .iter()
             .enumerate()
             .map(|(class, list)| list.len() * (2 + 2 * (MIN_TABLE_SLOTS << class)))
@@ -221,7 +221,7 @@ impl WordArena {
     fn alloc_array(&self, contents: &[u64], capacity: usize) -> u32 {
         let class = array_class(capacity.max(contents.len()).max(8));
         let capacity = class_capacity(class);
-        let recycled = self.free_arrays.lock()[class].pop();
+        let recycled = self.free_arrays[class].pop();
         let start = recycled.unwrap_or_else(|| self.bump(capacity + 2));
         let data = start + 2;
         for (slot, &hash) in self.words(data, contents.len()).iter().zip(contents) {
@@ -252,7 +252,7 @@ impl WordArena {
         }
         if self.word(data - 1).fetch_sub(1, Ordering::AcqRel) == 1 {
             let (_, capacity) = unpack(self.array_header(data).load(Ordering::Relaxed));
-            self.free_arrays.lock()[array_class(capacity as usize)].push(data - 2);
+            self.free_arrays[array_class(capacity as usize)].push(data - 2);
         }
     }
 
@@ -260,7 +260,7 @@ impl WordArena {
 
     fn alloc_table(&self, slots: usize) -> u32 {
         let class = table_class(slots);
-        let recycled = self.free_tables.lock()[class].pop();
+        let recycled = self.free_tables[class].pop();
         let table = recycled.unwrap_or_else(|| self.bump(2 + 2 * slots));
         for word in self.words(table + 2, 2 * slots) {
             word.store(0, Ordering::Relaxed);
@@ -275,7 +275,7 @@ impl WordArena {
             return;
         }
         let slots = self.table_slots(table);
-        self.free_tables.lock()[table_class(slots)].push(table);
+        self.free_tables[table_class(slots)].push(table);
     }
 
     #[inline]
@@ -325,6 +325,21 @@ impl WordArena {
                 })
             })
             .collect()
+    }
+
+    /// Visit the live children of a table without allocating.
+    fn for_each_child(&self, table: u32, mut visit: impl FnMut(u32)) {
+        if table == NONE {
+            return;
+        }
+        let slots = self.table_slots(table);
+        let words = self.words(table + 2, 2 * slots);
+        for index in 0..slots {
+            let entry = words[2 * index + 1].load(Ordering::Acquire);
+            if entry != 0 && entry != TOMB {
+                visit(entry as u32);
+            }
+        }
     }
 
     /// Write an entry into a free or tombstoned slot of a table that has room (writer side).
@@ -531,7 +546,7 @@ struct RunChunk {
 struct RunSlab {
     dir: Box<[OnceLock<RunChunk>]>,
     next: AtomicU32,
-    free: Mutex<Vec<u32>>,
+    free: SegQueue<u32>,
     words: usize,
 }
 
@@ -540,7 +555,7 @@ impl RunSlab {
         Self {
             dir: (0..RUN_DIR).map(|_| OnceLock::new()).collect(),
             next: AtomicU32::new(0),
-            free: Mutex::new(Vec::new()),
+            free: SegQueue::new(),
             words,
         }
     }
@@ -572,7 +587,7 @@ impl RunSlab {
     /// A run that is not yet reachable from the tree: a dead header given its next life, or a
     /// fresh one.
     fn alloc(&self, start: usize, parent: u32, window: Window) -> u32 {
-        if let Some(id) = self.free.lock().pop() {
+        if let Some(id) = self.free.pop() {
             let run = self.run(id);
             let mut meta = run.meta.lock();
             debug_assert!(meta.dead && coverage_is_empty(self.coverage(id)));
@@ -700,9 +715,10 @@ pub struct RunIndex {
     max_workers: usize,
     worker_to_id: DashMap<Arc<str>, u32, FxBuildHasher>,
     registry: Mutex<WorkerRegistry>,
-    worker_blocks: Box<[AtomicUsize]>,
-    total_blocks: AtomicUsize,
-    distinct_blocks: AtomicUsize,
+    /// Blocks held per worker, one cache line each: the lanes write these on every event.
+    worker_blocks: Box<[CachePadded<AtomicUsize>]>,
+    /// Per-worker signed contributions to the distinct-block count, summed on demand.
+    distinct_blocks: Box<[CachePadded<AtomicIsize>]>,
 }
 
 impl Default for RunIndex {
@@ -728,6 +744,15 @@ enum InRun<'b> {
     Continue(&'b [StoredBlock]),
     /// Carry on in this run (id, generation) from its first block.
     MoveTo(u32, u32),
+}
+
+/// Blocks a store walk placed: `count` blocks from `start` in the event sit in `run` from
+/// `offset`. Recorded under the run lock, written into the lane map after it.
+struct Placed {
+    run: u32,
+    offset: u32,
+    start: usize,
+    count: usize,
 }
 
 /// A batch of a worker's offsets in one run, with the generation the run must still have.
@@ -768,9 +793,12 @@ impl RunIndex {
             max_workers,
             worker_to_id: DashMap::with_hasher(FxBuildHasher),
             registry: Mutex::new(WorkerRegistry::default()),
-            worker_blocks: (0..max_workers).map(|_| AtomicUsize::new(0)).collect(),
-            total_blocks: AtomicUsize::new(0),
-            distinct_blocks: AtomicUsize::new(0),
+            worker_blocks: (0..max_workers)
+                .map(|_| CachePadded::new(AtomicUsize::new(0)))
+                .collect(),
+            distinct_blocks: (0..max_workers)
+                .map(|_| CachePadded::new(AtomicIsize::new(0)))
+                .collect(),
         }
     }
 
@@ -819,12 +847,20 @@ impl RunIndex {
 
     /// Blocks held across all workers (a block two workers hold counts twice).
     pub fn current_size(&self) -> usize {
-        self.total_blocks.load(Ordering::Relaxed)
+        self.worker_blocks
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Distinct blocks held by at least one worker.
     pub fn entry_count(&self) -> usize {
-        self.distinct_blocks.load(Ordering::Relaxed)
+        let total: isize = self
+            .distinct_blocks
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum();
+        total.max(0) as usize
     }
 
     pub fn worker_block_count(&self, worker: u32) -> usize {
@@ -838,7 +874,6 @@ impl RunIndex {
             return;
         }
         self.worker_blocks[worker as usize].fetch_add(blocks, Ordering::Relaxed);
-        self.total_blocks.fetch_add(blocks, Ordering::Relaxed);
     }
 
     fn debit(&self, worker: u32, blocks: usize) {
@@ -846,7 +881,20 @@ impl RunIndex {
             return;
         }
         self.worker_blocks[worker as usize].fetch_sub(blocks, Ordering::Relaxed);
-        self.total_blocks.fetch_sub(blocks, Ordering::Relaxed);
+    }
+
+    /// `worker` became the first holder of `blocks` distinct blocks.
+    fn distinct_add(&self, worker: u32, blocks: usize) {
+        if blocks != 0 {
+            self.distinct_blocks[worker as usize].fetch_add(blocks as isize, Ordering::Relaxed);
+        }
+    }
+
+    /// `worker` was the last holder of `blocks` distinct blocks.
+    fn distinct_sub(&self, worker: u32, blocks: usize) {
+        if blocks != 0 {
+            self.distinct_blocks[worker as usize].fetch_sub(blocks as isize, Ordering::Relaxed);
+        }
     }
 
     /// The hash at `offset` of a run, from the writer's side (the run is locked).
@@ -937,8 +985,8 @@ impl RunIndex {
     /// live run's lock and reviving a dead id never waits on a thread that holds the dead id's
     /// lock and wants the live run.
     fn recycle(&self, freed: &mut Vec<u32>) {
-        if !freed.is_empty() {
-            self.slab.free.lock().append(freed);
+        for id in freed.drain(..) {
+            self.slab.free.push(id);
         }
     }
 
@@ -948,6 +996,7 @@ impl RunIndex {
     /// says the blocks are gone.
     fn split_locked(
         &self,
+        worker: u32,
         run_id: u32,
         meta: &mut RunMeta,
         at: usize,
@@ -973,7 +1022,7 @@ impl RunIndex {
         let uncovered = suffix_words[..self.words].iter().all(|word| *word == 0);
         if uncovered && !coverage_is_empty(coverage) {
             // The excluded worker was the last holder of these blocks.
-            self.distinct_blocks.fetch_sub(len - at, Ordering::Relaxed);
+            self.distinct_sub(worker, len - at);
         }
         if uncovered && children == NONE {
             run.begin_update();
@@ -997,12 +1046,12 @@ impl RunIndex {
         for (slot, value) in self.slab.coverage(suffix_id).iter().zip(suffix_words) {
             slot.store(value, Ordering::Relaxed);
         }
-        for (_, child, _) in self.arena.table_entries(children) {
+        self.arena.for_each_child(children, |child| {
             self.slab
                 .run(child)
                 .parent
                 .store(suffix_id, Ordering::Release);
-        }
+        });
         let table = self.arena.alloc_table(MIN_TABLE_SLOTS);
         self.arena
             .table_put(table, self.hash_at(run, at), suffix_id, suffix.generation());
@@ -1075,13 +1124,42 @@ impl RunIndex {
         }
     }
 
-    /// One attempt to place a store, from the parent block (or the root) down the tree.
+    /// One attempt to place a store, from the parent block (or the root) down the tree. Map
+    /// entries for the placed blocks are written after the run locks are released: the lane map
+    /// is private, and a split meanwhile is covered by the forwarding records.
     fn store_walk(
         &self,
         worker: u32,
         blocks: &[StoredBlock],
         origin: Option<(SequenceHash, BlockRef)>,
         map: &mut RunBlockMap,
+    ) -> Walk {
+        let mut pending: Vec<Placed> = Vec::new();
+        let outcome = self.store_walk_locked(worker, blocks, origin, map, &mut pending);
+        for placed in pending {
+            for (index, stored) in blocks[placed.start..placed.start + placed.count]
+                .iter()
+                .enumerate()
+            {
+                map.insert(
+                    stored.seq_hash,
+                    BlockRef {
+                        run: placed.run,
+                        offset: placed.offset + index as u32,
+                    },
+                );
+            }
+        }
+        outcome
+    }
+
+    fn store_walk_locked(
+        &self,
+        worker: u32,
+        blocks: &[StoredBlock],
+        origin: Option<(SequenceHash, BlockRef)>,
+        map: &mut RunBlockMap,
+        pending: &mut Vec<Placed>,
     ) -> Walk {
         let (mut run_id, mut offset, mut meta) = match origin {
             None => (ROOT, 0usize, self.slab.run(ROOT).meta.lock()),
@@ -1096,11 +1174,26 @@ impl RunIndex {
         };
         let mut remaining = blocks;
         loop {
-            let next = match self.store_in_run(worker, run_id, &mut meta, offset, remaining, map) {
+            let next = match self.store_in_run(
+                worker,
+                run_id,
+                &mut meta,
+                offset,
+                remaining,
+                blocks.len() - remaining.len(),
+                pending,
+            ) {
                 InRun::Done => return Walk::Done,
                 InRun::Continue(rest) => {
                     remaining = rest;
-                    self.store_at_end(worker, run_id, &meta, remaining, map)
+                    self.store_at_end(
+                        worker,
+                        run_id,
+                        &meta,
+                        remaining,
+                        blocks.len() - remaining.len(),
+                        pending,
+                    )
                 }
                 InRun::MoveTo(child, generation) => Some((child, generation)),
             };
@@ -1121,6 +1214,7 @@ impl RunIndex {
 
     /// Match `remaining` against the run from `offset`: join or split the run as needed, record
     /// the matched blocks, and say how to go on.
+    #[expect(clippy::too_many_arguments)]
     fn store_in_run<'b>(
         &self,
         worker: u32,
@@ -1128,7 +1222,8 @@ impl RunIndex {
         meta: &mut RunMeta,
         offset: usize,
         remaining: &'b [StoredBlock],
-        map: &mut RunBlockMap,
+        block_start: usize,
+        pending: &mut Vec<Placed>,
     ) -> InRun<'b> {
         let run = self.slab.run(run_id);
         let coverage = self.slab.coverage(run_id);
@@ -1140,7 +1235,7 @@ impl RunIndex {
         if !covered && offset > 0 {
             // The parent entry pointed into a run this worker does not cover (it cannot, unless
             // the engine re-stored under a stale parent). Cut here and join the suffix instead.
-            let suffix = self.split_locked(run_id, meta, offset, None);
+            let suffix = self.split_locked(worker, run_id, meta, offset, None);
             return InRun::MoveTo(suffix, self.slab.run(suffix).generation());
         }
         let data = run.block.load(Ordering::Relaxed) + run.base.load(Ordering::Relaxed);
@@ -1154,24 +1249,21 @@ impl RunIndex {
         if matched < available && (matched < remaining.len() || !covered) {
             // A divergence inside the run (both branches stay held), or a worker that holds only
             // a prefix of it: either way the run ends here.
-            self.split_locked(run_id, meta, offset + matched, None);
+            self.split_locked(worker, run_id, meta, offset + matched, None);
         }
         if !covered {
             if coverage_is_empty(coverage) {
-                self.distinct_blocks.fetch_add(run.len(), Ordering::Relaxed);
+                self.distinct_add(worker, run.len());
             }
             set(coverage, worker);
             self.credit(worker, run.len());
         }
-        for (index, stored) in remaining[..matched].iter().enumerate() {
-            map.insert(
-                stored.seq_hash,
-                BlockRef {
-                    run: run_id,
-                    offset: (offset + index) as u32,
-                },
-            );
-        }
+        pending.push(Placed {
+            run: run_id,
+            offset: offset as u32,
+            start: block_start,
+            count: matched,
+        });
         if matched == remaining.len() {
             return InRun::Done;
         }
@@ -1187,7 +1279,8 @@ impl RunIndex {
         run_id: u32,
         meta: &RunMeta,
         remaining: &[StoredBlock],
-        map: &mut RunBlockMap,
+        block_start: usize,
+        pending: &mut Vec<Placed>,
     ) -> Option<(u32, u32)> {
         let run = self.slab.run(run_id);
         let coverage = self.slab.coverage(run_id);
@@ -1226,18 +1319,14 @@ impl RunIndex {
             self.link_child(run, head, new_id);
             (new_id, 0)
         };
-        for (index, stored) in remaining.iter().enumerate() {
-            map.insert(
-                stored.seq_hash,
-                BlockRef {
-                    run: target,
-                    offset: (first + index) as u32,
-                },
-            );
-        }
+        pending.push(Placed {
+            run: target,
+            offset: first as u32,
+            start: block_start,
+            count: remaining.len(),
+        });
         self.credit(worker, contents.len());
-        self.distinct_blocks
-            .fetch_add(contents.len(), Ordering::Relaxed);
+        self.distinct_add(worker, contents.len());
         None
     }
 
@@ -1363,11 +1452,11 @@ impl RunIndex {
         for (low, high) in ranges.into_iter().rev() {
             if high + 1 < run.len() {
                 // The tail beyond the range keeps every worker, this one included.
-                self.split_locked(run_id, meta, high + 1, None);
+                self.split_locked(worker, run_id, meta, high + 1, None);
             }
             if low > 0 {
                 // The range becomes its own run without this worker.
-                self.split_locked(run_id, meta, low, Some(worker));
+                self.split_locked(worker, run_id, meta, low, Some(worker));
             } else {
                 self.clear_holder(run_id, worker);
             }
@@ -1380,8 +1469,7 @@ impl RunIndex {
         let coverage = self.slab.coverage(run_id);
         clear(coverage, worker);
         if coverage_is_empty(coverage) {
-            self.distinct_blocks
-                .fetch_sub(self.slab.run(run_id).len(), Ordering::Relaxed);
+            self.distinct_sub(worker, self.slab.run(run_id).len());
         }
     }
 
@@ -1562,7 +1650,7 @@ impl RunIndex {
         let allocated = self.slab.allocated();
         let mut stats = RunIndexStats {
             runs_allocated: allocated,
-            runs_free: self.slab.free.lock().len(),
+            runs_free: self.slab.free.len(),
             arena_bytes: self.arena.used() as usize * size_of::<AtomicU64>(),
             arena_free_bytes: self.arena.free_words() * size_of::<AtomicU64>(),
             header_bytes: allocated * (size_of::<Run>() + self.words * size_of::<AtomicU64>()),

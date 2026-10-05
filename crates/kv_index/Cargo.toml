@@ -16,6 +16,8 @@ categories = ["data-structures", "caching"]
 [dependencies]
 bincode = "1.3"
 blake3 = { workspace = true }
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8"
 dashmap = { workspace = true }
 once_cell = "1.21.4"
 parking_lot = { workspace = true }
