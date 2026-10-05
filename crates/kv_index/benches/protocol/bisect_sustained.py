@@ -60,7 +60,10 @@ def run_trial(
     before = hostload.sample(cores, args.sample_seconds, {os.getpid()})
     started = time.time()
     with open(out / f"point{point}-trial{trial}.log", "w") as log:
-        status = subprocess.run(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
+        child = subprocess.Popen(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
+        (out / "child.pid").write_text(f"{child.pid}\n")  # the only pid a stop may target
+        returncode = child.wait()
+    (out / "child.pid").write_text("")
     record["wall_s"] = time.time() - started
     after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
     if args.lock_scope == "trial":
@@ -70,12 +73,12 @@ def run_trial(
         lock.rotate(args.point_minutes)
     else:
         lock.note(args.point_minutes)
-    record["exit_code"] = status.returncode
+    record["exit_code"] = returncode
     foreign_b, background_b = hostload.classify(before, args.threshold_pct, allow, False)
     foreign_a, background_a = hostload.classify(after, args.threshold_pct, allow, False)
     record["foreign_load"] = foreign_b + foreign_a
     record["background_load"] = background_b + background_a
-    if status.returncode != 0 or not result.exists():
+    if returncode != 0 or not result.exists():
         record.update(kept_up=False, error="trial failed")
         return record
     data = json.loads(result.read_text())
@@ -171,6 +174,7 @@ def main() -> int:
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    (out / "runner.pid").write_text(f"{os.getpid()}\n")
     lo, hi = args.lo, args.hi
     points: list[dict] = []
 

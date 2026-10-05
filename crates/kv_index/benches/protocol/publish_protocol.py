@@ -64,7 +64,10 @@ def run_trial(
     before = hostload.sample(cores, args.sample_seconds, {os.getpid()})
     started = time.time()
     with open(out / f"{role}-{index}.log", "w") as log:
-        status = subprocess.run(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
+        child = subprocess.Popen(shlex.split(command), stdout=log, stderr=subprocess.STDOUT)
+        (out / "child.pid").write_text(f"{child.pid}\n")  # the only pid a stop may target
+        returncode = child.wait()
+    (out / "child.pid").write_text("")
     record["wall_s"] = time.time() - started
     after = hostload.sample(cores, args.sample_seconds, {os.getpid()})
     if args.lock_scope == "trial":
@@ -72,9 +75,9 @@ def run_trial(
     # Everything above the record threshold is kept; the discard decision is made at summary time
     # from these rows, so a finished run can be re-summarised under other thresholds.
     record["load_rows"] = [row for row in before + after if row["cpu_pct"] >= args.record_pct]
-    record["exit_code"] = status.returncode
-    if status.returncode != 0 or not result.exists():
-        record["discarded"] = f"trial failed (exit {status.returncode})"
+    record["exit_code"] = returncode
+    if returncode != 0 or not result.exists():
+        record["discarded"] = f"trial failed (exit {returncode})"
     else:
         data = json.loads(result.read_text())
         offered = data["offered_block_ops_per_sec"]
@@ -305,6 +308,7 @@ def main() -> int:
     args = parser.parse_args()
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    (out / "runner.pid").write_text(f"{os.getpid()}\n")
     lock = measurelock.MeasureLock(
         args.lock,
         args.owner_file or re.sub(r"\.lock$", "", args.lock) + ".owner",
