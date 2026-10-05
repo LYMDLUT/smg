@@ -321,7 +321,14 @@ pub fn encode_batch(batch: &common::KvEventBatch, dp_rank: i32, wire: Wire) -> V
         Wire::Vllm => Value::from(dp_rank),
         Wire::Sglang => Value::Nil,
     };
-    let value = Value::Array(vec![Value::F64(unix_seconds()), Value::Array(events), rank]);
+    // The batch's own creation time, as the engines' `ts`; a batch without one
+    // (the startup clear) is stamped now.
+    let ts = if batch.timestamp > 0.0 {
+        batch.timestamp
+    } else {
+        unix_seconds()
+    };
+    let value = Value::Array(vec![Value::F64(ts), Value::Array(events), rank]);
     let mut buf = Vec::new();
     // Writing into a Vec cannot fail.
     let _ = rmpv::encode::write_value(&mut buf, &value);
@@ -554,6 +561,18 @@ mod tests {
         };
         assert_eq!(batch.len(), 3, "[ts, events, data_parallel_rank]");
         assert!(batch[0].as_f64().is_some_and(|ts| ts > 1.7e9));
+        let mut stamped = sample_batch();
+        stamped.timestamp = 1_700_000_000.25;
+        let again = encode_batch(&stamped, 3, Wire::Vllm);
+        let Value::Array(again) = rmpv::decode::read_value(&mut again.as_slice()).expect("msgpack")
+        else {
+            panic!("array");
+        };
+        assert_eq!(
+            again[0].as_f64(),
+            Some(1_700_000_000.25),
+            "the batch's creation time is the ts"
+        );
         assert_eq!(batch[2].as_i64(), Some(3));
         let events = batch[1].as_array().expect("events");
         assert_eq!(events.len(), 3);

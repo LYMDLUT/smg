@@ -368,6 +368,14 @@ fn unix_ms(at: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
+/// Seconds since the Unix epoch, as the engines stamp their event batches.
+pub fn unix_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 /// A cloneable handle to one simulated engine.
 #[derive(Clone)]
 pub struct Engine {
@@ -1388,7 +1396,9 @@ impl SchedulerState {
             self.kv_seq += 1;
             Some(common::KvEventBatch {
                 sequence_number: self.kv_seq,
-                timestamp: 0.0,
+                // Creation time, as the engines stamp their batches: a batch the
+                // delay hook holds back keeps it, so the delay shows up as lag.
+                timestamp: unix_seconds(),
                 events: kv,
                 dp_rank: Some(0),
             })
@@ -2041,6 +2051,20 @@ mod tests {
     }
 
     #[test]
+    fn batches_are_stamped_with_their_creation_time() {
+        let p = EngineParams::default();
+        let mut st = SchedulerState::new();
+        let (r, _rx) = req("x", vec![1; 32], 1);
+        st.enqueue(r, &p);
+        let batch = st.step(&p).batch.expect("a batch");
+        let age = unix_seconds() - batch.timestamp;
+        assert!(
+            (0.0..5.0).contains(&age),
+            "fresh wall-clock stamp: {age} s old"
+        );
+    }
+
+    #[test]
     fn prompt_blocks_emit_one_chained_stored_event() {
         let p = EngineParams {
             block_size: 4,
@@ -2299,13 +2323,18 @@ mod tests {
             .expect("stream open");
         assert!(matches!(token, GenEvent::Token { .. }));
         let token_at = Instant::now();
-        next_batch(&mut live_stream, Duration::from_secs(5))
+        let batch = next_batch(&mut live_stream, Duration::from_secs(5))
             .await
             .expect("the batch");
         let lag = token_at.elapsed();
         assert!(
             lag >= Duration::from_millis(200),
             "events trail the pass by the delay: {lag:?}"
+        );
+        let age = unix_seconds() - batch.timestamp;
+        assert!(
+            (0.2..30.0).contains(&age),
+            "the batch keeps its creation time, so the delay is visible as lag: {age} s"
         );
     }
 
