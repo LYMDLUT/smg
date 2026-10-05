@@ -7,6 +7,9 @@
 //!
 //! - [`catalog::DEFAULT_POLICY`] reproduces the pre-policy cache-aware decision exactly (an affinity
 //!   group that the host resolves with its pressure gate and expected-wait selector).
+//! - `dynamo-default`, the three llm-d profiles (`llm-d-optimized-baseline`,
+//!   `llm-d-precise-prefix`, `llm-d-sticky-until-saturated`), `ramjet` and `dualmap` are ports
+//!   of published policies so routing quality can be compared under one host and one mock engine.
 //!
 //! The cost of the stage itself is measured by `benches/policy_selection.rs`.
 
@@ -16,6 +19,13 @@ pub mod policy;
 pub mod softmax;
 
 mod default;
+mod dualmap;
+mod dynamo;
+mod llm_d;
+mod ramjet;
+
+#[cfg(test)]
+mod sim_tests;
 
 pub use catalog::{build, default_policy, CatalogError, DEFAULT_POLICY, POLICY_NAMES};
 pub use inputs::{CandidateInputs, RequestInputs};
