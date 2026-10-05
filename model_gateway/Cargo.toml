@@ -250,6 +250,11 @@ name = "scheduler_load"
 harness = false
 path = "benches/scheduler_load.rs"
 
+[[bench]]
+name = "policy_selection"
+harness = false
+path = "benches/policy_selection.rs"
+
 [lints]
 workspace = true
 
