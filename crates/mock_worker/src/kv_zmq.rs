@@ -85,13 +85,22 @@ pub async fn run(
     mut publisher: PubSocket,
     mut replay: Option<RouterSocket>,
 ) {
-    let mut events = engine.subscribe_kv(0);
+    let mut events = engine.subscribe_published();
     let mut state = Publisher::new(cfg.topic.into_bytes(), cfg.buffer_steps, cfg.dp_rank);
+    let mut generation = engine.fault_status().generation;
     loop {
         tokio::select! {
-            batch = events.next() => {
-                let Some(Ok(batch)) = batch else { break };
-                let message = state.publish(&batch);
+            item = events.next() => {
+                let Some(item) = item else { break };
+                if item.generation != generation {
+                    // The engine's publisher restarted: so does this one.
+                    generation = item.generation;
+                    state.restart();
+                }
+                let message = state.publish(&item.batch);
+                if item.dropped {
+                    continue; // lost on the wire; replay still has it
+                }
                 if let Err(e) = publisher.send(message).await {
                     tracing::warn!("kv-events publish failed: {e}");
                 }
@@ -664,6 +673,36 @@ mod tests {
             replayed.contains(&live_seq),
             "the live frame is in the buffer too"
         );
+        // A publisher restart starts the ZMQ sequence over as well.
+        engine.restart_publisher().await;
+        let mut restarted = None;
+        for i in 200..400 {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GenEvent>();
+            receivers.push(rx);
+            engine.submit(NewRequest {
+                request_id: format!("r{i}"),
+                prompt_token_ids: (0..64).map(|t| t + i * 64).collect(),
+                max_new: 1,
+                events: tx,
+            });
+            if let Ok(Ok(message)) = timeout(Duration::from_millis(50), sub.recv()).await {
+                let seq = u64::from_be_bytes(
+                    message
+                        .get(1)
+                        .expect("seq")
+                        .as_ref()
+                        .try_into()
+                        .expect("8 bytes"),
+                );
+                // Sequence 0 was consumed live (or missed) before the restart;
+                // seeing it again means the publisher started over.
+                if seq == 0 {
+                    restarted = Some(seq);
+                    break;
+                }
+            }
+        }
+        assert_eq!(restarted, Some(0), "the sequence restarted from 0");
         drop(receivers);
     }
 }

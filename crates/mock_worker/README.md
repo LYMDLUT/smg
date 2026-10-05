@@ -159,16 +159,18 @@ but cannot drive event-driven `cache_aware`, which requires token ids.)
 
 ### Fault hooks (recovery drills)
 
-All under the admin API; `{worker}` is a worker name (`grpc:<port>`) or `all`.
-A hook applies to every KV-event transport of the worker (gRPC
-`SubscribeKvEvents` and the ZMQ publisher alike) and reports the state it set.
+All under the admin API; `{worker}` is a worker name (`grpc:<port>`,
+`zmq:<index>`) or `all`. A hook applies to every KV-event transport of the
+worker (gRPC `SubscribeKvEvents` and the ZMQ publisher alike) and answers with
+the worker's hook state (`drop_pending`, `dropped_total`, `delay_ms`,
+`paused`, `generation`, `restarts`).
 
 | Hook | Effect |
 |------|--------|
 | `POST /admin/fault/{worker}/drop?batches=N` | the next N event batches are not published (lost on the wire; they stay in the replay buffer, so a gap replay recovers them) |
 | `POST /admin/fault/{worker}/delay?ms=D` | every batch is published D ms after its pass ends (0 clears) |
-| `POST /admin/fault/{worker}/restart-publisher` | the publisher restarts: sequence numbers start over from the first value, the replay buffer is emptied, the cache is kept (no `AllBlocksCleared`) |
-| `POST /admin/fault/{worker}/pause` | the engine freezes: no passes, no tokens, no events; requests queue; health and `GetLoads` keep answering |
+| `POST /admin/fault/{worker}/restart-publisher` | the publisher restarts: gRPC sequence numbers start over at 1 and the ZMQ sequence at 0, the replay buffers are emptied, the cache is kept (no `AllBlocksCleared`); `generation` increments |
+| `POST /admin/fault/{worker}/pause` | the engine freezes after its current pass: no passes, no tokens, no events; requests queue (and count as waiting); health and `GetLoads` keep answering |
 | `POST /admin/fault/{worker}/resume` | the engine runs again |
 | `GET /admin/fault/{worker}` | the hooks' current state (pending drops, delay, restarts, paused, generation) |
 | `POST /admin/reset/{worker}` | (already there) clear the cache and publish `AllBlocksCleared` |

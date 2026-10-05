@@ -24,13 +24,16 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     pin::Pin,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, RwLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::common_proto as common;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use tonic::Status;
 
 // ---------------------------------------------------------------------------
@@ -225,15 +228,67 @@ pub struct LoadSnapshot {
 /// Shared state readable from the transport handlers while the actor runs.
 struct EngineShared {
     snapshot: RwLock<LoadSnapshot>,
-    kv_tx: broadcast::Sender<common::KvEventBatch>,
+    /// Every published batch, as the publisher task releases it.
+    kv_tx: broadcast::Sender<Published>,
+    /// Hands batches from the actor to the publisher task with their release time.
+    publish_tx: mpsc::UnboundedSender<(Published, Instant)>,
     kv_replay: Mutex<VecDeque<common::KvEventBatch>>,
     prefix_cache: bool,
+    block_size: u32,
     /// Worker name for records and the admin API (`grpc:<port>` / `http:<port>`).
     name: String,
     /// Mirror of the actor's cache block keys, so sibling engines and the
     /// admin API can read it without entering the actor: the fleet oracle
     /// ("which worker holds the most of this prompt") is a read over these.
     cache_mirror: RwLock<HashSet<u64>>,
+    /// Fault hooks for the recovery drills (admin API).
+    faults: Faults,
+    /// Wakes a paused actor.
+    resume: Notify,
+}
+
+/// Fault hooks: what the recovery drills switch on through the admin API.
+#[derive(Default)]
+struct Faults {
+    /// Event batches still to lose on the wire.
+    drop_batches: AtomicU32,
+    dropped_total: AtomicU64,
+    /// Publishing delay after a pass ends, in ms.
+    delay_ms: AtomicU64,
+    /// The engine is frozen: no passes until resumed.
+    paused: AtomicBool,
+    /// Publisher generation; a restart bumps it.
+    generation: AtomicU64,
+    restarts: AtomicU64,
+}
+
+/// The hooks' current state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaultStatus {
+    pub drop_pending: u32,
+    pub dropped_total: u64,
+    pub delay_ms: u64,
+    pub paused: bool,
+    pub generation: u64,
+    pub restarts: u64,
+}
+
+/// What the engine itself would serve from cache for a prompt right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheTruth {
+    pub cached_tokens: u32,
+    pub cached_blocks: u32,
+    pub block_size: u32,
+}
+
+/// A batch as the publisher releases it to every transport.
+#[derive(Clone, Debug)]
+pub struct Published {
+    pub batch: common::KvEventBatch,
+    /// Lost on the wire by a drop hook: not delivered live, kept for replay.
+    pub dropped: bool,
+    /// The publisher generation the batch belongs to.
+    pub generation: u64,
 }
 
 /// Messages into the engine actor.
@@ -242,6 +297,9 @@ enum EngineMsg {
     /// Drop every cached block and announce `AllBlocksCleared` (an engine
     /// restart, as far as the gateway's index is concerned).
     Reset,
+    /// The publisher restarts: sequence numbers start over, the replay
+    /// buffer is emptied, the cache is kept. Acknowledged once applied.
+    RestartPublisher(tokio::sync::oneshot::Sender<()>),
 }
 
 /// One admitted request as seen by the engine: the ground truth for routing
@@ -337,14 +395,22 @@ impl Engine {
     pub fn spawn_named(params: EngineParams, name: String, register: bool) -> Engine {
         let (tx, rx) = mpsc::unbounded_channel();
         let (kv_tx, _) = broadcast::channel(params.kv_broadcast_capacity.max(1));
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(EngineShared {
             snapshot: RwLock::new(LoadSnapshot::idle(&params)),
-            kv_tx,
+            kv_tx: kv_tx.clone(),
+            publish_tx,
             kv_replay: Mutex::new(VecDeque::new()),
             prefix_cache: params.prefix_cache,
+            block_size: params.block_size,
             name,
             cache_mirror: RwLock::new(HashSet::new()),
+            faults: Faults::default(),
+            resume: Notify::new(),
         });
+        // The publisher task releases batches in order at their release time
+        // (the delay hook) and ends with the actor, which owns its sender.
+        tokio::spawn(publish(publish_rx, kv_tx));
         tokio::spawn(run(params, rx, shared.clone()));
         let engine = Engine { tx, shared };
         if register {
@@ -364,6 +430,86 @@ impl Engine {
     /// Clear the prefix cache and announce it (`AllBlocksCleared`).
     pub fn reset(&self) {
         let _ = self.tx.send(EngineMsg::Reset);
+    }
+
+    /// Lose the next `batches` event batches on the wire (they stay in the
+    /// replay buffer).
+    pub fn fault_drop(&self, batches: u32) {
+        self.shared
+            .faults
+            .drop_batches
+            .store(batches, Ordering::Relaxed);
+    }
+
+    /// Publish every batch `ms` milliseconds after its pass ends (0 clears).
+    pub fn fault_delay_ms(&self, ms: u64) {
+        self.shared.faults.delay_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Restart the publisher: sequence numbers start over, the replay buffer
+    /// is emptied, the cache is kept. Returns once the actor has applied it
+    /// (after its current pass, at most), so a status read right after sees
+    /// the new generation.
+    pub async fn restart_publisher(&self) {
+        let (ack, applied) = tokio::sync::oneshot::channel();
+        if self.tx.send(EngineMsg::RestartPublisher(ack)).is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), applied).await;
+        }
+    }
+
+    /// Freeze the engine: no passes, no tokens, no events; requests queue.
+    pub fn pause(&self) {
+        self.shared.faults.paused.store(true, Ordering::Relaxed);
+    }
+
+    /// Run again after a pause.
+    pub fn resume(&self) {
+        self.shared.faults.paused.store(false, Ordering::Relaxed);
+        self.shared.resume.notify_one();
+    }
+
+    pub fn fault_status(&self) -> FaultStatus {
+        let f = &self.shared.faults;
+        FaultStatus {
+            drop_pending: f.drop_batches.load(Ordering::Relaxed),
+            dropped_total: f.dropped_total.load(Ordering::Relaxed),
+            delay_ms: f.delay_ms.load(Ordering::Relaxed),
+            paused: f.paused.load(Ordering::Relaxed),
+            generation: f.generation.load(Ordering::Relaxed),
+            restarts: f.restarts.load(Ordering::Relaxed),
+        }
+    }
+
+    /// What this engine would serve from cache for `token_ids` right now:
+    /// its own prefix match over the mirror, last block recomputed, as
+    /// admission would compute it.
+    pub fn cached_tokens_for(&self, token_ids: &[u32]) -> CacheTruth {
+        let bs = self.shared.block_size.max(1);
+        let keys = prompt_blocks(token_ids, bs as usize).0;
+        let mut matched = self.match_prefix(&keys) as u32;
+        if matched > 0 && matched * bs >= token_ids.len() as u32 {
+            matched -= 1;
+        }
+        CacheTruth {
+            cached_tokens: matched * bs,
+            cached_blocks: matched,
+            block_size: bs,
+        }
+    }
+
+    /// Every batch the publisher releases from now on, with its drop mark and
+    /// generation (for transports that keep their own replay buffer).
+    pub fn subscribe_published(&self) -> Pin<Box<dyn Stream<Item = Published> + Send>> {
+        let live_rx = self.shared.kv_tx.subscribe();
+        Box::pin(stream::unfold(live_rx, |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(item) => return Some((item, rx)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }))
     }
 
     /// This engine's name (`grpc:<port>` / `http:<port>`; empty when unnamed).
@@ -432,7 +578,10 @@ impl Engine {
         let live_stream = stream::unfold(live_rx, |mut rx| async move {
             loop {
                 match rx.recv().await {
-                    Ok(batch) => return Some((Ok(batch), rx)),
+                    // A batch lost on the wire (drop hook) never reaches a live
+                    // subscriber; it waits in the replay buffer.
+                    Ok(item) if item.dropped => continue,
+                    Ok(item) => return Some((Ok(item.batch), rx)),
                     // A lagged slow consumer leaves a gap; the gateway detects it
                     // and reconnects, replaying from the buffer. Skip and continue.
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -467,6 +616,18 @@ async fn run(
         // Drain any other already-queued submissions without blocking.
         while let Ok(msg) = rx.try_recv() {
             handle_msg(&mut state, &shared, &params, msg);
+        }
+        // A paused engine takes messages (requests queue, scored at arrival)
+        // but runs no pass until resumed.
+        while shared.faults.paused.load(Ordering::Relaxed) {
+            *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) = state.snapshot(&params);
+            tokio::select! {
+                _ = shared.resume.notified() => {}
+                msg = rx.recv() => match msg {
+                    Some(msg) => handle_msg(&mut state, &shared, &params, msg),
+                    None => return,
+                },
+            }
         }
 
         let step = state.step(&params);
@@ -513,14 +674,41 @@ async fn run(
                     buf.pop_front();
                 }
             }
-            let _ = shared.kv_tx.send(batch);
+            let faults = &shared.faults;
+            let dropped = faults
+                .drop_batches
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok();
+            if dropped {
+                faults.dropped_total.fetch_add(1, Ordering::Relaxed);
+            }
+            let release_at =
+                Instant::now() + Duration::from_millis(faults.delay_ms.load(Ordering::Relaxed));
+            let item = Published {
+                batch,
+                dropped,
+                generation: faults.generation.load(Ordering::Relaxed),
+            };
+            let _ = shared.publish_tx.send((item, release_at));
         }
         *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) = step.snapshot;
     }
 }
 
+/// Release batches to every transport in order, each at its release time.
+async fn publish(
+    mut rx: mpsc::UnboundedReceiver<(Published, Instant)>,
+    kv_tx: broadcast::Sender<Published>,
+) {
+    while let Some((item, release_at)) = rx.recv().await {
+        tokio::time::sleep_until(release_at.into()).await;
+        let _ = kv_tx.send(item);
+    }
+}
+
 /// Apply one actor message: enqueue a request (scoring the fleet oracle at
-/// arrival, before this engine's own cache changes) or reset the cache.
+/// arrival, before this engine's own cache changes), reset the cache, or
+/// restart the publisher.
 fn handle_msg(
     state: &mut SchedulerState,
     shared: &Arc<EngineShared>,
@@ -551,6 +739,17 @@ fn handle_msg(
             state.enqueue_with_oracle(req, params, oracle_tokens);
         }
         EngineMsg::Reset => state.reset(),
+        EngineMsg::RestartPublisher(ack) => {
+            state.restart_publisher();
+            shared
+                .kv_replay
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            shared.faults.generation.fetch_add(1, Ordering::Relaxed);
+            shared.faults.restarts.fetch_add(1, Ordering::Relaxed);
+            let _ = ack.send(());
+        }
     }
 }
 
@@ -818,6 +1017,11 @@ impl SchedulerState {
     /// Ask the next pass to clear the cache and announce `AllBlocksCleared`.
     pub(crate) fn reset(&mut self) {
         self.reset_pending = true;
+    }
+
+    /// The publisher restarted: batch sequence numbers start over.
+    pub(crate) fn restart_publisher(&mut self) {
+        self.kv_seq = 0;
     }
 
     fn is_idle(&self) -> bool {
@@ -1970,6 +2174,161 @@ mod tests {
             st.pool.free_lru.len() as u64,
             "all blocks idle"
         );
+    }
+
+    /// A live engine for the hook tests, with one request helper.
+    fn live() -> Engine {
+        Engine::spawn(EngineParams::default())
+    }
+
+    fn submit(engine: &Engine, id: &str, prompt: Vec<u32>) -> mpsc::UnboundedReceiver<GenEvent> {
+        let (r, rx) = req(id, prompt, 1);
+        engine.submit(r);
+        rx
+    }
+
+    async fn next_batch(
+        stream: &mut KvEventStream,
+        within: Duration,
+    ) -> Option<common::KvEventBatch> {
+        tokio::time::timeout(within, stream.next())
+            .await
+            .ok()
+            .flatten()
+            .and_then(Result::ok)
+    }
+
+    #[tokio::test]
+    async fn drop_hook_loses_live_batches_but_keeps_them_for_replay() {
+        let engine = live();
+        let mut live_stream = engine.subscribe_kv(0);
+        engine.fault_drop(1);
+        let mut rx1 = submit(&engine, "a", vec![1; 64]);
+        // Let the first request's pass (and its batch) complete before the
+        // second arrives, so the two batches are distinct.
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx1.recv())
+            .await
+            .expect("events")
+        {
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        let _rx2 = submit(&engine, "b", vec![2; 64]);
+        let first_live = next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("a live batch");
+        assert_eq!(
+            first_live.sequence_number, 2,
+            "the first batch was lost on the wire, the second arrives"
+        );
+        let mut replay = engine.subscribe_kv(0);
+        let replayed = next_batch(&mut replay, Duration::from_secs(1))
+            .await
+            .expect("replay");
+        assert_eq!(
+            replayed.sequence_number, 1,
+            "the lost batch is still replayable"
+        );
+        let status = engine.fault_status();
+        assert_eq!((status.drop_pending, status.dropped_total), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn pause_freezes_the_engine_until_resume() {
+        let engine = live();
+        engine.pause();
+        let mut rx = submit(&engine, "a", vec![3; 32]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "no token while paused"
+        );
+        assert!(engine.fault_status().paused);
+        assert_eq!(engine.load().num_waiting_reqs, 1, "the request queued");
+        engine.resume();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a token after resume")
+            .expect("stream open");
+        assert!(matches!(event, GenEvent::Token { .. }));
+        assert!(!engine.fault_status().paused);
+    }
+
+    #[tokio::test]
+    async fn restart_publisher_starts_the_sequence_over_and_empties_replay() {
+        let engine = live();
+        let mut live_stream = engine.subscribe_kv(0);
+        let _rx1 = submit(&engine, "a", vec![4; 64]);
+        let before = next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("a batch");
+        assert_eq!(before.sequence_number, 1);
+        engine.restart_publisher().await;
+        let _rx2 = submit(&engine, "b", vec![5; 64]);
+        let after = next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("a batch after the restart");
+        assert_eq!(after.sequence_number, 1, "sequence numbers start over");
+        let status = engine.fault_status();
+        assert_eq!((status.generation, status.restarts), (1, 1));
+        let mut replay = engine.subscribe_kv(0);
+        let replayed = next_batch(&mut replay, Duration::from_secs(1))
+            .await
+            .expect("replay");
+        assert_eq!(
+            replayed.sequence_number, 1,
+            "only the new generation is replayable"
+        );
+    }
+
+    #[tokio::test]
+    async fn delay_hook_defers_publishing_but_not_tokens() {
+        let engine = live();
+        let mut live_stream = engine.subscribe_kv(0);
+        engine.fault_delay_ms(300);
+        let mut rx = submit(&engine, "a", vec![6; 64]);
+        let token = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a token")
+            .expect("stream open");
+        assert!(matches!(token, GenEvent::Token { .. }));
+        let token_at = Instant::now();
+        next_batch(&mut live_stream, Duration::from_secs(5))
+            .await
+            .expect("the batch");
+        let lag = token_at.elapsed();
+        assert!(
+            lag >= Duration::from_millis(200),
+            "events trail the pass by the delay: {lag:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_tokens_for_reports_the_engine_truth() {
+        let engine = live();
+        let prompt: Vec<u32> = (0..64).collect();
+        assert_eq!(engine.cached_tokens_for(&prompt).cached_tokens, 0);
+        let mut rx = submit(&engine, "a", prompt.clone());
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("events")
+        {
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        // The mirror is updated at pass end, just before the token is sent.
+        let truth = engine.cached_tokens_for(&prompt);
+        assert_eq!(truth.block_size, 16);
+        assert_eq!(
+            (truth.cached_blocks, truth.cached_tokens),
+            (3, 48),
+            "all four blocks are cached; the last one is recomputed"
+        );
+        let longer: Vec<u32> = (0..80).collect();
+        assert_eq!(engine.cached_tokens_for(&longer).cached_tokens, 64);
     }
 
     #[test]
