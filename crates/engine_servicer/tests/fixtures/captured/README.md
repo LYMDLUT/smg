@@ -72,3 +72,28 @@ its pages.
 Engine truth from the workload: `shared` = `[absent, 512 x7]` (SGLang omits `prompt_tokens_details` when nothing
 was cached), `repeat` = `[624 x8]`, `burst` = all absent (prompt KV is inserted only after prefill, so concurrent
 sharers miss), `evict` = all absent, `recheck` = `[absent, 512 x7]`, `after_reset` = `[absent, 512]`.
+
+## SGLang 0.5.21, data-parallel size 2 (`sglang-dp2/`, host venv, GPUs 2 and 3)
+
+`launch-command.txt`: `--dp-size 2`, KV events `endpoint tcp://*:5567` (rank r publishes on 5567+r, replay on
+5577+r), captured as two streams (`rank0-*`, `rank1-*`) with the same scripted workload (40 unique prompts in
+the eviction phase, which this configuration's larger pools did not evict). Each rank: its own sequence counter
+from 0 (the startup `AllBlocksCleared` is batch 0, only in the replay buffer; live 1..28, no gaps), envelope
+`[ts, events, attn_dp_rank]` with `attn_dp_rank` 0 on the first stream and 1 on the second, 29 `BlockStored`,
+2 `AllBlocksCleared` (startup and `/flush_cache`), no removals. Same per-event keys as the single-rank capture.
+
+## SGLang 0.5.21, HiCache write-through (`sglang-hicache/`, host venv, GPU 1)
+
+`launch-command.txt`: `--enable-hierarchical-cache --hicache-ratio 8 --hicache-write-policy write_through
+--max-total-tokens 4096` (a 4 k-token device pool under a 32 k-token pinned-host tier). Workload: `shared`
+(8 sharers of a 512-token prefix), `repeat`, `evict` (12 unique 1024-token prompts, 2 concurrent), `recheck`
+(the shared prompts again), `reset` (`/flush_cache`). Stream: 43 batches, seq 1..42 without gaps, 53 `BlockStored`
+(31 `medium: "GPU"`, 22 `"CPU_PINNED"`), 11 `BlockRemoved` (all GPU), 2 `AllBlocksCleared`. `sequence.txt`
+lists per-hash transitions: the 96 hashes of the shared prefix and its first suffixes show exactly
+`Store GPU -> Store CPU_PINNED -> Remove GPU -> Store GPU` (write-through backup, demotion under the eviction
+phase with the host copy kept, load-back when the prefix was requested again; the recheck requests reported
+`cached_tokens` 624, counting the host hit), followed by a fresh `Store GPU -> Store CPU_PINNED` after the flush.
+A first run with `--hicache-ratio 2` (`run1` in the harness directory, not checked in) evicted the host copy too
+(`... -> Remove GPU -> Remove CPU_PINNED`), so the ratio matters for reproducing the load-back.
+The plain `*-hicache-capture.jsonl` (43 batches) is checked in uncompressed as well, as the fixture for the tier
+transitions.

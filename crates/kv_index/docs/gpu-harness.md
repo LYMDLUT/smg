@@ -136,6 +136,13 @@ servicer (f4dc134b wheel) with `SMG_KV_EVENT_HASH_CHECK=vllm-sha256-cbor`; the w
 `PYTHONHASHSEED=12345` logged `hash_checked 964, hash_mismatch 964`, the other three `962 / 0`, nothing dropped,
 and the workload through the loop-head gateway completed 256/256 with 240 prefix hits.
 
+SGLang per-rank relay and HiCache fixtures (`crates/engine_servicer/tests/fixtures/captured/sglang-dp2`,
+`sglang-hicache`): `--dp-size 2` publishes one stream per rank (ports 5567+r, replay 5577+r, each sequence from 0,
+`attn_dp_rank` 0/1 in the envelope); HiCache write-through with `--hicache-ratio 8` over a 4 k-token device pool
+gives the `Store GPU -> Store CPU_PINNED -> Remove GPU -> Store GPU` cycle for the shared prefix (96 hashes),
+while `--hicache-ratio 2` evicts the host copy as well. The replay-gap drill (engine restart mid-run) was left for
+later as instructed.
+
 ### Container-free path (used for everything after the podman wedge)
 
 `~/smg-perf/gpu/venv-vllm`: `pip install vllm==0.31.0 ninja` plus `crates/grpc_client/python`, `grpc_servicer/` and the
