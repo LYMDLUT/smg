@@ -476,9 +476,19 @@ impl IndexEntry {
         }
     }
 
+    /// Record an access at coarse time `now`.
+    ///
+    /// The stamp has whole-second resolution, so a store is needed at most
+    /// once per second per entry: every other call finds the value already
+    /// equal and performs a plain load. That keeps the query path free of
+    /// shared-memory writes in steady state (a hot entry probed a million
+    /// times a second is written once), while prune keeps the exact "last
+    /// store or read" semantics it had when every probe wrote.
     #[inline]
     fn touch(&self, now: u32) {
-        self.last_touch.store(now, Ordering::Relaxed);
+        if self.last_touch.load(Ordering::Relaxed) != now {
+            self.last_touch.store(now, Ordering::Relaxed);
+        }
     }
 }
 
