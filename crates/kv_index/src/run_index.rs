@@ -324,6 +324,59 @@ impl WordArena {
         None
     }
 
+    /// Claim a slot for `key` without a lock: the head word is taken by compare-and-swap, then the
+    /// run word is published. A reader stops at an empty run word, so an entry in flight is simply
+    /// not there yet for it; a writer that meets the same head in flight waits for it.
+    fn table_claim(&self, table: u32, key: u64, child: u32, generation: u32) -> Claim {
+        if table == NONE {
+            return Claim::Full;
+        }
+        let slots = self.table_slots(table);
+        if slots == 0 || !slots.is_power_of_two() {
+            return Claim::Full;
+        }
+        let words = self.words(table + 2, 2 * slots);
+        let mask = slots - 1;
+        let mut index = key as usize & mask;
+        for _ in 0..slots {
+            let (Some(head_word), Some(run_word)) =
+                (words.get(2 * index), words.get(2 * index + 1))
+            else {
+                return Claim::Full;
+            };
+            let mut head = head_word.load(Ordering::Acquire);
+            if head == 0 {
+                match head_word.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        run_word.store(
+                            u64::from(child) | (u64::from(generation) << 32),
+                            Ordering::Release,
+                        );
+                        self.word(table).fetch_add(1 << 32, Ordering::Relaxed);
+                        self.word(table + 1).fetch_add(1, Ordering::Relaxed);
+                        return Claim::Inserted;
+                    }
+                    Err(taken) => head = taken,
+                }
+            }
+            if head == key {
+                loop {
+                    let run = run_word.load(Ordering::Acquire);
+                    if run == 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    if run == TOMB {
+                        break;
+                    }
+                    return Claim::Exists(run as u32, (run >> 32) as u32);
+                }
+            }
+            index = (index + 1) & mask;
+        }
+        Claim::Full
+    }
+
     /// Live `(head, run, generation)` entries of a table.
     fn table_entries(&self, table: u32) -> Vec<(u64, u32, u32)> {
         if table == NONE {
@@ -396,16 +449,6 @@ impl WordArena {
             }
         }
         self.word(table + 1).load(Ordering::Relaxed)
-    }
-
-    /// Whether another entry fits under 3/4 load (tombstones count).
-    fn table_has_room(&self, table: u32) -> bool {
-        if table == NONE {
-            return false;
-        }
-        let header = self.word(table).load(Ordering::Relaxed);
-        let (slots, used) = (header as u32 as usize, (header >> 32) as usize);
-        (used + 1) * 4 <= slots * 3
     }
 
     /// A new table holding the live entries of `table` plus room for one more.
@@ -717,6 +760,9 @@ struct Run {
     /// arena. A worker is either in the coverage bitset (whole run) or here, never both.
     partials: AtomicU32,
     forwards: AtomicU32,
+    /// Lock-free child inserts in progress on this run; a writer that replaces the child table
+    /// or hands it to a suffix waits for this to drain inside its version step.
+    inflight: AtomicU32,
     meta: Mutex<RunMeta>,
 }
 
@@ -732,6 +778,7 @@ impl Run {
             children: AtomicU32::new(NONE),
             partials: AtomicU32::new(NONE),
             forwards: AtomicU32::new(NONE),
+            inflight: AtomicU32::new(0),
             meta: Mutex::new(RunMeta::default()),
         }
     }
@@ -785,7 +832,17 @@ impl Run {
     }
 
     fn begin_update(&self) {
-        self.version.fetch_add(1, Ordering::Acquire);
+        // SeqCst against the inserters' `inflight` increment: either they see the odd version and
+        // back off, or the writer sees their count and waits (see `wait_inflight`).
+        self.version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Wait for lock-free child inserts to finish; called inside a version step, so no new one
+    /// starts meanwhile.
+    fn wait_inflight(&self) {
+        while self.inflight.load(Ordering::SeqCst) != 0 {
+            std::hint::spin_loop();
+        }
     }
 
     fn end_update(&self) {
@@ -974,6 +1031,8 @@ pub struct LaneStats {
     pub splits_divergence: u64,
     pub splits_hole: u64,
     pub splits_stale_parent: u64,
+    /// Children linked without the parent's lock.
+    pub inserts: u64,
 }
 
 #[cfg(feature = "lane-stats")]
@@ -986,6 +1045,7 @@ struct LaneCounters {
     splits_divergence: CachePadded<AtomicU64>,
     splits_hole: CachePadded<AtomicU64>,
     splits_stale_parent: CachePadded<AtomicU64>,
+    inserts: CachePadded<AtomicU64>,
 }
 
 /// Worker slots: a slot is in use from `intern_worker` until `remove_worker`, after which it is
@@ -1041,8 +1101,19 @@ enum Plan {
     Skip(usize),
     /// Continue in the child `(id, generation)` from its first block.
     Descend(u32, u32),
+    /// Open a new child for the blocks in hand, without the run's lock if the table has room.
+    Insert,
     /// The run must change: take its lock and re-read it.
     Lock,
+}
+
+/// Outcome of claiming a child-table slot.
+enum Claim {
+    Inserted,
+    /// Another writer already linked a child with this head.
+    Exists(u32, u32),
+    /// No free slot (or no table): grow under the lock.
+    Full,
 }
 
 /// What [`RunIndex::store_in_run`] found.
@@ -1134,6 +1205,7 @@ impl RunIndex {
                 splits_divergence: self.counters.splits_divergence.load(Ordering::Relaxed),
                 splits_hole: self.counters.splits_hole.load(Ordering::Relaxed),
                 splits_stale_parent: self.counters.splits_stale_parent.load(Ordering::Relaxed),
+                inserts: self.counters.inserts.load(Ordering::Relaxed),
             }
         }
         #[cfg(not(feature = "lane-stats"))]
@@ -1334,28 +1406,35 @@ impl RunIndex {
         }
     }
 
-    /// Add `child` to the run's table (the run is locked), growing the table when it is 3/4
-    /// full; the old table is freed after the new one is published.
-    fn link_child(&self, run: &Run, head: u64, child: u32) {
-        let table = run.children.load(Ordering::Relaxed);
+    /// Add `child` to the run's table (the run is locked): claims a slot like a lock-free
+    /// inserter, growing the table under a version step that first drains inserters in flight.
+    /// `Some` when another writer linked a child with this head meanwhile: the caller descends
+    /// into that one instead.
+    fn link_child(&self, run: &Run, head: u64, child: u32) -> Option<(u32, u32)> {
         let generation = self.slab.run(child).generation();
-        if self.arena.table_has_room(table) {
-            self.arena.table_put(table, head, child, generation);
-            return;
+        loop {
+            let table = run.children.load(Ordering::Acquire);
+            match self.arena.table_claim(table, head, child, generation) {
+                Claim::Inserted => return None,
+                Claim::Exists(other, other_generation) => return Some((other, other_generation)),
+                Claim::Full => {}
+            }
+            run.begin_update();
+            run.wait_inflight();
+            let table = run.children.load(Ordering::Relaxed);
+            let grown = if table == NONE {
+                self.arena.alloc_table(MIN_TABLE_SLOTS)
+            } else {
+                self.arena.table_grown(table)
+            };
+            run.children.store(grown, Ordering::Relaxed);
+            run.end_update();
+            self.arena.free_table(table);
         }
-        let grown = if table == NONE {
-            self.arena.alloc_table(MIN_TABLE_SLOTS)
-        } else {
-            self.arena.table_grown(table)
-        };
-        self.arena.table_put(grown, head, child, generation);
-        run.begin_update();
-        run.children.store(grown, Ordering::Relaxed);
-        run.end_update();
-        self.arena.free_table(table);
     }
 
-    /// Take `child` out of the run's table (the run is locked); an emptied table goes away.
+    /// Take `child` out of the run's table (the run is locked); an emptied table goes away once
+    /// no insert is in flight on it.
     fn unlink_child(&self, run: &Run, child: u32) {
         let table = run.children.load(Ordering::Relaxed);
         if table == NONE {
@@ -1363,10 +1442,55 @@ impl RunIndex {
         }
         if self.arena.table_take(table, child) == 0 {
             run.begin_update();
-            run.children.store(NONE, Ordering::Relaxed);
-            run.end_update();
-            self.arena.free_table(table);
+            run.wait_inflight();
+            if self.arena.word(table + 1).load(Ordering::Relaxed) == 0 {
+                run.children.store(NONE, Ordering::Relaxed);
+                run.end_update();
+                self.arena.free_table(table);
+            } else {
+                run.end_update();
+            }
         }
+    }
+
+    /// A lock-free attempt to link `child` (prepared, unpublished) under `run` for the blocks
+    /// after its last one: holds `inflight` across the claim so a split or table growth cannot
+    /// move the table under the insert. `Claim::Full` means the locked path must do it.
+    fn insert_child(&self, run_id: u32, child: u32, head: u64) -> Claim {
+        let run = self.slab.run(run_id);
+        loop {
+            run.inflight.fetch_add(1, Ordering::SeqCst);
+            let version = run.version.load(Ordering::SeqCst);
+            if version & 1 == 1 {
+                run.inflight.fetch_sub(1, Ordering::SeqCst);
+                std::hint::spin_loop();
+                continue;
+            }
+            let table = run.children.load(Ordering::Acquire);
+            let len = run.len();
+            if run.version.load(Ordering::SeqCst) != version {
+                run.inflight.fetch_sub(1, Ordering::SeqCst);
+                continue;
+            }
+            // The child continues this run after its current last block.
+            let new_run = self.slab.run(child);
+            new_run
+                .start
+                .store((run.start() + len) as u32, Ordering::Relaxed);
+            new_run.parent.store(run_id, Ordering::Release);
+            let claim = self
+                .arena
+                .table_claim(table, head, child, new_run.generation());
+            run.inflight.fetch_sub(1, Ordering::SeqCst);
+            return claim;
+        }
+    }
+
+    /// A run prepared for a store that another lane beat to the slot: back to the slab.
+    fn discard_run(&self, run_id: u32, worker: u32, freed: &mut Vec<u32>) {
+        let mut meta = self.slab.run(run_id).meta.lock();
+        clear(self.slab.coverage(run_id), worker);
+        self.kill(run_id, &mut meta, freed);
     }
 
     /// Retire a run that is unlinked (locked by the caller): its array reference goes, its
@@ -1584,16 +1708,19 @@ impl RunIndex {
             for (slot, word) in self.slab.coverage(suffix_id).iter().zip(coverage) {
                 slot.store(word.load(Ordering::Relaxed), Ordering::Relaxed);
             }
+            let table = self.arena.alloc_table(MIN_TABLE_SLOTS);
+            self.arena
+                .table_put(table, self.hash_at(run, at), suffix_id, suffix.generation());
+            run.begin_update();
+            // Children linked without the lock while we prepared: wait for them to land, then
+            // hand the whole table, and every child's parent pointer, to the suffix.
+            run.wait_inflight();
             self.arena.for_each_child(children, |child| {
                 self.slab
                     .run(child)
                     .parent
                     .store(suffix_id, Ordering::Release);
             });
-            let table = self.arena.alloc_table(MIN_TABLE_SLOTS);
-            self.arena
-                .table_put(table, self.hash_at(run, at), suffix_id, suffix.generation());
-            run.begin_update();
             run.len.store(at as u32, Ordering::Relaxed);
             run.children.store(table, Ordering::Relaxed);
             run.end_update();
@@ -1744,6 +1871,9 @@ impl RunIndex {
             }
         };
         let mut remaining = blocks;
+        // Set when a lock-free insert found the child table full: the next look at the same run
+        // takes its lock, whose path grows the table.
+        let mut force_lock = false;
         loop {
             // Look at the run under its version first: a run this worker already holds up to
             // the blocks in hand, or a run whose child continues them, is passed without its
@@ -1759,7 +1889,10 @@ impl RunIndex {
                 return self.restart();
             }
             let block_start = blocks.len() - remaining.len();
-            let plan = if offset < len {
+            let plan = if force_lock {
+                force_lock = false;
+                Plan::Lock
+            } else if offset < len {
                 let held = self.held_in(run_id, &window, worker);
                 if held < offset {
                     Plan::Lock
@@ -1786,6 +1919,9 @@ impl RunIndex {
                     .table_find(window.children, remaining[0].content_hash.0)
                 {
                     Some((child, generation)) => Plan::Descend(child, generation),
+                    // A run with a child table takes a new branch without its lock; a leaf (the
+                    // worker's own to extend, or a shared one without a table yet) is locked.
+                    None if window.children != NONE => Plan::Insert,
                     None => Plan::Lock,
                 }
             };
@@ -1793,6 +1929,58 @@ impl RunIndex {
                 continue;
             }
             match plan {
+                Plan::Insert => {
+                    let head = remaining[0].content_hash.0;
+                    let contents: Vec<u64> = remaining
+                        .iter()
+                        .map(|stored| stored.content_hash.0)
+                        .collect();
+                    let block = self
+                        .arena
+                        .alloc_array(&contents, capacity_for(contents.len()));
+                    let new_id = self.slab.alloc(
+                        0,
+                        run_id,
+                        Window {
+                            block,
+                            base: 0,
+                            len: contents.len() as u32,
+                            children: NONE,
+                            partials: NONE,
+                            forwards: NONE,
+                        },
+                    );
+                    set(self.slab.coverage(new_id), worker);
+                    match self.insert_child(run_id, new_id, head) {
+                        Claim::Inserted => {
+                            #[cfg(feature = "lane-stats")]
+                            self.counters.inserts.fetch_add(1, Ordering::Relaxed);
+                            pending.push(Placed {
+                                run: new_id,
+                                offset: 0,
+                                start: block_start,
+                                count: remaining.len(),
+                            });
+                            self.credit(worker, contents.len());
+                            self.distinct_add(worker, contents.len());
+                            return Walk::Done;
+                        }
+                        Claim::Exists(child, generation) => {
+                            let mut freed = Vec::new();
+                            self.discard_run(new_id, worker, &mut freed);
+                            self.recycle(&mut freed);
+                            run_id = child;
+                            expected = generation;
+                            offset = 0;
+                        }
+                        Claim::Full => {
+                            let mut freed = Vec::new();
+                            self.discard_run(new_id, worker, &mut freed);
+                            self.recycle(&mut freed);
+                            force_lock = true;
+                        }
+                    }
+                }
                 Plan::Skip(matched) => {
                     pending.push(Placed {
                         run: run_id,
@@ -1983,7 +2171,12 @@ impl RunIndex {
                 },
             );
             set(self.slab.coverage(new_id), worker);
-            self.link_child(run, head, new_id);
+            if let Some(existing) = self.link_child(run, head, new_id) {
+                let mut freed = Vec::new();
+                self.discard_run(new_id, worker, &mut freed);
+                self.recycle(&mut freed);
+                return Some(existing);
+            }
             (new_id, 0)
         };
         pending.push(Placed {
