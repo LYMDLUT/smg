@@ -124,11 +124,16 @@ impl TimingModel {
 /// A hardware calibration of the pass model, as the GPU harness writes it:
 /// prefill `a + b·T + c·T²` ms over the uncached tokens of a pass, decode
 /// `d + e·u + f·u²` ms over KV utilisation, the engine's KV capacity and a
-/// fixed per-request overhead. The JSON accepts the coefficients as objects
-/// (`{"a":..,"b":..,"c":..}` / `{"d":..,"e":..,"f":..}`) or arrays, under
-/// `prefill_ms`/`prefill` and `decode_ms`/`decode`; capacity as
-/// `kv_capacity_tokens` or `kv_capacity_blocks` (with `block_size`); the
-/// overhead as `request_overhead_ms`. Unknown keys are ignored.
+/// fixed per-request overhead. The JSON accepts the harness's own layout
+/// (`prefill_fit_ms: {a_ms, b_ms_per_token, c_ms_per_token2}`,
+/// `decode_fit_vs_utilisation_ms: {d_ms, e_ms_per_u, f_ms_per_u2}`), or the
+/// coefficients as objects (`{"a":..,"b":..,"c":..}` / `{"d":..,"e":..,"f":..}`)
+/// or arrays under `prefill_ms`/`prefill` and `decode_ms`/`decode`; capacity
+/// as `kv_capacity_tokens` or `kv_capacity_blocks` (with `block_size`); the
+/// overhead only as an explicit `request_overhead_ms` (the harness's
+/// `fixed_overhead_ms` is the measured one-token TTFT, which the prefill
+/// intercept already covers, so it is not added again). Unknown keys are
+/// ignored.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Calibration {
     pub prefill: [f64; 3],
@@ -148,7 +153,7 @@ impl Calibration {
     }
 
     pub fn from_value(v: &serde_json::Value) -> Result<Self, String> {
-        let poly = |keys: [&str; 2], names: [&str; 3]| -> Result<[f64; 3], String> {
+        let poly = |keys: [&str; 3], names: [&str; 3]| -> Result<[f64; 3], String> {
             let node = keys
                 .iter()
                 .find_map(|k| v.get(*k))
@@ -169,9 +174,15 @@ impl Calibration {
             }
             Ok(out)
         };
-        let prefill = poly(["prefill_ms", "prefill"], ["a", "b", "c"])?;
-        let decode = poly(["decode_ms", "decode"], ["d", "e", "f"])
-            .or_else(|_| poly(["decode_ms", "decode"], ["a", "b", "c"]))?;
+        let prefill = poly(
+            ["prefill_fit_ms", "prefill_ms", "prefill"],
+            ["a_ms", "b_ms_per_token", "c_ms_per_token2"],
+        )
+        .or_else(|_| poly(["prefill_ms", "prefill", "prefill_fit_ms"], ["a", "b", "c"]))?;
+        let decode_keys = ["decode_fit_vs_utilisation_ms", "decode_ms", "decode"];
+        let decode = poly(decode_keys, ["d_ms", "e_ms_per_u", "f_ms_per_u2"])
+            .or_else(|_| poly(decode_keys, ["d", "e", "f"]))
+            .or_else(|_| poly(decode_keys, ["a", "b", "c"]))?;
         let block_size = v
             .get("block_size")
             .and_then(serde_json::Value::as_u64)
@@ -2199,6 +2210,30 @@ mod tests {
         assert!(Calibration::from_value(&bad)
             .unwrap_err()
             .contains("prefill"));
+    }
+
+    #[test]
+    fn calibration_reads_the_gpu_harness_layout() {
+        // qwen3-8b-gb300-vllm0.31.json, abridged.
+        let harness: serde_json::Value = serde_json::from_str(
+            r#"{"target": "127.0.0.1:20061", "kv_capacity_tokens": 676128,
+                "prefill_points_ms": {"1": {"median_ms": 23.84}},
+                "prefill_fit_ms": {"a_ms": 35.24, "b_ms_per_token": 0.005654, "c_ms_per_token2": 2.076e-07,
+                                   "fixed_overhead_ms": 23.84, "residual_ms": [-22.48]},
+                "decode_fit_vs_utilisation_ms": {"d_ms": 3.7645, "e_ms_per_u": 15.2448, "f_ms_per_u2": -2.8663,
+                                                 "u": "KV tokens in use / capacity (computed)"},
+                "decode_fit_vs_batch_ms": {"d_ms": 3.8, "e_ms_per_seq": 0.028, "f_ms_per_seq2": 1.3e-05}}"#,
+        )
+        .unwrap();
+        let c = Calibration::from_value(&harness).unwrap();
+        assert_eq!(c.prefill, [35.24, 0.005654, 2.076e-07]);
+        assert_eq!(c.decode, [3.7645, 15.2448, -2.8663]);
+        assert_eq!(c.kv_capacity_tokens, Some(676_128));
+        assert_eq!(c.block_size, None);
+        assert_eq!(
+            c.request_overhead_ms, 0.0,
+            "the one-token TTFT is in the prefill intercept already"
+        );
     }
 
     #[tokio::test]
