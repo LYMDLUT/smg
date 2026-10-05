@@ -1,12 +1,16 @@
-//! Render parity with the bellwether reference fixtures.
+//! Render parity with the bellwether reference fixtures, through the gateway's
+//! chat request path.
 //!
 //! bellwether (smg-project/bellwether) records, for each model at a pinned
 //! Hugging Face revision, what the checkpoint's own chat template renders for
 //! a corpus of chat requests: the prompt text and its token ids. This test
-//! replays every render fixture through the tokenizer the way the gateway
-//! does (`model_gateway/src/routers/grpc/utils/chat_utils.rs`: template
-//! kwargs, the pop-and-prefix path for `continue_final_message`) and compares
-//! text and ids byte for byte.
+//! turns each recorded request into the `ChatCompletionRequest` the HTTP layer
+//! would build, renders it with `process_chat_messages`, the entry point the
+//! gateway and the bindings share (content format, typed tools, tool-call
+//! arguments parsed for renderers that do not take them raw, template kwargs,
+//! the thinking toggle, `continue_final_message`), encodes the text as the
+//! gateway's tokenize step does, and compares text and ids with the reference
+//! byte for byte.
 //!
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory
 //! of a bellwether checkout; without it the test prints a skip notice and
@@ -14,24 +18,28 @@
 //! manifest's revision when it is there, else from a one-time download into
 //! `.tokenizer_cache/bellwether/<slug>/<revision>/`.
 //!
-//! A difference is a finding, not something to hide: every known one is
-//! listed in [`KNOWN_DIFFERENCES`] with its reason and where it is tracked,
-//! the run fails on any other, and it fails again when a listed case starts
-//! matching, so the list cannot rot.
+//! A difference is a finding, not something to hide: every known one is listed
+//! in [`KNOWN_DIFFERENCES`] with its reason and where it is tracked, the run
+//! fails on any other, on a listed case that starts matching, and on a listed
+//! case that the loaded fixtures no longer contain, so the list cannot rot.
+//!
+//! What the test cannot see: the public entry point returns the rendered text
+//! and not the deferred encode a segment-aware renderer prepares, so for such
+//! a renderer the ids compared here are a flat encode of the text, which the
+//! gateway itself warns may not reproduce its own ids. The two models recorded
+//! so far render to text that is encoded flat.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
 
-use llm_tokenizer::{
-    chat_template::ChatTemplateParams,
-    create_tokenizer,
-    traits::{PromptEncoding, Tokenizer as TokenizerTrait},
-};
+use llm_tokenizer::{create_tokenizer, traits::Tokenizer};
+use openai_protocol::chat::ChatCompletionRequest;
 use serde::Deserialize;
 use serde_json::Value;
+use smg::routers::grpc::utils::process_chat_messages;
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 const CACHE_DIR: &str = ".tokenizer_cache/bellwether";
@@ -60,17 +68,31 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "add_generation_prompt is not a field of SMG's chat request; the header is always appended \
          (smg-project/smg#2780)",
     ),
-];
-
-/// The keys of a render request this test hands to the renderer the way the
-/// gateway does. Any other key fails the case, so a corpus knob the
-/// projection does not know is reported instead of rendering without it.
-const PROJECTED_KEYS: [&str; 5] = [
-    "messages",
-    "tools",
-    "chat_template_kwargs",
-    "continue_final_message",
-    "add_generation_prompt",
+    (
+        "deepseek-r1/render/tools-history-single-call",
+        "the gateway parses tool-call arguments into objects before rendering and the R1 template \\
+         concatenates them as text, so the render fails (smg-project/smg#2783)",
+    ),
+    (
+        "deepseek-r1/render/tools-history-parallel-calls",
+        "the gateway parses tool-call arguments into objects before rendering and the R1 template \\
+         concatenates them as text, so the render fails (smg-project/smg#2783)",
+    ),
+    (
+        "deepseek-r1/render/tools-history-results-reordered",
+        "the gateway parses tool-call arguments into objects before rendering and the R1 template \\
+         concatenates them as text, so the render fails (smg-project/smg#2783)",
+    ),
+    (
+        "deepseek-r1/render/tools-history-content-and-call",
+        "the gateway parses tool-call arguments into objects before rendering and the R1 template \\
+         concatenates them as text, so the render fails (smg-project/smg#2783)",
+    ),
+    (
+        "qwen3-8b/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the engines do; \
+         the Qwen3 template accepts an object (smg-project/bellwether#12, needs:simo)",
+    ),
 ];
 
 /// `fixtures/<slug>/manifest.toml`: the model and the revision its fixtures
@@ -130,6 +152,7 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
     );
 
     let known: BTreeMap<&str, &str> = KNOWN_DIFFERENCES.iter().copied().collect();
+    let mut loaded_slugs = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut differences = BTreeMap::new();
     let mut matched = 0usize;
@@ -139,6 +162,7 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
         if !render_dir.is_dir() {
             continue;
         }
+        loaded_slugs.insert(slug.clone());
         let dir = tokenizer_dir(&manifest.model, &manifest.revision, slug)
             .unwrap_or_else(|e| panic!("{slug}: {e}"));
         let dir_str = dir
@@ -169,7 +193,7 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
                 with_witnesses += 1;
             }
             seen.insert(fixture.id.clone());
-            let outcome = match render(tok.as_ref(), &fixture.request) {
+            let outcome = match render(tok.as_ref(), &manifest.model, &fixture.request) {
                 Err(e) => Err(e),
                 Ok(got)
                     if got.text == fixture.reference.text
@@ -219,96 +243,44 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
         "listed in KNOWN_DIFFERENCES but matching the reference now; remove: {}",
         healed.join(", ")
     );
+    let gone: Vec<&str> = known
+        .keys()
+        .copied()
+        .filter(|id| {
+            let slug = id.split('/').next().unwrap_or_default();
+            loaded_slugs.contains(slug) && !seen.contains(*id)
+        })
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "listed in KNOWN_DIFFERENCES but no longer among the loaded fixtures; remove or rename: {}",
+        gone.join(", ")
+    );
 }
 
-/// Hand a corpus request to the renderer the way the gateway does: the
-/// messages and tools as sent, `chat_template_kwargs` as template variables,
-/// and `continue_final_message` on a trailing assistant message rendered
-/// natively when the renderer can, else by popping the message and appending
-/// its text after the generation header. SMG's chat request has no
-/// `add_generation_prompt` field: the gateway appends the generation header
-/// on every request that is not a native continuation, so a corpus case that
-/// sets the field renders as if it had not.
-fn render(tok: &dyn TokenizerTrait, request: &Value) -> Result<Rendered, String> {
-    let object = request.as_object().ok_or("the request is not an object")?;
-    if let Some(key) = object
-        .keys()
-        .find(|key| !PROJECTED_KEYS.contains(&key.as_str()))
-    {
-        return Err(format!("request key {key:?} is not projected by this test"));
-    }
-    let mut messages = object
-        .get("messages")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or("the request has no messages array")?;
-    let tools = object.get("tools").and_then(Value::as_array).cloned();
-    let kwargs: HashMap<String, Value> = object
-        .get("chat_template_kwargs")
-        .and_then(Value::as_object)
-        .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default();
-
-    let continues_final_assistant = object
-        .get("continue_final_message")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && messages
-            .last()
-            .and_then(|message| message.get("role"))
-            .and_then(Value::as_str)
-            == Some("assistant");
-    let native_continuation =
-        continues_final_assistant && tok.renderer_capabilities().native_assistant_continuation;
-    let assistant_prefix = if continues_final_assistant && !native_continuation {
-        messages
-            .pop()
-            .and_then(|message| message.get("content").and_then(prefill_text))
-    } else {
-        None
-    };
-
-    let params = ChatTemplateParams {
-        add_generation_prompt: !native_continuation,
-        tools: tools.as_deref(),
-        template_kwargs: (!kwargs.is_empty()).then_some(&kwargs),
-        ..Default::default()
-    };
-    let out = tok
-        .apply_chat_template_with_encoding(&messages, params, assistant_prefix.as_deref())
-        .map_err(|e| format!("render failed: {e}"))?;
-    let ids = match out.encoding {
-        PromptEncoding::FromText => tok
-            .encode(&out.text, false)
-            .map_err(|e| format!("encode failed: {e}"))?
-            .token_ids()
-            .to_vec(),
-        PromptEncoding::Deferred(_) => {
-            return Err(
-                "the renderer deferred its encode; this test replays only renderers that return text to encode"
-                    .to_string(),
-            );
-        }
-    };
+/// Hand a corpus request to the gateway's own request processing. The request
+/// becomes the `ChatCompletionRequest` the HTTP layer would build, with the
+/// manifest's model, and keys SMG does not know are ignored the way the
+/// gateway ignores them. `process_chat_messages` then renders it exactly as the
+/// gateway does before tokenizing, and the ids are the flat encode of that
+/// text, which is the gateway's tokenize step for a renderer that returns text
+/// to encode.
+fn render(tok: &dyn Tokenizer, model: &str, request: &Value) -> Result<Rendered, String> {
+    let mut body = request.clone();
+    let object = body.as_object_mut().ok_or("the request is not an object")?;
+    object.insert("model".to_string(), Value::String(model.to_string()));
+    let request: ChatCompletionRequest = serde_json::from_value(body)
+        .map_err(|e| format!("the gateway does not accept this request: {e}"))?;
+    let processed = process_chat_messages(&request, tok, None)?;
+    let ids = tok
+        .encode(&processed.text, false)
+        .map_err(|e| format!("encode failed: {e}"))?
+        .token_ids()
+        .to_vec();
     Ok(Rendered {
-        text: out.text,
+        text: processed.text,
         ids,
     })
-}
-
-/// The gateway's `prefill_text`: a string content, or the `text` parts of an
-/// array.
-fn prefill_text(content: &Value) -> Option<String> {
-    match content {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(parts) => Some(
-            parts
-                .iter()
-                .filter_map(|part| part.get("text")?.as_str())
-                .collect(),
-        ),
-        _ => None,
-    }
 }
 
 /// Where the rendering and the reference part: the first differing token and
@@ -396,7 +368,11 @@ fn read_fixtures(dir: &Path) -> Result<Vec<Fixture>, String> {
 }
 
 /// The checkpoint's tokenizer files at the manifest's revision: the Hugging
-/// Face cache snapshot when it is there, else a one-time download.
+/// Face cache snapshot when it is there, else a one-time download of the files
+/// the tokenizer and the renderer read: `tokenizer.json`,
+/// `tokenizer_config.json`, the separate chat template files a checkpoint may
+/// ship instead of a template inside the config, and `config.json` for
+/// renderer detection. Only the first two must exist.
 fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, String> {
     if let Some(snapshot) = hf_cache_snapshot(model, revision) {
         return Ok(snapshot);
@@ -404,10 +380,11 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let client = reqwest::blocking::Client::new();
-    // `config.json` only serves renderer detection, so a checkpoint without one is fine.
     for (file, min_bytes, required) in [
         ("tokenizer.json", 100_000usize, true),
         ("tokenizer_config.json", 100, true),
+        ("chat_template.jinja", 1, false),
+        ("chat_template.json", 1, false),
         ("config.json", 50, false),
     ] {
         let path = dir.join(file);
@@ -438,8 +415,9 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
 }
 
 /// `<hub cache>/models--<org>--<name>/snapshots/<revision>`, the layout
-/// `huggingface_hub` keeps, under `HF_HUB_CACHE`, `HF_HOME/hub` or the
-/// default `~/.cache/huggingface/hub`.
+/// `huggingface_hub` keeps, under `HF_HUB_CACHE`, `HF_HOME/hub` or the default
+/// `~/.cache/huggingface/hub`. A snapshot holds every file the checkpoint
+/// ships, so a separate chat template file is there when one exists.
 fn hf_cache_snapshot(model: &str, revision: &str) -> Option<PathBuf> {
     let hub = std::env::var_os("HF_HUB_CACHE")
         .map(PathBuf::from)
