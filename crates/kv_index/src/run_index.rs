@@ -1358,16 +1358,20 @@ impl RunIndex {
 
     /// Hand a removed worker's slot back once nothing refers to it any more.
     fn release_worker(&self, worker: u32) {
-        let mut registry = self.registry.lock();
-        let Some(name) = registry
-            .names
-            .get_mut(worker as usize)
-            .and_then(Option::take)
-        else {
+        // Lock order is name map shard, then registry (as in `intern_worker`): never hold the
+        // registry while touching the name map, or an intern and a release deadlock each other.
+        let name = {
+            let mut registry = self.registry.lock();
+            registry
+                .names
+                .get_mut(worker as usize)
+                .and_then(Option::take)
+        };
+        let Some(name) = name else {
             return;
         };
         self.worker_to_id.remove(&*name);
-        registry.free.push(worker);
+        self.registry.lock().free.push(worker);
     }
 
     pub fn worker_id(&self, worker: &str) -> Option<u32> {
@@ -3278,6 +3282,37 @@ mod tests {
             .expect("ref extend");
         assert_eq!(index.debug_blocks(), reference.blocks());
         assert_eq!(scores(&index, &longer), vec![(w, 12), (v, 5)]);
+    }
+
+    /// Interning and releasing worker slots from many threads at once: an intern holds a name-map
+    /// shard and then the registry, a release must not hold the registry while it takes a shard,
+    /// or the two deadlock (this test hung within seconds before the order was fixed).
+    #[test]
+    fn worker_slots_churn_from_many_threads_without_deadlock() {
+        let index = RunIndex::with_max_workers(64);
+        std::thread::scope(|scope| {
+            for thread in 0..8u32 {
+                let index = &index;
+                scope.spawn(move || {
+                    for round in 0..2_000u32 {
+                        let name = format!("t{thread}-r{}", round % 5);
+                        let id = index.intern_worker(&name).expect("slot");
+                        let mut map = RunBlockMap::default();
+                        let held: Vec<ContentHash> =
+                            (0..3).map(|p| content(u64::from(id) + 1, p)).collect();
+                        index
+                            .apply_stored(id, &blocks_of(&held), None, &mut map)
+                            .expect("store");
+                        index.remove_worker(id, map);
+                    }
+                });
+            }
+        });
+        assert_eq!(index.current_size(), 0);
+        assert_eq!(
+            index.intern_worker("after"),
+            Ok(index.intern_worker("after").expect("slot"))
+        );
     }
 
     #[test]
