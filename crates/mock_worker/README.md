@@ -103,13 +103,22 @@ cargo run --release -p mock-worker -- \
 ```
 
 `--timing fit:<path>` replaces the uncalibrated polynomials with a hardware
-calibration the GPU harness writes: a JSON with `prefill_ms` (`{"a","b","c"}`
-or `[a,b,c]`, ms over the uncached tokens of a pass), `decode_ms`
-(`{"d","e","f"}` or `[d,e,f]`, ms over KV utilisation), the engine's capacity
-as `kv_capacity_tokens` or `kv_capacity_blocks` with `block_size`, and
-`request_overhead_ms`; unknown keys are ignored, and `--block-size`,
+calibration the GPU harness writes. Prefill comes either from a measured
+point table (`prefill_table_ms: [[tokens, ms], ...]`, or the harness's
+`prefill_points_ms: {"<tokens>": {"median_ms": ..}}`), interpolated linearly
+and extrapolated with the last slope, together with a pass-total form for
+batched prefills (`prefill_pass_ms: {"intercept_ms", "ms_per_token"}`, from a
+concurrent sweep): a lone request costs its table value, a pass that prefills
+several requests costs the pass-total form and never less than the table
+value of its largest request; or, without a table, from the polynomial
+`prefill_fit_ms` / `prefill_ms` (`{"a","b","c"}` or `[a,b,c]`). Decode is
+`decode_fit_vs_utilisation_ms` / `decode_ms` (`{"d","e","f"}` or `[d,e,f]`, ms
+over KV utilisation); capacity is `kv_capacity_tokens` or
+`kv_capacity_blocks` with `block_size`; `request_overhead_ms` shifts every
+event of a stream. Unknown keys are ignored, and `--block-size`,
 `--kv-tokens`/`--kv-blocks` and `--request-overhead-ms` given explicitly win
-over the file. The defaults stay AISimulate's uncalibrated baseline.
+over the file (the GB300 restricted-pool fleet is `--kv-blocks 12000
+--block-size 16`). The defaults stay AISimulate's uncalibrated baseline.
 
 Agreement with hardware is the caller's problem: AISimulate's published
 agreement for these polynomials (mean absolute percentage error 48.5% on TTFT,

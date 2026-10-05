@@ -55,6 +55,18 @@ pub enum TimingModel {
         decode_base_ms: f64,
         decode_per_req_ms: f64,
     },
+    /// A hardware calibration: a single request's prefill from a measured
+    /// point table (piecewise-linear over `(tokens, ms)`, extrapolated with
+    /// the last slope); a pass that prefills several requests costs the
+    /// pass-total form `intercept + slope × total uncached tokens in the
+    /// pass`, never less than the table value of its largest request (the
+    /// per-request plateau is the floor). Decode as the polynomial.
+    Calibrated {
+        table: Vec<(f64, f64)>,
+        pass_intercept_ms: f64,
+        pass_ms_per_token: f64,
+        decode: [f64; 3],
+    },
 }
 
 impl TimingModel {
@@ -78,11 +90,79 @@ impl TimingModel {
         }
     }
 
-    /// A calibration file's polynomials (`Calibration::load`).
+    /// A calibration file's model (`Calibration::load`): the point table and
+    /// pass-total form when the file has them, else its polynomials.
     pub fn fitted(c: &Calibration) -> Self {
-        Self::Polynomial {
-            prefill: c.prefill,
-            decode: c.decode,
+        match (&c.prefill_table, c.prefill_pass) {
+            (Some(table), pass) if table.len() >= 2 => {
+                let (pass_intercept_ms, pass_ms_per_token) = pass.unwrap_or_else(|| {
+                    // No pass form: the table's last slope, from its first value.
+                    let n = table.len();
+                    let slope =
+                        (table[n - 1].1 - table[n - 2].1) / (table[n - 1].0 - table[n - 2].0);
+                    (table[0].1, slope.max(0.0))
+                });
+                Self::Calibrated {
+                    table: table.clone(),
+                    pass_intercept_ms,
+                    pass_ms_per_token,
+                    decode: c.decode,
+                }
+            }
+            _ => Self::Polynomial {
+                prefill: c.prefill,
+                decode: c.decode,
+            },
+        }
+    }
+
+    /// Piecewise-linear value of a `(tokens, ms)` table at `tokens`: the
+    /// first point's value below the table, the last segment's slope (never
+    /// negative) above it.
+    fn table_ms(table: &[(f64, f64)], tokens: f64) -> f64 {
+        let Some(first) = table.first() else {
+            return 0.0;
+        };
+        if tokens <= first.0 || table.len() == 1 {
+            return first.1;
+        }
+        for w in table.windows(2) {
+            let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+            if tokens <= x1 {
+                return y0 + (y1 - y0) * (tokens - x0) / (x1 - x0).max(f64::EPSILON);
+            }
+        }
+        let n = table.len();
+        let ((x0, y0), (x1, y1)) = (table[n - 2], table[n - 1]);
+        let slope = ((y1 - y0) / (x1 - x0).max(f64::EPSILON)).max(0.0);
+        y1 + slope * (tokens - x1)
+    }
+
+    /// Prefill time of a pass that computes `total` uncached tokens, the
+    /// largest single request's share being `largest`: a lone request costs
+    /// its table value; a batched pass costs the pass-total form, never less
+    /// than the table value of its largest request.
+    fn prefill_pass_ms(&self, total: u32, largest: u32) -> f64 {
+        if total == 0 {
+            return 0.0;
+        }
+        match self {
+            Self::Calibrated {
+                table,
+                pass_intercept_ms,
+                pass_ms_per_token,
+                ..
+            } => {
+                let largest = largest.min(total).max(1);
+                let single = Self::table_ms(table, f64::from(largest));
+                if largest >= total {
+                    // A lone request costs its table value, whatever the pass form says.
+                    return single;
+                }
+                let batched = pass_intercept_ms + pass_ms_per_token * f64::from(total);
+                single.max(batched)
+            }
+            other => other.prefill_ms(total),
         }
     }
 
@@ -98,6 +178,7 @@ impl TimingModel {
                 a + b * t + c * t * t
             }
             Self::Linear { prefill_tps, .. } => f64::from(tokens) / prefill_tps.max(1.0) * 1000.0,
+            Self::Calibrated { .. } => self.prefill_pass_ms(tokens, tokens),
         }
     }
 
@@ -117,6 +198,12 @@ impl TimingModel {
                 decode_per_req_ms,
                 ..
             } => decode_base_ms + decode_per_req_ms * batch as f64,
+            Self::Calibrated {
+                decode: [a, b, c], ..
+            } => {
+                let u = (active_tokens as f64 / capacity_tokens.max(1) as f64).min(1.0);
+                (a + b * u + c * u * u).max(1.0)
+            }
         }
     }
 }
@@ -138,6 +225,13 @@ impl TimingModel {
 pub struct Calibration {
     pub prefill: [f64; 3],
     pub decode: [f64; 3],
+    /// Measured single-request prefill `(tokens, ms)` points, sorted by tokens
+    /// (`prefill_table_ms: [[tokens, ms], ...]`, or the harness's
+    /// `prefill_points_ms: {"<tokens>": {"median_ms": ..}}`).
+    pub prefill_table: Option<Vec<(f64, f64)>>,
+    /// Pass-total form for batched prefills, `(intercept_ms, ms_per_token)`
+    /// (`prefill_pass_ms: {"intercept_ms": .., "ms_per_token": ..}`).
+    pub prefill_pass: Option<(f64, f64)>,
     pub kv_capacity_tokens: Option<u64>,
     pub block_size: Option<u32>,
     pub request_overhead_ms: f64,
@@ -174,11 +268,29 @@ impl Calibration {
             }
             Ok(out)
         };
+        let prefill_table = Self::table_of(v);
+        let prefill_pass = v
+            .get("prefill_pass_ms")
+            .or_else(|| v.get("batched_prefill_ms"))
+            .and_then(|node| {
+                Some((
+                    node.get("intercept_ms")?.as_f64()?,
+                    node.get("ms_per_token")?.as_f64()?,
+                ))
+            });
         let prefill = poly(
             ["prefill_fit_ms", "prefill_ms", "prefill"],
             ["a_ms", "b_ms_per_token", "c_ms_per_token2"],
         )
-        .or_else(|_| poly(["prefill_ms", "prefill", "prefill_fit_ms"], ["a", "b", "c"]))?;
+        .or_else(|_| poly(["prefill_ms", "prefill", "prefill_fit_ms"], ["a", "b", "c"]))
+        .or_else(|e| {
+            // A table alone is a complete prefill model.
+            if prefill_table.is_some() {
+                Ok([0.0; 3])
+            } else {
+                Err(e)
+            }
+        })?;
         let decode_keys = ["decode_fit_vs_utilisation_ms", "decode_ms", "decode"];
         let decode = poly(decode_keys, ["d_ms", "e_ms_per_u", "f_ms_per_u2"])
             .or_else(|_| poly(decode_keys, ["d", "e", "f"]))
@@ -202,10 +314,64 @@ impl Calibration {
         Ok(Self {
             prefill,
             decode,
+            prefill_table,
+            prefill_pass,
             kv_capacity_tokens,
             block_size,
             request_overhead_ms,
         })
+    }
+
+    /// The prefill point table, from `prefill_table_ms` (`[[tokens, ms], ..]`),
+    /// `prefill_points` (`[{tokens, ms | prefill_ms | median_ms}, ..]`) or the
+    /// harness's `prefill_points_ms` (`{"<tokens>": {"median_ms": ..}}`).
+    fn table_of(v: &serde_json::Value) -> Option<Vec<(f64, f64)>> {
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        if let Some(rows) = v
+            .get("prefill_table_ms")
+            .and_then(serde_json::Value::as_array)
+        {
+            for row in rows {
+                if let (Some(t), Some(ms)) = (
+                    row.get(0).and_then(serde_json::Value::as_f64),
+                    row.get(1).and_then(serde_json::Value::as_f64),
+                ) {
+                    points.push((t, ms));
+                }
+            }
+        } else if let Some(rows) = v
+            .get("prefill_points")
+            .and_then(serde_json::Value::as_array)
+        {
+            for row in rows {
+                let ms = ["ms", "prefill_ms", "median_ms"]
+                    .iter()
+                    .find_map(|k| row.get(*k).and_then(serde_json::Value::as_f64));
+                if let (Some(t), Some(ms)) =
+                    (row.get("tokens").and_then(serde_json::Value::as_f64), ms)
+                {
+                    points.push((t, ms));
+                }
+            }
+        } else if let Some(map) = v
+            .get("prefill_points_ms")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (tokens, entry) in map {
+                let ms = entry
+                    .get("median_ms")
+                    .and_then(serde_json::Value::as_f64)
+                    .or_else(|| entry.as_f64());
+                if let (Ok(t), Some(ms)) = (tokens.parse::<f64>(), ms) {
+                    points.push((t, ms));
+                }
+            }
+        }
+        if points.len() < 2 {
+            return None;
+        }
+        points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        Some(points)
     }
 }
 
@@ -1264,6 +1430,7 @@ impl SchedulerState {
 
         let mut budget = p.max_batched_tokens;
         let mut prefill_tokens = 0u32;
+        let mut largest_chunk = 0u32;
         let mut num_decode = 0usize;
         let mut decode_tokens = 0u32;
         let mut decode_ctx = 0u64;
@@ -1298,6 +1465,7 @@ impl SchedulerState {
                 self.push_removed(&mut kv, freed, p);
                 let stored = self.apply_prefill(i, chunk, p);
                 prefill_tokens += chunk;
+                largest_chunk = largest_chunk.max(chunk);
                 budget -= chunk;
                 let mut completed = stored;
                 if completes {
@@ -1436,6 +1604,7 @@ impl SchedulerState {
             self.push_removed(&mut kv, freed, p);
             let mut completed = self.apply_prefill(idx, chunk, p);
             prefill_tokens += chunk;
+            largest_chunk = largest_chunk.max(chunk);
             budget -= chunk;
             if completes {
                 completed.extend(self.emit_token(idx, &mut sends, p));
@@ -1501,7 +1670,7 @@ impl SchedulerState {
         self.running = still;
 
         // ---- 5. Timing + bookkeeping ----
-        let prefill_ms = p.timing.prefill_ms(prefill_tokens);
+        let prefill_ms = p.timing.prefill_pass_ms(prefill_tokens, largest_chunk);
         let decode_ms = p
             .timing
             .decode_ms(num_decode, decode_ctx, p.kv_capacity_tokens);
@@ -2210,6 +2379,94 @@ mod tests {
         assert!(Calibration::from_value(&bad)
             .unwrap_err()
             .contains("prefill"));
+    }
+
+    #[test]
+    fn calibrated_prefill_uses_the_table_for_one_request_and_the_pass_form_for_a_batch() {
+        let model = TimingModel::Calibrated {
+            table: vec![
+                (1.0, 24.0),
+                (128.0, 37.0),
+                (512.0, 82.0),
+                (1024.0, 75.0),
+                (4096.0, 98.0),
+                (8192.0, 106.0),
+                (16384.0, 211.0),
+            ],
+            pass_intercept_ms: 35.0,
+            pass_ms_per_token: 0.0095,
+            decode: TimingModel::POLY_DECODE,
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 0.5;
+        // A lone request: its interpolated table value, whatever the pass form says.
+        assert!(close(model.prefill_pass_ms(1024, 1024), 75.0));
+        assert!(
+            close(model.prefill_pass_ms(768, 768), 78.5),
+            "{}",
+            model.prefill_pass_ms(768, 768)
+        );
+        assert!(
+            close(model.prefill_pass_ms(64, 64), 30.45),
+            "{}",
+            model.prefill_pass_ms(64, 64)
+        );
+        // Batched: four 1024-token prompts take the pass form once it exceeds the plateau.
+        assert!(close(
+            model.prefill_pass_ms(4096, 1024),
+            75.0_f64.max(35.0 + 0.0095 * 4096.0)
+        ));
+        assert!(close(
+            model.prefill_pass_ms(16384, 1024),
+            35.0 + 0.0095 * 16384.0
+        ));
+        // One 16k request: its own table point wins over the pass form.
+        assert!(close(model.prefill_pass_ms(16384, 16384), 211.0));
+        // Beyond the table: the last slope.
+        let slope = (211.0 - 106.0) / (16384.0 - 8192.0);
+        assert!(close(
+            model.prefill_pass_ms(20000, 20000),
+            211.0 + slope * (20000.0 - 16384.0)
+        ));
+        assert!(close(model.prefill_ms(0), 0.0));
+    }
+
+    #[test]
+    fn calibration_table_and_pass_form_are_read() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"prefill_points_ms": {"1": {"median_ms": 23.84, "min_ms": 23.27}, "1024": {"median_ms": 74.94}, "128": {"median_ms": 37.33}},
+                "prefill_pass_ms": {"intercept_ms": 38.3, "ms_per_token": 0.0102},
+                "decode_fit_vs_utilisation_ms": {"d_ms": 3.76, "e_ms_per_u": 15.24, "f_ms_per_u2": -2.87},
+                "kv_capacity_tokens": 676128}"#,
+        )
+        .unwrap();
+        let c = Calibration::from_value(&v).unwrap();
+        assert_eq!(
+            c.prefill_table.as_deref(),
+            Some(&[(1.0, 23.84), (128.0, 37.33), (1024.0, 74.94)][..]),
+            "sorted by tokens"
+        );
+        assert_eq!(c.prefill_pass, Some((38.3, 0.0102)));
+        assert!(matches!(
+            TimingModel::fitted(&c),
+            TimingModel::Calibrated { pass_intercept_ms, .. } if (pass_intercept_ms - 38.3).abs() < 1e-9
+        ));
+        let canonical: serde_json::Value = serde_json::from_str(
+            r#"{"prefill_table_ms": [[1, 24], [4096, 98]], "decode_ms": [3.76, 15.24, -2.87]}"#,
+        )
+        .unwrap();
+        let c = Calibration::from_value(&canonical).unwrap();
+        assert_eq!(
+            c.prefill_table.as_deref(),
+            Some(&[(1.0, 24.0), (4096.0, 98.0)][..])
+        );
+        assert_eq!(
+            c.prefill, [0.0; 3],
+            "a table alone is a complete prefill model"
+        );
+        assert!(matches!(
+            TimingModel::fitted(&c),
+            TimingModel::Calibrated { .. }
+        ));
     }
 
     #[test]
