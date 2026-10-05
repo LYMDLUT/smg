@@ -14,6 +14,8 @@ cargo bench --package dynamo-bench --bench mooncake_bench --no-default-features 
   --features mooncake,router-bench --no-run
 ```
 
-Overheads the adapter charges to SMG (not present for the Dynamo backends): one `Vec<StoredBlock>`
-per stored event, one `Vec<SequenceHash>` per removal, one `Vec<ContentHash>` per lookup, and the
-translation of SMG's interned worker ids back to `WorkerWithDpRank` in each score.
+Overheads the adapter charges to SMG (not present for the Dynamo backends): the translation of
+SMG's interned worker ids back to `WorkerWithDpRank` in each score (one lock-free `ArcSwap` load per
+lookup, one map insert per matching worker). Stores, removals and lookups pass the event's own
+buffers through SMG's `apply_stored_iter`, `apply_removed_iter` and `find_matches_in`, so the
+adapter builds no per-event or per-lookup `Vec`.

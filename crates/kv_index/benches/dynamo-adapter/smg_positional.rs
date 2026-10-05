@@ -2,20 +2,24 @@
 //! `SyncIndexer` interface, so the Mooncake replay measures it through the same lanes, queues,
 //! observation records and accounting as the Dynamo backends.
 //!
-//! What the adapter adds on top of SMG's own cost, and therefore charges to it:
-//! - one `Vec<StoredBlock>` (16 bytes per block) per stored event and one `Vec<SequenceHash>` per
-//!   removal, because SMG's event types carry no multimodal extra info;
-//! - one `Vec<ContentHash>` per lookup, because SMG's lookup takes its own hash newtype;
-//! - a score translation from SMG's interned `u32` worker ids back to `WorkerWithDpRank`.
+//! What the adapter adds on top of SMG's own cost, and therefore charges to it: a score
+//! translation from SMG's interned `u32` worker ids back to `WorkerWithDpRank` (one lock-free
+//! `ArcSwap` load per lookup and one map insert per matching worker). Stores, removals and
+//! lookups hand SMG the event's own buffers through its iterator and `ContentSeq` entry points,
+//! so no per-event or per-lookup `Vec` is built here.
 //!
 //! Semantics follow SMG's gateway (`KvEventMonitor`): one per-worker block map per lane, stores
 //! placed by the parent's tracked position (SMG ignores `start_position`), removals and clears by
 //! engine block hash, worker removal through SMG's reverse map.
 
-use std::sync::RwLock;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use flume::Receiver;
-use kv_index::{ApplyError, ContentHash, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap};
+use kv_index::{
+    ApplyError, ContentHash, ContentSeq, PositionalIndexer, SequenceHash, StoredBlock,
+    WorkerBlockMap,
+};
 use rustc_hash::FxHashMap;
 
 use super::metrics::{EventKind, KvIndexerMetrics, PreBoundEventCounters};
@@ -23,11 +27,11 @@ use super::metrics::{EventKind, KvIndexerMetrics, PreBoundEventCounters};
 use super::observation::WorkerObservationState;
 use super::traits::SyncIndexer;
 use super::types::{WorkerLookupStats, WorkerTask};
+use super::KvRouterError;
 use crate::protocols::{
     KvCacheEventData, KvCacheEventError, LocalBlockHash, OverlapScores, RouterEvent, WorkerId,
     WorkerWithDpRank,
 };
-use super::KvRouterError;
 
 /// One lane's view of a worker: SMG's interned id and SMG's per-worker block map.
 struct LaneWorker {
@@ -35,17 +39,33 @@ struct LaneWorker {
     blocks: WorkerBlockMap,
 }
 
+/// A request's block hashes as SMG reads them, without copying them into SMG's newtype.
+struct RequestHashes<'a>(&'a [LocalBlockHash]);
+
+impl ContentSeq for RequestHashes<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn at(&self, position: usize) -> ContentHash {
+        ContentHash(self.0[position].0)
+    }
+}
+
 pub struct SmgPositional {
     inner: PositionalIndexer,
-    /// SMG worker id -> Dynamo worker, for translating lookup scores back.
-    workers: RwLock<Vec<Option<WorkerWithDpRank>>>,
+    /// SMG worker id -> Dynamo worker, for translating lookup scores back. Replaced wholesale
+    /// when a worker is interned (rare); lookups take one lock-free load.
+    workers: ArcSwap<Vec<Option<WorkerWithDpRank>>>,
 }
 
 impl SmgPositional {
     pub fn new(jump_size: usize) -> Self {
         Self {
             inner: PositionalIndexer::new(jump_size),
-            workers: RwLock::new(Vec::new()),
+            workers: ArcSwap::from_pointee(Vec::new()),
         }
     }
 
@@ -55,11 +75,14 @@ impl SmgPositional {
             .inner
             .intern_worker(&key)
             .expect("SMG worker id space (u32) exhausted");
-        let mut table = self.workers.write().unwrap_or_else(|e| e.into_inner());
-        if table.len() <= id as usize {
-            table.resize(id as usize + 1, None);
-        }
-        table[id as usize] = Some(worker);
+        self.workers.rcu(|table| {
+            let mut table = Vec::clone(table);
+            if table.len() <= id as usize {
+                table.resize(id as usize + 1, None);
+            }
+            table[id as usize] = Some(worker);
+            table
+        });
         id
     }
 
@@ -75,17 +98,13 @@ impl SmgPositional {
                     smg_id: self.intern(worker),
                     blocks: WorkerBlockMap::default(),
                 });
-                let blocks: Vec<StoredBlock> = store
-                    .blocks
-                    .iter()
-                    .map(|block| StoredBlock {
-                        seq_hash: SequenceHash(block.block_hash.0),
-                        content_hash: ContentHash(block.tokens_hash.0),
-                    })
-                    .collect();
+                let blocks = store.blocks.iter().map(|block| StoredBlock {
+                    seq_hash: SequenceHash(block.block_hash.0),
+                    content_hash: ContentHash(block.tokens_hash.0),
+                });
                 let parent = store.parent_hash.map(|hash| SequenceHash(hash.0));
                 self.inner
-                    .apply_stored(entry.smg_id, &blocks, parent, &mut entry.blocks)
+                    .apply_stored_iter(entry.smg_id, blocks, parent, &mut entry.blocks)
                     .map_err(|error| match error {
                         ApplyError::ParentBlockNotFound | ApplyError::WorkerNotTracked => {
                             KvCacheEventError::ParentBlockNotFound
@@ -96,13 +115,11 @@ impl SmgPositional {
                 let Some(entry) = lane.get_mut(&worker) else {
                     return Err(KvCacheEventError::BlockNotFound);
                 };
-                let hashes: Vec<SequenceHash> = remove
-                    .block_hashes
-                    .iter()
-                    .map(|hash| SequenceHash(hash.0))
-                    .collect();
-                self.inner
-                    .apply_removed(entry.smg_id, &hashes, &mut entry.blocks);
+                self.inner.apply_removed_iter(
+                    entry.smg_id,
+                    remove.block_hashes.iter().map(|hash| SequenceHash(hash.0)),
+                    &mut entry.blocks,
+                );
                 Ok(())
             }
             KvCacheEventData::Cleared => {
@@ -155,7 +172,7 @@ impl SyncIndexer for SmgPositional {
     fn worker(
         &self,
         event_receiver: Receiver<WorkerTask>,
-        metrics: Option<std::sync::Arc<KvIndexerMetrics>>,
+        metrics: Option<Arc<KvIndexerMetrics>>,
     ) -> anyhow::Result<()> {
         let mut lane: FxHashMap<WorkerWithDpRank, LaneWorker> = FxHashMap::default();
         let counters = metrics.as_ref().map(|m| m.prebind());
@@ -242,10 +259,9 @@ impl SyncIndexer for SmgPositional {
     }
 
     fn find_matches(&self, sequence: &[LocalBlockHash], early_exit: bool) -> OverlapScores {
-        let hashes: Vec<ContentHash> = sequence.iter().map(|hash| ContentHash(hash.0)).collect();
-        let smg = self.inner.find_matches(&hashes, early_exit);
+        let smg = self.inner.find_matches_in(&RequestHashes(sequence), early_exit);
         let mut scores = OverlapScores::new();
-        let table = self.workers.read().unwrap_or_else(|e| e.into_inner());
+        let table = self.workers.load();
         for (smg_id, score) in smg.scores {
             if let Some(Some(worker)) = table.get(smg_id as usize) {
                 scores.scores.insert(*worker, score);
