@@ -433,13 +433,13 @@ impl KvEventMonitor {
             return;
         };
         let WorkerIndexState {
-            blocks, skipped, ..
+            blocks, counters, ..
         } = worker_blocks;
-        if skipped != SkippedEvents::default() {
+        if counters != WorkerIndexCounters::default() {
             debug!(
                 worker_id,
-                ?skipped,
-                "KV events the positional index skipped"
+                ?counters,
+                "KV events the positional index did not take as is"
             );
         }
         let result = tokio::task::spawn_blocking(move || {
@@ -769,7 +769,7 @@ impl KvEventMonitor {
         }
         let first_level = stored.blocks.first().and_then(|block| block.cache_level);
         let Some(tier) = indexed_tier(stored.tier, first_level) else {
-            worker_blocks.skipped.untracked_tier += 1;
+            worker_blocks.counters.untracked_tier += 1;
             return;
         };
 
@@ -824,13 +824,13 @@ impl KvEventMonitor {
             return;
         }
         let Some(tier) = indexed_tier(removed.tier, removed.cache_level) else {
-            worker_blocks.skipped.untracked_tier += 1;
+            worker_blocks.counters.untracked_tier += 1;
             return;
         };
 
         let hashes = removed.block_hashes.iter().map(|&h| SequenceHash::from(h));
         let seq_hashes: Vec<SequenceHash> =
-            if tier == IndexedTier::Device && worker_blocks.tiers.is_empty() {
+            if tier == IndexedTier::Device && worker_blocks.copies.is_empty() {
                 hashes.collect()
             } else {
                 hashes
@@ -841,14 +841,14 @@ impl KvEventMonitor {
         indexer.apply_removed(worker_id, &seq_hashes, &mut worker_blocks.blocks);
     }
 
-    /// Drop every block of a worker from the indexer and forget its residency.
+    /// Drop every block of a worker from the indexer and forget its copies.
     fn apply_cleared(
         worker_id: u32,
         indexer: &PositionalIndexer,
         worker_blocks: &mut WorkerIndexState,
     ) {
         indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
-        worker_blocks.tiers.clear();
+        worker_blocks.copies.clear();
     }
 }
 
@@ -868,15 +868,6 @@ fn convert_kv_block(block: &KvBlock, seed: u64) -> StoredBlock {
 enum IndexedTier {
     Device,
     Host,
-}
-
-impl IndexedTier {
-    const fn bit(self) -> u8 {
-        match self {
-            Self::Device => 1,
-            Self::Host => 2,
-        }
-    }
 }
 
 /// The tier an event names: its `tier` when set, else a block's
@@ -903,10 +894,16 @@ fn indexed_tier(tier: Option<i32>, cache_level: Option<i32>) -> Option<IndexedTi
 /// prefix matching is about. Sliding-window and Mamba groups are skipped.
 const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
 
-/// Events the positional index skipped, by reason; logged when the worker's
-/// subscription ends.
+/// The most physical copies of one block counted per tier. vLLM's opt-in
+/// `kv_cache_report_mode: full` re-announces whole hit chains without
+/// removals, which would grow a count without bound; the cap turns that into
+/// at most this many extra removals before the block leaves the index.
+const COPIES_CAP: u8 = 8;
+
+/// What the positional index did not take at face value, by reason; logged
+/// when the worker's subscription ends.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SkippedEvents {
+pub(crate) struct WorkerIndexCounters {
     /// Stores and removals on tiers the index does not track.
     pub(crate) untracked_tier: u64,
     /// Events for cache groups other than main attention.
@@ -915,28 +912,59 @@ pub(crate) struct SkippedEvents {
     pub(crate) remote: u64,
     /// Events owned by a residency agent rather than the engine.
     pub(crate) foreign_owner: u64,
-    /// Removals on a tier that never reported the block.
+    /// Removals on a tier that held no counted copy of the block.
     pub(crate) unknown_copy: u64,
+    /// Stores of a block already indexed on that tier (a second physical copy).
+    pub(crate) duplicate_copies: u64,
+    /// Copy counts that hit [`COPIES_CAP`].
+    pub(crate) capped_copies: u64,
+}
+
+/// Physical copies of one block per tier, all of the worker's ranks pooled:
+/// the worker URL is the routing target and its copies are interchangeable
+/// for a prefix hit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Copies {
+    device: u8,
+    host: u8,
+}
+
+impl Copies {
+    fn on(&mut self, tier: IndexedTier) -> &mut u8 {
+        match tier {
+            IndexedTier::Device => &mut self.device,
+            IndexedTier::Host => &mut self.host,
+        }
+    }
+
+    fn none(self) -> bool {
+        self.device == 0 && self.host == 0
+    }
 }
 
 /// A worker's share of the positional index: the indexer's reverse map plus
-/// the tiers each block is resident on, once the worker reports a tier other
-/// than the device.
+/// the physical copies of each block per tier, once the worker reports more
+/// than one copy or a tier other than the device.
 ///
-/// Residency is sparse. A block gets an entry in `tiers` only when a host
-/// copy is stored, so a device-only worker pays nothing beyond the reverse
-/// map, and an indexed block without an entry is a device-only copy. That
-/// invariant lets a removal on one tier evict the block only when no indexed
-/// copy remains.
+/// The engines do not deduplicate physical blocks: vLLM recomputes the last
+/// block of an exact resend into a second copy with the same hash and emits
+/// `BlockRemoved` per copy, and SGLang's HiCache keeps a host copy next to
+/// the device one. The relay forwards every store and removal, so this state
+/// counts copies and lets a removal evict the block only when none remains.
+///
+/// Counting is sparse. A block gets an entry in `copies` only on a host
+/// store or on a second store of an indexed hash; an indexed block without
+/// an entry is a single device copy. A worker that never duplicates and
+/// never offloads pays one lookup per stored block and no memory.
 #[derive(Default)]
 pub(crate) struct WorkerIndexState {
     /// The indexer's caller-owned reverse map for this worker.
     pub(crate) blocks: WorkerBlockMap,
-    /// Residency bits ([`IndexedTier::bit`]) of blocks with a host copy.
-    tiers: HashMap<SequenceHash, u8>,
+    /// Copies per tier of blocks with a host copy or more than one copy.
+    copies: HashMap<SequenceHash, Copies>,
     /// Cache groups whose kind is not main attention.
     non_main_groups: Vec<u32>,
-    pub(crate) skipped: SkippedEvents,
+    pub(crate) counters: WorkerIndexCounters,
 }
 
 impl WorkerIndexState {
@@ -951,11 +979,11 @@ impl WorkerIndexState {
         ownership: Option<&str>,
     ) -> bool {
         if ownership.is_some_and(|owner| owner.eq_ignore_ascii_case("kvcr")) {
-            self.skipped.foreign_owner += 1;
+            self.counters.foreign_owner += 1;
             return false;
         }
         if locality.is_some_and(|locality| locality == KvCacheLocality::Remote as i32) {
-            self.skipped.remote += 1;
+            self.counters.remote += 1;
             return false;
         }
         let main = match kind {
@@ -973,44 +1001,51 @@ impl WorkerIndexState {
             None => !group_idx.is_some_and(|group| self.non_main_groups.contains(&group)),
         };
         if !main {
-            self.skipped.non_main_group += 1;
+            self.counters.non_main_group += 1;
         }
         main
     }
 
-    /// Record a store on `tier`. A host store opens the block's residency
-    /// entry, crediting a device copy already in the index; a device store
-    /// only updates an entry a host store opened.
+    /// Count a store on `tier`, before the indexer applies it. A second copy
+    /// of an indexed block, or any host copy, opens the block's entry; the
+    /// implicit single device copy is credited when it does.
     fn note_stored(&mut self, blocks: &[StoredBlock], tier: IndexedTier) {
-        match tier {
-            IndexedTier::Host => {
-                for block in blocks {
-                    let indexed = self.blocks.contains_key(&block.seq_hash);
-                    let mask = self.tiers.entry(block.seq_hash).or_insert(0);
-                    if *mask == 0 && indexed {
-                        *mask |= IndexedTier::Device.bit();
-                    }
-                    *mask |= IndexedTier::Host.bit();
-                }
+        for block in blocks {
+            let indexed = self.blocks.contains_key(&block.seq_hash);
+            let entry = match self.copies.entry(block.seq_hash) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(vacant) => match tier {
+                    IndexedTier::Device if !indexed => continue,
+                    _ => vacant.insert(Copies {
+                        device: u8::from(indexed),
+                        host: 0,
+                    }),
+                },
+            };
+            let count = entry.on(tier);
+            if *count > 0 {
+                self.counters.duplicate_copies += 1;
             }
-            IndexedTier::Device if !self.tiers.is_empty() => {
-                for block in blocks {
-                    if let Some(mask) = self.tiers.get_mut(&block.seq_hash) {
-                        *mask |= IndexedTier::Device.bit();
-                    }
-                }
+            if *count < COPIES_CAP {
+                *count += 1;
+            } else {
+                self.counters.capped_copies += 1;
             }
-            IndexedTier::Device => {}
         }
     }
 
-    /// Drop `tier`'s copy of a block; `true` when no indexed copy remains and
-    /// the block should leave the index.
+    /// Drop one copy of a block on `tier`; `true` when no counted copy
+    /// remains and the block should leave the index.
     fn release(&mut self, seq_hash: SequenceHash, tier: IndexedTier) -> bool {
-        match self.tiers.entry(seq_hash) {
+        match self.copies.entry(seq_hash) {
             Entry::Occupied(mut entry) => {
-                *entry.get_mut() &= !tier.bit();
-                if *entry.get() == 0 {
+                let count = entry.get_mut().on(tier);
+                if *count == 0 {
+                    self.counters.unknown_copy += 1;
+                    return false;
+                }
+                *count -= 1;
+                if entry.get().none() {
                     entry.remove();
                     true
                 } else {
@@ -1020,7 +1055,7 @@ impl WorkerIndexState {
             Entry::Vacant(_) => match tier {
                 IndexedTier::Device => true,
                 IndexedTier::Host => {
-                    self.skipped.unknown_copy += 1;
+                    self.counters.unknown_copy += 1;
                     false
                 }
             },
@@ -1590,7 +1625,7 @@ mod tests {
         KvEventMonitor::apply_removed(&from_host, w1, &indexer, &mut wb);
         assert!(!routable(&indexer, w1, &hashes));
         assert_eq!(indexer.current_size(), 0);
-        assert!(wb.tiers.is_empty());
+        assert!(wb.copies.is_empty());
     }
 
     #[test]
@@ -1629,7 +1664,7 @@ mod tests {
         from_host.tier = Some(KvCacheTier::Host as i32);
         KvEventMonitor::apply_removed(&from_host, w1, &indexer, &mut wb);
         assert!(routable(&indexer, w1, &hashes));
-        assert_eq!(wb.skipped.unknown_copy, 1);
+        assert_eq!(wb.counters.unknown_copy, 1);
     }
 
     #[test]
@@ -1655,7 +1690,7 @@ mod tests {
             1,
             "a disk removal does not touch the device copy"
         );
-        assert_eq!(wb.skipped.untracked_tier, 3);
+        assert_eq!(wb.counters.untracked_tier, 3);
     }
 
     #[test]
@@ -1684,7 +1719,7 @@ mod tests {
         removal.group_idx = Some(1);
         KvEventMonitor::apply_removed(&removal, w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 1);
-        assert_eq!(wb.skipped.non_main_group, 3);
+        assert_eq!(wb.counters.non_main_group, 3);
 
         removal.group_idx = Some(0);
         KvEventMonitor::apply_removed(&removal, w1, &indexer, &mut wb);
@@ -1718,12 +1753,12 @@ mod tests {
             1,
             "an agent's clear leaves the engine's blocks"
         );
-        assert_eq!(wb.skipped.remote, 1);
-        assert_eq!(wb.skipped.foreign_owner, 2);
+        assert_eq!(wb.counters.remote, 1);
+        assert_eq!(wb.counters.foreign_owner, 2);
     }
 
     #[test]
-    fn clearing_forgets_residency() {
+    fn clearing_forgets_copies_and_residency() {
         let indexer = PositionalIndexer::new(64);
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
@@ -1732,17 +1767,123 @@ mod tests {
         let mut on_host = stored_event(1, &TOKENS);
         on_host.tier = Some(KvCacheTier::Host as i32);
         KvEventMonitor::apply_stored(&on_host, w1, &indexer, &mut wb);
-        assert!(!wb.tiers.is_empty());
+        assert!(!wb.copies.is_empty());
 
         KvEventMonitor::apply_cleared(w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 0);
-        assert!(wb.tiers.is_empty());
+        assert!(wb.copies.is_empty());
 
         KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
         KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
         assert!(
             !routable(&indexer, w1, &hashes),
             "no stale host bit survives a clear"
+        );
+    }
+
+    #[test]
+    fn two_copies_need_two_removals() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+
+        // vLLM recomputes the last block of an exact resend into a second
+        // physical copy with the same hash and removes the copies one by one.
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        assert!(wb.copies.is_empty(), "a single device copy costs no entry");
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        assert_eq!(wb.counters.duplicate_copies, 1);
+
+        KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        assert!(
+            routable(&indexer, w1, &hashes),
+            "the other copy is still cached"
+        );
+        assert_eq!(indexer.current_size(), 1);
+
+        KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        assert!(!routable(&indexer, w1, &hashes));
+        assert_eq!(indexer.current_size(), 0);
+        assert!(wb.copies.is_empty());
+    }
+
+    #[test]
+    fn device_and_host_copies_are_counted_per_tier() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+        let mut on_host = stored_event(1, &TOKENS);
+        on_host.tier = Some(KvCacheTier::Host as i32);
+        let mut from_host = removed_event(1);
+        from_host.tier = Some(KvCacheTier::Host as i32);
+
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        KvEventMonitor::apply_stored(&on_host, w1, &indexer, &mut wb);
+        assert_eq!(
+            wb.copies[&SequenceHash::from(1i64)],
+            Copies { device: 2, host: 1 }
+        );
+
+        // A host removal consumes the host copy only.
+        KvEventMonitor::apply_removed(&from_host, w1, &indexer, &mut wb);
+        assert!(routable(&indexer, w1, &hashes));
+        // A second host removal has nothing to take and evicts nothing.
+        KvEventMonitor::apply_removed(&from_host, w1, &indexer, &mut wb);
+        assert!(routable(&indexer, w1, &hashes));
+        assert_eq!(wb.counters.unknown_copy, 1);
+
+        KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        assert!(routable(&indexer, w1, &hashes), "one device copy left");
+        KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        assert!(!routable(&indexer, w1, &hashes));
+    }
+
+    #[test]
+    fn clearing_forgets_copy_counts() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        KvEventMonitor::apply_cleared(w1, &indexer, &mut wb);
+        assert!(wb.copies.is_empty());
+
+        KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        assert!(
+            !routable(&indexer, w1, &hashes),
+            "no count survives a clear"
+        );
+    }
+
+    #[test]
+    fn copy_counts_are_capped() {
+        let indexer = PositionalIndexer::new(64);
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+
+        // vLLM's `kv_cache_report_mode: full` re-announces a hit chain on
+        // every lookup without removals; the count stops at the cap.
+        for _ in 0..20 {
+            KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+        }
+        assert_eq!(wb.copies[&SequenceHash::from(1i64)].device, COPIES_CAP);
+        assert_eq!(wb.counters.capped_copies, 20 - u64::from(COPIES_CAP));
+
+        for _ in 1..COPIES_CAP {
+            KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        }
+        assert!(routable(&indexer, w1, &hashes));
+        KvEventMonitor::apply_removed(&removed_event(1), w1, &indexer, &mut wb);
+        assert!(
+            !routable(&indexer, w1, &hashes),
+            "the cap bounds the extra removals"
         );
     }
 }
