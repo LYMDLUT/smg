@@ -2219,6 +2219,7 @@ dependencies = [
  "engine-zmq-adapter",
  "engine-zmq-client",
  "futures",
+ "kv-index",
  "llm-tokenizer",
  "openai-protocol",
  "portpicker",

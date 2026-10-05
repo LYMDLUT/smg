@@ -36,6 +36,8 @@ zeromq.workspace = true
 
 [dev-dependencies]
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
+# The KV-event fixtures' round trip into the gateway's positional index.
+kv-index.workspace = true
 portpicker = "0.1"
 tempfile = "3"
 

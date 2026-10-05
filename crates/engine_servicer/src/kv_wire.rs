@@ -996,3 +996,532 @@ impl Normalizer {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    /// A publisher batch from JSON: objects become msgpack maps (the engines'
+    /// tagged-map events), arrays become arrays (the batch envelope and the
+    /// legacy event layout).
+    fn batch_from(value: Value) -> WireBatch {
+        let bytes = rmp_serde::to_vec_named(&value).expect("encodes");
+        rmp_serde::from_slice(&bytes).expect("decodes")
+    }
+
+    fn normalize_all(batches: Vec<Value>) -> (Vec<common::KvEventBatch>, Normalizer) {
+        let mut normalizer = Normalizer::new();
+        let mut event_id = 0;
+        let out = batches
+            .into_iter()
+            .enumerate()
+            .map(|(seq, value)| normalize(&mut normalizer, value, seq as u64, &mut event_id))
+            .collect();
+        (out, normalizer)
+    }
+
+    fn normalize(
+        normalizer: &mut Normalizer,
+        value: Value,
+        seq: u64,
+        event_id: &mut u64,
+    ) -> common::KvEventBatch {
+        normalizer.normalize_batch(batch_from(value), seq, event_id)
+    }
+
+    fn one(events: Vec<Value>) -> Value {
+        json!([1700000000.5, events, 0])
+    }
+
+    fn store(hashes: &[i64], parent: Option<i64>, tokens: &[u32]) -> Value {
+        json!({
+            "type": "BlockStored",
+            "block_hashes": hashes,
+            "parent_block_hash": parent,
+            "token_ids": tokens,
+            "block_size": 4,
+            "lora_id": null,
+            "medium": "GPU",
+            "lora_name": null,
+            "group_idx": 0,
+            "kv_cache_spec_kind": "full_attention",
+        })
+    }
+
+    fn remove(hashes: &[i64]) -> Value {
+        json!({"type": "BlockRemoved", "block_hashes": hashes, "medium": "GPU", "group_idx": 0})
+    }
+
+    fn with(mut value: Value, key: &str, item: Value) -> Value {
+        value[key] = item;
+        value
+    }
+
+    fn stored(event: &common::KvCacheEvent) -> &common::KvBlocksStored {
+        match event.data {
+            Some(kv_cache_event::Data::Stored(ref stored)) => stored,
+            ref other => panic!("not a store: {other:?}"),
+        }
+    }
+
+    fn removed(event: &common::KvCacheEvent) -> &common::KvBlocksRemoved {
+        match event.data {
+            Some(kv_cache_event::Data::Removed(ref removed)) => removed,
+            ref other => panic!("not a removal: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hash_identity_folds_like_vllm() {
+        let mut digest = [0u8; 32];
+        digest[23] = 0xaa;
+        digest[24..].copy_from_slice(&0x8000_0000_0000_0001u64.to_be_bytes());
+        assert_eq!(low64_big_endian(&digest), 0x8000_0000_0000_0001);
+        assert_eq!(low64_big_endian(&[0, 0, 0, 0, 0, 0, 0, 7]), 7);
+
+        let (batches, _) = normalize_all(vec![one(vec![store(
+            &[i64::MIN + 1, -3],
+            None,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+        )])]);
+        let blocks = &stored(&batches[0].events[0]).blocks;
+        assert_eq!(
+            blocks[0].block_hash,
+            i64::MIN + 1,
+            "a u64 above i64::MAX keeps its bits"
+        );
+        assert_eq!(
+            blocks[1].block_hash, -3,
+            "SGLang's signed form passes through"
+        );
+    }
+
+    #[test]
+    fn unknown_and_malformed_events_cost_themselves_not_the_batch() {
+        let (batches, normalizer) = normalize_all(vec![one(vec![
+            json!({"type": "BlockMigrated", "block_hashes": [1], "destination": "peer"}),
+            json!({"type": "BlockStored", "block_hashes": "nope", "token_ids": [1], "block_size": 1}),
+            json!({"block_hashes": [1]}),
+            json!(["BlockStored", "nope"]),
+            remove(&[9]),
+        ])]);
+        assert_eq!(batches[0].events.len(), 1);
+        assert_eq!(removed(&batches[0].events[0]).block_hashes, vec![9]);
+        assert_eq!(
+            batches[0].events[0].event_id, 5,
+            "ids advance for dropped events too"
+        );
+        let counts = normalizer.counts();
+        assert_eq!(counts.dropped(DropReason::UnknownType), 1);
+        assert_eq!(counts.dropped(DropReason::Malformed), 3);
+        assert_eq!(counts.forwarded_removed, 1);
+    }
+
+    #[test]
+    fn residency_agent_events_are_dropped() {
+        let (batches, normalizer) = normalize_all(vec![one(vec![
+            with(store(&[1], None, &[1, 2, 3, 4]), "ownership", json!("kvcr")),
+            with(remove(&[1]), "ownership", json!("KVCR")),
+            json!({"type": "AllBlocksCleared", "ownership": "kvcr"}),
+            json!({"type": "AllBlocksCleared"}),
+        ])]);
+        assert_eq!(batches[0].events.len(), 1);
+        assert!(matches!(
+            batches[0].events[0].data,
+            Some(kv_cache_event::Data::Cleared(_))
+        ));
+        assert_eq!(
+            normalizer
+                .counts()
+                .dropped(DropReason::UnsupportedOwnership),
+            3
+        );
+        assert_eq!(normalizer.counts().forwarded_cleared, 1);
+    }
+
+    #[test]
+    fn remote_and_unknown_localities_are_dropped() {
+        let (batches, normalizer) = normalize_all(vec![one(vec![
+            with(
+                store(&[1], None, &[1, 2, 3, 4]),
+                "locality",
+                json!("REMOTE"),
+            ),
+            with(remove(&[1]), "locality", json!("elsewhere")),
+            with(store(&[2], None, &[1, 2, 3, 4]), "locality", json!("local")),
+        ])]);
+        assert_eq!(batches[0].events.len(), 1);
+        assert_eq!(
+            stored(&batches[0].events[0]).locality,
+            Some(KvCacheLocality::Local as i32)
+        );
+        assert_eq!(normalizer.counts().dropped(DropReason::NonLocalLocality), 2);
+    }
+
+    #[test]
+    fn media_map_to_tiers_and_cache_levels() {
+        let table = [
+            (None, KvCacheTier::Device, None),
+            (Some("GPU"), KvCacheTier::Device, None),
+            (Some("device"), KvCacheTier::Device, None),
+            (Some("CPU"), KvCacheTier::Host, Some(1)),
+            (Some("CPU_PINNED"), KvCacheTier::Host, Some(1)),
+            (Some("CPU_TIER1"), KvCacheTier::Host, Some(1)),
+            (Some("CPU_TIER2"), KvCacheTier::Disk, Some(2)),
+            (Some("DISK"), KvCacheTier::Disk, Some(2)),
+            (Some("NVME"), KvCacheTier::Disk, Some(2)),
+            (Some("STORAGE"), KvCacheTier::Disk, Some(2)),
+            (Some("EXTERNAL"), KvCacheTier::External, Some(3)),
+            (Some("NETWORK"), KvCacheTier::External, Some(3)),
+            (Some("REMOTE"), KvCacheTier::External, Some(3)),
+            (Some("SHARED"), KvCacheTier::External, Some(3)),
+        ];
+        for (medium, tier, level) in table {
+            assert_eq!(tier_of(medium), Some(tier), "{medium:?}");
+            assert_eq!(cache_level_of(tier), level, "{medium:?}");
+        }
+        assert_eq!(tier_of(Some("MARS")), None);
+
+        let (batches, normalizer) = normalize_all(vec![one(vec![
+            with(
+                store(&[1], None, &[1, 2, 3, 4]),
+                "medium",
+                json!("CPU_PINNED"),
+            ),
+            with(remove(&[1]), "medium", json!("STORAGE")),
+            with(store(&[2], None, &[1, 2, 3, 4]), "medium", json!("MARS")),
+            with(store(&[3], None, &[1, 2, 3, 4]), "medium", Value::Null),
+        ])]);
+        let events = &batches[0].events;
+        assert_eq!(events.len(), 3);
+        let host = stored(&events[0]);
+        assert_eq!(host.tier, Some(KvCacheTier::Host as i32));
+        assert_eq!(host.medium.as_deref(), Some("CPU_PINNED"));
+        assert_eq!(host.blocks[0].cache_level, Some(1));
+        let disk = removed(&events[1]);
+        assert_eq!(disk.tier, Some(KvCacheTier::Disk as i32));
+        assert_eq!(disk.cache_level, Some(2));
+        let device = stored(&events[2]);
+        assert_eq!(device.tier, Some(KvCacheTier::Device as i32));
+        assert_eq!(device.medium, None);
+        assert_eq!(device.blocks[0].cache_level, None);
+        assert_eq!(normalizer.counts().dropped(DropReason::UnknownMedium), 1);
+    }
+
+    #[test]
+    fn non_main_attention_groups_are_dropped_and_remembered() {
+        let sliding = |hash: i64| {
+            let event = with(store(&[hash], None, &[1, 2, 3, 4]), "group_idx", json!(1));
+            let event = with(event, "kv_cache_spec_kind", json!("sliding_window"));
+            with(event, "kv_cache_spec_sliding_window", json!(128))
+        };
+        let (batches, normalizer) = normalize_all(vec![
+            one(vec![
+                sliding(1),
+                store(&[2], None, &[1, 2, 3, 4]),
+                with(
+                    with(
+                        store(&[3], None, &[1, 2, 3, 4]),
+                        "kv_cache_spec_kind",
+                        json!("mla_attention"),
+                    ),
+                    "group_idx",
+                    json!(2),
+                ),
+                with(
+                    with(
+                        store(&[4], None, &[1, 2, 3, 4]),
+                        "kv_cache_spec_kind",
+                        json!("sink_full_attention"),
+                    ),
+                    "group_idx",
+                    json!(3),
+                ),
+                with(
+                    with(
+                        store(&[5], None, &[1, 2, 3, 4]),
+                        "kv_cache_spec_kind",
+                        json!("mamba"),
+                    ),
+                    "group_idx",
+                    json!(4),
+                ),
+            ]),
+            one(vec![
+                // Removals carry no kind: the learned groups decide.
+                with(remove(&[1]), "group_idx", json!(1)),
+                with(remove(&[2]), "group_idx", json!(0)),
+                // An unlearned group without a kind counts as main.
+                with(remove(&[7]), "group_idx", json!(9)),
+                // A kind-less store on a learned non-main group is dropped too.
+                with(
+                    with(store(&[8], None, &[1, 2, 3, 4]), "group_idx", json!(4)),
+                    "kv_cache_spec_kind",
+                    Value::Null,
+                ),
+            ]),
+        ]);
+        assert_eq!(batches[0].events.len(), 3);
+        assert_eq!(batches[1].events.len(), 2);
+        assert_eq!(removed(&batches[1].events[0]).block_hashes, vec![2]);
+        assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![7]);
+        assert_eq!(
+            normalizer
+                .counts()
+                .dropped(DropReason::NonMainAttentionGroup),
+            4
+        );
+        assert_eq!(
+            stored(&batches[0].events[1]).kv_cache_spec_kind.as_deref(),
+            Some("mla_attention")
+        );
+    }
+
+    #[test]
+    fn placeholders_unaligned_and_self_referencing_stores_are_dropped() {
+        let (batches, normalizer) = normalize_all(vec![one(vec![
+            // vLLM's CPU offload placeholder: a chunk key, no tokens, block_size 0.
+            with(
+                with(store(&[1], None, &[]), "block_size", json!(0)),
+                "medium",
+                json!("CPU"),
+            ),
+            store(&[], None, &[1, 2, 3, 4]),
+            store(&[2], None, &[1, 2, 3, 4, 5, 6]),
+            with(store(&[3], None, &[1, 2, 3, 4]), "block_size", json!(0)),
+            store(&[4], Some(4), &[1, 2, 3, 4]),
+            store(&[5, 5], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            store(&[6], None, &[1, 2, 3, 4]),
+        ])]);
+        assert_eq!(batches[0].events.len(), 1);
+        assert_eq!(stored(&batches[0].events[0]).blocks[0].block_hash, 6);
+        let counts = normalizer.counts();
+        assert_eq!(counts.dropped(DropReason::Placeholder), 2);
+        assert_eq!(counts.dropped(DropReason::UnalignedBlocks), 2);
+        assert_eq!(counts.dropped(DropReason::SelfReferencingHashes), 2);
+    }
+
+    #[test]
+    fn bigram_pages_fold_to_their_tokens() {
+        let (batches, normalizer) = normalize_all(vec![one(vec![with(
+            store(&[1], None, &[]),
+            "token_ids",
+            json!([[1, 2], [2, 3], [3, 4], [4, 5]]),
+        )])]);
+        let block = &stored(&batches[0].events[0]).blocks[0];
+        assert_eq!(block.token_ids, vec![1, 2, 3, 4]);
+        assert_eq!(block.block_size, 4);
+        assert_eq!(normalizer.counts().bigram_stores, 1);
+        assert_eq!(normalizer.counts().forwarded_stored, 1);
+    }
+
+    #[test]
+    fn stores_and_removals_are_forwarded_one_for_one() {
+        let (batches, normalizer) = normalize_all(vec![
+            one(vec![
+                store(&[1, 2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
+                store(&[1, 2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
+                store(&[2, 3], Some(1), &[5, 6, 7, 8, 9, 10, 11, 12]),
+            ]),
+            one(vec![
+                remove(&[1]),
+                remove(&[1]),
+                remove(&[1, 2]),
+                store(&[1], None, &[1, 2, 3, 4]),
+            ]),
+        ]);
+        assert_eq!(batches[0].events.len(), 3);
+        assert_eq!(batches[1].events.len(), 4);
+        for event in &batches[1].events[..2] {
+            assert_eq!(removed(event).block_hashes, vec![1]);
+        }
+        assert_eq!(removed(&batches[1].events[2]).block_hashes, vec![1, 2]);
+        let counts = normalizer.counts();
+        assert_eq!(counts.forwarded_stored, 4);
+        assert_eq!(counts.forwarded_removed, 3);
+        assert_eq!(
+            counts.duplicate_stores, 1,
+            "only the exact resend; a re-store after removal is new"
+        );
+        assert!(counts.dropped.is_empty());
+    }
+
+    #[test]
+    fn namespaces_come_from_the_event_its_extra_keys_or_its_parent() {
+        // (A prompt-embeddings digest is msgpack bin, which JSON cannot
+        // express; the generated fixtures cover it.)
+        let lora = |value: Value| with(value, "lora_name", json!("adapter"));
+        let (batches, _) = normalize_all(vec![
+            one(vec![
+                // vLLM: the salt rides in block 0's extra keys, after the LoRA
+                // name and the multimodal (identifier, offset) pairs.
+                with(
+                    lora(store(&[1], None, &[1, 2, 3, 4])),
+                    "extra_keys",
+                    json!([["adapter", ["mm-abc", 0], "salt-1"]]),
+                ),
+                with(
+                    lora(store(&[2], Some(1), &[5, 6, 7, 8])),
+                    "extra_keys",
+                    json!([["adapter"]]),
+                ),
+                store(&[3], Some(2), &[9, 10, 11, 12]),
+                // SGLang: the salt is a field; empty strings count as absent.
+                with(
+                    store(&[4], None, &[1, 2, 3, 4]),
+                    "cache_salt",
+                    json!("tenant-a"),
+                ),
+                with(
+                    with(store(&[5], None, &[1, 2, 3, 4]), "cache_salt", json!("")),
+                    "lora_name",
+                    json!(""),
+                ),
+            ]),
+            // Another rank does not inherit from this one.
+            json!([1700000001.0, [store(&[6], Some(3), &[13, 14, 15, 16])], 1]),
+        ]);
+        let events = &batches[0].events;
+        let first = stored(&events[0]);
+        assert_eq!(first.lora_name.as_deref(), Some("adapter"));
+        assert_eq!(first.cache_salt.as_deref(), Some("salt-1"));
+        let keys: Vec<_> = first.blocks[0]
+            .extra_keys
+            .iter()
+            .map(|key| key.key.clone().expect("a key"))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                kv_block_extra_key::Key::Text("adapter".into()),
+                kv_block_extra_key::Key::Multimodal(common::KvMultimodalKey {
+                    identifier: "mm-abc".into(),
+                    offset: 0,
+                }),
+                kv_block_extra_key::Key::Text("salt-1".into()),
+            ]
+        );
+        let child = stored(&events[1]);
+        assert_eq!(child.lora_name.as_deref(), Some("adapter"));
+        assert_eq!(
+            child.cache_salt.as_deref(),
+            Some("salt-1"),
+            "inherited from block 0"
+        );
+        let grandchild = stored(&events[2]);
+        assert_eq!(grandchild.lora_name.as_deref(), Some("adapter"));
+        assert_eq!(grandchild.cache_salt.as_deref(), Some("salt-1"));
+        assert_eq!(stored(&events[3]).cache_salt.as_deref(), Some("tenant-a"));
+        assert_eq!(stored(&events[3]).lora_name, None);
+        assert_eq!(stored(&events[4]).cache_salt, None);
+        assert_eq!(stored(&events[4]).lora_name, None);
+        let other_rank = stored(&batches[1].events[0]);
+        assert_eq!(other_rank.lora_name, None);
+        assert_eq!(other_rank.cache_salt, None);
+    }
+
+    #[test]
+    fn a_clear_resets_its_rank_only() {
+        let (batches, normalizer) = normalize_all(vec![
+            one(vec![store(&[1], None, &[1, 2, 3, 4])]),
+            json!([1700000001.0, [store(&[1], None, &[1, 2, 3, 4])], 1]),
+            one(vec![
+                json!({"type": "AllBlocksCleared"}),
+                store(&[1], None, &[1, 2, 3, 4]),
+            ]),
+            json!([1700000003.0, [store(&[1], None, &[1, 2, 3, 4])], 1]),
+        ]);
+        assert!(matches!(
+            batches[2].events[0].data,
+            Some(kv_cache_event::Data::Cleared(_))
+        ));
+        assert_eq!(batches[2].events.len(), 2);
+        assert_eq!(normalizer.counts().forwarded_cleared, 1);
+        assert_eq!(
+            normalizer.counts().duplicate_stores,
+            1,
+            "rank 1 kept its seen set"
+        );
+        assert_eq!(batches[3].dp_rank, Some(1));
+    }
+
+    #[test]
+    fn array_and_map_layouts_decode_alike() {
+        let map = one(vec![
+            with(
+                with(
+                    store(&[1, 2], Some(7), &[1, 2, 3, 4, 5, 6, 7, 8]),
+                    "session_id",
+                    json!("req-1"),
+                ),
+                "lora_name",
+                json!("adapter"),
+            ),
+            with(remove(&[1]), "locality", json!("LOCAL")),
+            json!({"type": "AllBlocksCleared"}),
+        ]);
+        let array = json!([
+            1700000000.5,
+            [
+                [
+                    "BlockStored",
+                    [1, 2],
+                    7,
+                    [1, 2, 3, 4, 5, 6, 7, 8],
+                    4,
+                    null,
+                    "GPU",
+                    "adapter",
+                    null,
+                    0,
+                    "full_attention",
+                    null,
+                    null,
+                    null,
+                    "req-1"
+                ],
+                ["BlockRemoved", [1], "GPU", 0, "LOCAL"],
+                ["AllBlocksCleared"],
+            ],
+            0
+        ]);
+        let (from_map, _) = normalize_all(vec![map]);
+        let (from_array, _) = normalize_all(vec![array]);
+        assert_eq!(from_map, from_array);
+        let first = stored(&from_map[0].events[0]);
+        assert_eq!(first.session_id.as_deref(), Some("req-1"));
+        assert_eq!(first.lora_name.as_deref(), Some("adapter"));
+        assert_eq!(first.parent_block_hash, Some(7));
+        assert_eq!(first.group_idx, Some(0));
+        assert_eq!(
+            removed(&from_map[0].events[1]).locality,
+            Some(KvCacheLocality::Local as i32)
+        );
+    }
+
+    #[test]
+    fn legacy_arrays_keep_their_trailing_slots_in_order() {
+        // ownership is the removal's sixth slot and must gate the event even
+        // when locality (the fifth) is set.
+        let (batches, normalizer) = normalize_all(vec![json!([
+            1700000000.5,
+            [
+                ["BlockRemoved", [1], "STORAGE", 0, "LOCAL", "kvcr"],
+                ["BlockRemoved", [2], "STORAGE", 0, "REMOTE"],
+                ["BlockRemoved", [3], "GPU"],
+            ],
+            0
+        ])]);
+        assert_eq!(batches[0].events.len(), 1);
+        assert_eq!(removed(&batches[0].events[0]).block_hashes, vec![3]);
+        assert_eq!(
+            normalizer
+                .counts()
+                .dropped(DropReason::UnsupportedOwnership),
+            1
+        );
+        assert_eq!(normalizer.counts().dropped(DropReason::NonLocalLocality), 1);
+    }
+}
