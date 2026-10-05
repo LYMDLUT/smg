@@ -14,6 +14,7 @@
 mod common;
 mod event_tree;
 mod lane_map;
+pub mod lane_pool;
 mod path_hash;
 pub mod reference;
 pub mod run_index;
@@ -29,6 +30,9 @@ pub use event_tree::{
     StoredBlock, WorkerBlockMap, WorkerId, WorkerIdExhausted, XXH3_SEED,
 };
 pub use lane_map::RunBlockMap;
+pub use lane_pool::{
+    Claimed, Control, LaneHooks, LanePool, LanePoolConfig, PoolMetrics, QueueFull,
+};
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
 pub use reference::{request_prefix_hashes, ReferenceIndexer};
 pub use run_index::{BlockRef, RunIndex, RunIndexStats};
