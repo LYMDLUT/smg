@@ -1,0 +1,223 @@
+diff --git a/lib/bench/Cargo.toml b/lib/bench/Cargo.toml
+index 224e8004c2..644b029ad4 100644
+--- a/lib/bench/Cargo.toml
++++ b/lib/bench/Cargo.toml
+@@ -46,6 +46,7 @@ dc-ckf-relay = [
+ kv-router-stress-support = ["dep:reqwest"]
+ mooncake = [
+   "router-bench",
++  "dynamo-kv-router/smg-backend",
+   "dep:dynamo-mocker",
+   "dep:indicatif",
+   "dep:libc",
+diff --git a/lib/bench/kv_router/mooncake_bench.rs b/lib/bench/kv_router/mooncake_bench.rs
+index d816081cd3..0132872120 100644
+--- a/lib/bench/kv_router/mooncake_bench.rs
++++ b/lib/bench/kv_router/mooncake_bench.rs
+@@ -17,7 +17,9 @@ use dynamo_bench::kv_router_common::issuer::pin_current_thread_to_cpus;
+ use dynamo_bench::kv_router_common::replay::generate_replay_artifacts;
+ use dynamo_bench::kv_router_common::sweep::compute_sweep_durations;
+ use dynamo_kv_router::indexer::KvIndexerMetrics;
+-use dynamo_kv_router::{ConcurrentRadixTreeCompressed, PositionalIndexer, ThreadPoolIndexer};
++use dynamo_kv_router::{
++    ConcurrentRadixTreeCompressed, PositionalIndexer, SmgPositional, ThreadPoolIndexer,
++};
+ use mooncake_open_loop::{
+     OpenLoopConfig, OpenLoopResult, RunProvenance, parse_cpu_list, prepare_mooncake_corpus,
+     prepare_open_loop_trial, run_open_loop, validate_cpu_partition,
+@@ -54,6 +56,15 @@ enum IndexerArgs {
+         #[clap(long, default_value = "16")]
+         num_event_workers: usize,
+     },
++    /// SMG's event-driven PositionalIndexer (smg-project/smg crates/kv_index) behind the same lanes.
++    SmgPositional {
++        /// Number of positions to skip during jump search before scanning back.
++        #[clap(long, default_value = "8")]
++        jump_size: usize,
++        /// Number of OS threads that consume and apply KV cache events.
++        #[clap(long, default_value = "16")]
++        num_event_workers: usize,
++    },
+ }
+
+ impl IndexerArgs {
+@@ -66,6 +77,10 @@ impl IndexerArgs {
+             IndexerArgs::ConcurrentRadixTreeCompressed { num_event_workers } => {
+                 MooncakeIndexerConfig::concurrent_radix_tree_compressed(*num_event_workers)
+             }
++            IndexerArgs::SmgPositional {
++                jump_size,
++                num_event_workers,
++            } => MooncakeIndexerConfig::smg_positional(*jump_size, *num_event_workers),
+         }
+     }
+ }
+@@ -193,7 +208,9 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
+         };
+         if !matches!(
+             config.kind,
+-            MooncakeIndexerKind::NestedMap | MooncakeIndexerKind::ConcurrentRadixTreeCompressed
++            MooncakeIndexerKind::NestedMap
++            | MooncakeIndexerKind::ConcurrentRadixTreeCompressed
++            | MooncakeIndexerKind::SmgPositional
+         ) {
+             anyhow::bail!(
+                 "corrected Mooncake replay supports only nested-map and concurrent-radix-tree-compressed; got {name}"
+@@ -295,6 +312,15 @@ async fn run_open_loop_for_config(
+             ));
+             run_backend(config.short_name(), indexer, trial, open_config).await
+         }
++        MooncakeIndexerKind::SmgPositional => {
++            let indexer = Arc::new(ThreadPoolIndexer::new_with_metrics(
++                SmgPositional::new(config.jump_size),
++                config.num_event_workers,
++                args.common.block_size,
++                metrics(),
++            ));
++            run_backend(config.short_name(), indexer, trial, open_config).await
++        }
+         MooncakeIndexerKind::RadixTree | MooncakeIndexerKind::BranchShardedCrtc => {
+             anyhow::bail!(
+                 "{} is not supported by corrected Mooncake replay",
+@@ -406,7 +432,10 @@ fn run_provenance(args: &Args, config: &MooncakeIndexerConfig) -> anyhow::Result
+         trace_duplication_factor: common.trace_duplication_factor,
+         trace_simulation_duration_ms: common.trace_simulation_duration_ms,
+         seed: common.seed,
+-        jump_size: matches!(config.kind, MooncakeIndexerKind::NestedMap)
++        jump_size: matches!(
++            config.kind,
++            MooncakeIndexerKind::NestedMap | MooncakeIndexerKind::SmgPositional
++        )
+             .then_some(config.jump_size),
+         issuer_spin_us: args.issuer_spin_us,
+         issue_lag_diagnostic_threshold_us: args.issue_lag_diagnostic_threshold_us,
+diff --git a/lib/bench/kv_router/mooncake_shared.rs b/lib/bench/kv_router/mooncake_shared.rs
+index b5f52c324a..c49548a6a5 100644
+--- a/lib/bench/kv_router/mooncake_shared.rs
++++ b/lib/bench/kv_router/mooncake_shared.rs
+@@ -4,6 +4,7 @@
+ use std::sync::Arc;
+
+ use dynamo_kv_router::LocalBlockHash;
++use dynamo_kv_router::SmgPositional;
+ use dynamo_kv_router::indexer::pruning::PruneConfig;
+ use dynamo_kv_router::indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics};
+ use dynamo_kv_router::protocols::{KvCacheEvent, KvCacheEventData, StorageTier};
+@@ -22,6 +23,8 @@ pub enum MooncakeIndexerKind {
+     NestedMap,
+     ConcurrentRadixTreeCompressed,
+     BranchShardedCrtc,
++    /// SMG's event-driven PositionalIndexer (smg-project/smg crates/kv_index).
++    SmgPositional,
+ }
+
+ #[derive(Clone, Debug)]
+@@ -56,6 +59,14 @@ impl MooncakeIndexerConfig {
+         }
+     }
+
++    pub fn smg_positional(jump_size: usize, num_event_workers: usize) -> Self {
++        Self {
++            kind: MooncakeIndexerKind::SmgPositional,
++            jump_size,
++            num_event_workers,
++            ..Self::radix_tree()
++        }
++    }
+     pub fn concurrent_radix_tree_compressed(num_event_workers: usize) -> Self {
+         Self {
+             kind: MooncakeIndexerKind::ConcurrentRadixTreeCompressed,
+@@ -86,6 +97,7 @@ impl MooncakeIndexerConfig {
+                 "concurrent-radix-tree-compressed"
+             }
+             MooncakeIndexerKind::BranchShardedCrtc => "branch-sharded-crtc",
++            MooncakeIndexerKind::SmgPositional => "smg-positional",
+         }
+     }
+
+@@ -93,12 +105,13 @@ impl MooncakeIndexerConfig {
+         let config = match name {
+             "radix-tree" => Self::radix_tree(),
+             "nested-map" => Self::nested_map(8, num_event_workers),
++            "smg-positional" => Self::smg_positional(8, num_event_workers),
+             "concurrent-radix-tree-compressed" => {
+                 Self::concurrent_radix_tree_compressed(num_event_workers)
+             }
+             "branch-sharded-crtc" => Self::branch_sharded_crtc(2, num_event_workers, 2),
+             _ => anyhow::bail!(
+-                "Unknown indexer '{}'. Valid names: radix-tree, nested-map, concurrent-radix-tree-compressed, branch-sharded-crtc",
++                "Unknown indexer '{}'. Valid names: radix-tree, nested-map, concurrent-radix-tree-compressed, branch-sharded-crtc, smg-positional",
+                 name
+             ),
+         };
+@@ -122,6 +135,12 @@ impl MooncakeIndexerConfig {
+                 block_size,
+                 Some(metrics),
+             )),
++            MooncakeIndexerKind::SmgPositional => Arc::new(ThreadPoolIndexer::new_with_metrics(
++                SmgPositional::new(self.jump_size),
++                self.num_event_workers,
++                block_size,
++                Some(metrics),
++            )),
+             MooncakeIndexerKind::ConcurrentRadixTreeCompressed => {
+                 Arc::new(ThreadPoolIndexer::new_with_metrics(
+                     ConcurrentRadixTreeCompressed::new(),
+@@ -185,6 +204,9 @@ impl MooncakeIndexerConfig {
+             MooncakeIndexerKind::BranchShardedCrtc => {
+                 anyhow::bail!("branch-sharded-crtc does not support approximate pruning")
+             }
++            MooncakeIndexerKind::SmgPositional => {
++                anyhow::bail!("smg-positional does not support approximate pruning")
++            }
+         };
+         Ok(indexer)
+     }
+diff --git a/lib/kv-router/Cargo.toml b/lib/kv-router/Cargo.toml
+index d27bb3d177..6ee4a82eb2 100644
+--- a/lib/kv-router/Cargo.toml
++++ b/lib/kv-router/Cargo.toml
+@@ -17,6 +17,8 @@ default = []
+ metrics = ["dep:prometheus"]
+ runtime-protocols = ["dep:dynamo-runtime"]
+ bench = []
++# SMG's kv_index PositionalIndexer behind SyncIndexer, for side-by-side Mooncake replay.
++smg-backend = ["dep:kv-index"]
+ profile = []
+ standalone-indexer = ["dep:axum", "dep:reqwest", "dep:zmq", "dep:chrono", "dep:tracing-appender"]
+ standalone-slot-tracker = ["dep:axum", "dep:zmq"]
+@@ -25,6 +27,8 @@ standalone-selection = ["standalone-indexer", "dep:once_cell"]
+ testing = []
+
+ [dependencies]
++# SMG (smg-project/smg) crates/kv_index, measured from its working tree.
++kv-index = { path = "/tmp/wt-leap/crates/kv_index", optional = true }
+ # repo
+ dynamo-runtime = { workspace = true, optional = true }
+ dynamo-kv-hashing = { workspace = true }
+diff --git a/lib/kv-router/src/indexer/mod.rs b/lib/kv-router/src/indexer/mod.rs
+index 5a9e982056..3605474699 100644
+--- a/lib/kv-router/src/indexer/mod.rs
++++ b/lib/kv-router/src/indexer/mod.rs
+@@ -77,6 +77,8 @@ pub mod concurrent_radix_tree_compressed;
+ pub mod cuckoo;
+ pub mod positional;
+ pub mod pruning;
++#[cfg(feature = "smg-backend")]
++pub mod smg_positional;
+ pub mod radix_tree;
+
+ #[cfg(test)]
+diff --git a/lib/kv-router/src/lib.rs b/lib/kv-router/src/lib.rs
+index 2707a88bf5..58e50f7a8a 100644
+--- a/lib/kv-router/src/lib.rs
++++ b/lib/kv-router/src/lib.rs
+@@ -59,6 +59,8 @@ pub use indexer::{
+     ThreadPoolIndexer,
+ };
+ pub use nested_map::PositionalIndexer;
++#[cfg(feature = "smg-backend")]
++pub use indexer::smg_positional::SmgPositional;
+ pub use protocols::{
+     KvCacheEventError, KvTransferEnforcement, LocalBlockHash, OverlapScores, RouterEvent,
+     RouterEventSink, SharedCacheHits, WorkerConfigLike, WorkerId, compute_block_hash_for_seq,
