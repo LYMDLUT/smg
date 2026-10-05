@@ -7884,6 +7884,7 @@ dependencies = [
 name = "smg-symphony"
 version = "0.0.1"
 dependencies = [
+ "openai-protocol",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

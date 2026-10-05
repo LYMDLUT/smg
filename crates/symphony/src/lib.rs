@@ -16,11 +16,13 @@
 //! The standard this crate is held to is craftsmanship: code that reads as well as it runs, with no
 //! compromise kept for convenience. A change whose only reason is "this can be better" is welcome.
 //!
-//! Status: skeleton. The public types below are the contract; the engine, the format definitions
-//! and the protocol adapters follow in later changes.
+//! Status: the public types below are the contract, and [`adapt`] renders them for the Chat
+//! Completions API; the engine, the format definitions and the other adapters follow in later
+//! changes.
 
 #![forbid(unsafe_code)]
 
+pub mod adapt;
 pub mod event;
 pub mod input;
 pub mod parser;

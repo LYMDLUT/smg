@@ -6,8 +6,8 @@ with one method, `Parser::feed`, whose lifecycle is expressed as input: the prom
 given, each decoded delta, the end of the stream. Every byte of output lands in exactly one event,
 including bytes that were dropped or could not be parsed.
 
-Status: skeleton. The public types are the contract; the engine, the format definitions and the
-protocol adapters follow.
+Status: the public types are the contract, and `adapt::chat` renders them as Chat Completions
+stream choices; the engine, the format definitions and the other adapters follow.
 
 Why the crate has a name: the community has spent years on many parser implementations, and none
 of them is right the way we want it, SMG's own two crates included. Not right as working code;
