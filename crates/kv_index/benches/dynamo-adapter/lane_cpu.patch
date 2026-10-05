@@ -1,8 +1,8 @@
 diff --git a/lib/bench/kv_router/mooncake_open_loop.rs b/lib/bench/kv_router/mooncake_open_loop.rs
-index 923c3bafbe..ac3bd14280 100644
+index 923c3bafbe..3b5f8c0f4f 100644
 --- a/lib/bench/kv_router/mooncake_open_loop.rs
 +++ b/lib/bench/kv_router/mooncake_open_loop.rs
-@@ -899,9 +899,53 @@ pub struct OpenLoopResult {
+@@ -899,9 +899,38 @@ pub struct OpenLoopResult {
      /// Resident set of the process once every lane has drained: the corpus plus the backend's
      /// index, so backends compare against the null backend's figure.
      pub end_rss_bytes: u64,
@@ -38,25 +38,19 @@ index 923c3bafbe..ac3bd14280 100644
 +    ticks * 1_000_000_000 / ticks_per_second
 +}
 +
-+/// `VmRSS` from `/proc/self/status`, in bytes (0 when unavailable).
-+fn resident_bytes() -> u64 {
-+    std::fs::read_to_string("/proc/self/status")
-+        .ok()
-+        .and_then(|status| {
-+            status.lines().find_map(|line| {
-+                let rest = line.strip_prefix("VmRSS:")?;
-+                let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-+                Some(kb * 1024)
-+            })
-+        })
-+        .unwrap_or(0)
-+}
-+
-+
  /// `VmRSS` from `/proc/self/status`, in bytes (0 when unavailable).
  fn resident_bytes() -> u64 {
      std::fs::read_to_string("/proc/self/status")
-@@ -1474,6 +1518,7 @@ fn analyze_result(
+@@ -916,6 +945,8 @@ fn resident_bytes() -> u64 {
+         .unwrap_or(0)
+ }
+ 
++
++
+ fn partition_dispatch(
+     dispatch: Vec<DispatchEntry>,
+     event_issuer_count: usize,
+@@ -1474,6 +1505,7 @@ fn analyze_result(
          failure_reasons,
          backend_timing_report,
          end_rss_bytes: resident_bytes(),
