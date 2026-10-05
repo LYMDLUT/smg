@@ -85,6 +85,11 @@ impl RunBlockMap {
         self.slots.len()
     }
 
+    /// Bytes held from the process allocator: slots and tags.
+    pub fn memory_bytes(&self) -> usize {
+        self.slots.len() * size_of::<Slot>() + self.tags.len()
+    }
+
     #[inline]
     fn home(&self, key: u64) -> usize {
         // Fibonacci hashing spreads structured keys; engine hashes are already uniform.

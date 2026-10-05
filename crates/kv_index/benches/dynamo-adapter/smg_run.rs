@@ -31,16 +31,14 @@ use crate::protocols::{
     WorkerWithDpRank,
 };
 
-/// Bytes per slot of the lane maps (`RunBlockMap`: open addressing, 16-byte slots), for the
-/// memory report.
-const MAP_SLOT_BYTES: usize = 16;
-
 /// One lane's view of a worker: SMG's interned id and SMG's per-worker block map.
 struct LaneWorker {
     smg_id: u32,
     blocks: RunBlockMap,
     /// Capacity last charged to `SmgRun::map_slots`.
     charged_slots: usize,
+    /// Bytes last charged to `SmgRun::map_bytes`.
+    charged_bytes: usize,
 }
 
 pub struct SmgRun {
@@ -52,6 +50,8 @@ pub struct SmgRun {
     intern_lock: Mutex<()>,
     /// Allocated slots across every lane map, kept current by the lanes.
     map_slots: AtomicUsize,
+    /// Bytes the lane maps hold from the process allocator (slots and tags).
+    map_bytes: AtomicUsize,
     /// Lookups served and runs walked by them, for the fragmentation line of the report.
     lookups: AtomicUsize,
     runs_walked: AtomicUsize,
@@ -68,6 +68,7 @@ impl SmgRun {
             workers: ArcSwap::from_pointee(Vec::new()),
             intern_lock: Mutex::new(()),
             map_slots: AtomicUsize::new(0),
+            map_bytes: AtomicUsize::new(0),
             lookups: AtomicUsize::new(0),
             runs_walked: AtomicUsize::new(0),
             idle_ns: AtomicUsize::new(0),
@@ -90,11 +91,22 @@ impl SmgRun {
                 .fetch_sub(entry.charged_slots - slots, Ordering::Relaxed);
         }
         entry.charged_slots = slots;
+        let bytes = entry.blocks.memory_bytes();
+        if bytes > entry.charged_bytes {
+            self.map_bytes
+                .fetch_add(bytes - entry.charged_bytes, Ordering::Relaxed);
+        } else if bytes < entry.charged_bytes {
+            self.map_bytes
+                .fetch_sub(entry.charged_bytes - bytes, Ordering::Relaxed);
+        }
+        entry.charged_bytes = bytes;
     }
 
     fn release_map(&self, entry: &LaneWorker) {
         self.map_slots
             .fetch_sub(entry.charged_slots, Ordering::Relaxed);
+        self.map_bytes
+            .fetch_sub(entry.charged_bytes, Ordering::Relaxed);
     }
 
     fn intern(&self, worker: WorkerWithDpRank) -> u32 {
@@ -125,6 +137,7 @@ impl SmgRun {
                     smg_id: self.intern(worker),
                     blocks: RunBlockMap::default(),
                     charged_slots: 0,
+                    charged_bytes: 0,
                 });
                 let blocks: Vec<StoredBlock> = store
                     .blocks
@@ -349,8 +362,10 @@ impl SyncIndexer for SmgRun {
         let memberships = self.inner.current_size();
         let distinct = self.inner.entry_count();
         let map_slots = self.map_slots.load(Ordering::Relaxed);
-        let map_bytes = map_slots * MAP_SLOT_BYTES;
+        let map_bytes = self.map_bytes.load(Ordering::Relaxed);
         let index_bytes = stats.arena_bytes + stats.header_bytes;
+        // What the process allocator sees: whole arena and slab chunks plus the maps.
+        let allocated_bytes = stats.arena_chunk_bytes + stats.slab_bytes + map_bytes;
         let per_membership = |bytes: usize| {
             if memberships == 0 {
                 0.0
@@ -366,6 +381,7 @@ impl SyncIndexer for SmgRun {
              arena bytes = {} header bytes = {} (index {:.1} B per membership)\n  \
              lane map slots = {map_slots} bytes = {map_bytes} ({:.1} B per membership)\n  \
              total {:.1} B per membership\n  \
+             allocated: arena chunks {} (free-listed {}) slab {} maps {map_bytes} = {} ({:.1} B per membership)\n  \
              lookups = {} runs walked per lookup = {:.2}\n  \
              lanes: busy {:.3} s idle {:.3} s (up to the last flush)\n  \
              locks root/own/shared = {:?} contended = {:?} wait_ms = {:?}\n  \
@@ -380,6 +396,11 @@ impl SyncIndexer for SmgRun {
             per_membership(index_bytes),
             per_membership(map_bytes),
             per_membership(index_bytes + map_bytes),
+            stats.arena_chunk_bytes,
+            stats.arena_free_bytes,
+            stats.slab_bytes,
+            allocated_bytes,
+            per_membership(allocated_bytes),
             self.lookups.load(Ordering::Relaxed),
             self.runs_walked.load(Ordering::Relaxed) as f64
                 / self.lookups.load(Ordering::Relaxed).max(1) as f64,

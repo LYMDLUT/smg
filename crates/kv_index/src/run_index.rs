@@ -203,6 +203,16 @@ impl WordArena {
         self.next.load(Ordering::Relaxed)
     }
 
+    /// Bytes of chunks taken from the process allocator: what the arena costs in memory.
+    fn chunk_bytes(&self) -> usize {
+        let chunks = self
+            .dir
+            .iter()
+            .filter(|chunk| chunk.get().is_some())
+            .count();
+        chunks * WORD_CHUNK * size_of::<AtomicU64>()
+    }
+
     /// Words sitting in free lists.
     fn free_words(&self) -> usize {
         let arrays: usize = self
@@ -941,6 +951,17 @@ impl RunSlab {
     fn allocated(&self) -> usize {
         self.next.load(Ordering::Relaxed) as usize
     }
+
+    /// Bytes of chunks taken from the process allocator: headers and coverage words of every
+    /// slot, used or not.
+    fn chunk_bytes(&self) -> usize {
+        let chunks = self
+            .dir
+            .iter()
+            .filter(|chunk| chunk.get().is_some())
+            .count();
+        chunks * RUN_CHUNK * (size_of::<Run>() + self.words * size_of::<AtomicU64>())
+    }
 }
 
 #[inline]
@@ -1005,8 +1026,14 @@ pub struct RunIndexStats {
     pub arena_bytes: usize,
     /// Bytes of the word arena sitting in free lists.
     pub arena_free_bytes: usize,
+    /// Bytes the word arena holds from the process allocator: `arena_bytes` rounded up to whole
+    /// chunks (8 MiB each).
+    pub arena_chunk_bytes: usize,
     /// Bytes of run headers, coverage words included (all allocated runs).
     pub header_bytes: usize,
+    /// Bytes the run slab holds from the process allocator: whole chunks of headers and coverage
+    /// words, used or not.
+    pub slab_bytes: usize,
 }
 
 /// Where a writer waited: the root, a leaf only this worker holds, or a run others hold too.
@@ -2691,7 +2718,9 @@ impl RunIndex {
             runs_free: self.slab.free.len(),
             arena_bytes: self.arena.used() as usize * size_of::<AtomicU64>(),
             arena_free_bytes: self.arena.free_words() * size_of::<AtomicU64>(),
+            arena_chunk_bytes: self.arena.chunk_bytes(),
             header_bytes: allocated * (size_of::<Run>() + self.words * size_of::<AtomicU64>()),
+            slab_bytes: self.slab.chunk_bytes(),
             ..RunIndexStats::default()
         };
         for id in 1..allocated as u32 {
