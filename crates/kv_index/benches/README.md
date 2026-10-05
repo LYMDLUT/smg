@@ -154,6 +154,19 @@ midpoint until the bracket is within the tolerance and writes `bracket.json` and
 For Dynamo's binary use `{window_ms}` in the template with `--total-block-ops` (the corpus
 total, 320,105,993 for the standard corpus), and the script derives the window per point.
 
+First brackets on the development host (competitor layout, 3 trials per point, every trial of a
+point must keep up; host daemons recorded as foreign load on every trial):
+
+| Indexer, harness | Keeps up at | Fails at | Trials at the failing rate (achieved / offered) | Lookup p50 / p99 (us) at the kept-up rate |
+| --- | --- | --- | --- | --- |
+| SMG `PositionalIndexer`, SMG harness | 107.0M (3000 ms window, parity trials) | 116.7M | 99.6%, 99.2%, 94.8% | 14-17 / 58-138 |
+| Dynamo CRTC, Dynamo harness | 682.2M | 727.2M | 99.3%, 97.5%, 99.7% | 3.5-3.6 / 14 |
+
+Both searches ended on a point where one trial of three fell short while the other two kept up
+(the SMG points at 127.2M and 116.7M: 96.5% and 94.8%; CRTC at 727.2M: 97.5%; at 826.4M one CRTC
+trial achieved 82.3%). With the strict rule the brackets are conservative; the per-trial ratios
+are in `bracket.json`, and a looser rule (two of three) would move both upper ends by one point.
+
 ## Publication protocol (guardrail 5)
 
 ```
@@ -164,13 +177,41 @@ python3 benches/protocol/publish_protocol.py --name "<system, harness>" --trials
 
 Each subject trial is followed by a control trial of the same command (or `--control-command`),
 so the pair shows the noise floor an A/A comparison would show before any difference under 5% is
-called. Every trial holds the lock, and the measurement cores are sampled for one second before
-and after it: a process above 5% CPU that is neither the trial nor allow-listed marks the trial
-discarded (kept and listed with the offender); allow-listed daemons are recorded as background.
-The summary gives medians with percentile-bootstrap 95% intervals (10,000 resamples) of achieved
-block ops/s and lookup p50/p99 per series, the subject-minus-control difference with its own
-interval, the discarded trials and why, and the background processes seen. Finished trials are
-skipped on re-run, so an interrupted run resumes.
+called. The lock is held per trial or, with `--lock-scope run`, for the whole run (one queue wait,
+all trials of a series under the same conditions). The measurement cores are sampled for one
+second before and after every trial: every process above 5% of a core is recorded with its peak,
+and a trial is discarded (kept and listed with the offender) when a process above 50% of a core
+is neither the trial nor allow-listed; discarded trials are replaced until each series has the
+requested number of usable ones or twice that many were attempted. The summary gives medians with
+percentile-bootstrap 95% intervals (10,000 resamples) of achieved block ops/s and lookup p50/p99
+per series, the subject-minus-control difference with its own interval, the discarded trials and
+why, and the background processes seen. The sampled rows are stored raw, so re-running on the
+same output directory resumes an interrupted run and re-summarises finished trials under other
+thresholds.
+
+## First protocol run (competitor layout)
+
+Both systems through the runner above on the development host, competitor layout (issuers on
+0-3, query issuer on 4, 64 event lanes and 128 query lanes on 5-63), 20 usable trials per series
+with the interleaved same-binary control, one lock hold per series, lane cores sampled around
+every trial (record 5%, discard 50%). The sustained points are the kept-up ends of the brackets
+above; the 750 ms window offers 427M.
+
+| System, harness | Load | Used / discarded | Kept up | Achieved median [95% CI] (M block ops/s) | Lookup p50 [CI] (us) | Lookup p99 [CI] (us) | Subject minus control: achieved, p50, p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| SMG PositionalIndexer, SMG harness | sustained bracket (107M offered) | 20 / 2 | 20 of 20 | 106.5 [106.2, 106.5] | 16.6 [16.5, 16.7] | 111 [105, 119] | -0.0 [-0.3, +0.4], -0.1 [-0.2, +0.1], +0.2 [-10.2, +8.8] |
+| control (same binary) (SMG PositionalIndexer) | same | 21 / 1 | 17 of 21 | 106.5 [106.1, 106.5] | 16.7 [16.5, 16.8] | 111 [108, 116] | |
+| Dynamo CRTC, Dynamo harness | sustained bracket (682M offered) | 21 / 5 | 16 of 21 | 679.8 [676.5, 679.9] | 3.3 [2.9, 3.4] | 13 [12, 14] | +1.6 [-2.5, +11.6], +0.0 [-0.4, +0.4], +0.1 [-1.4, +1.2] |
+| control (same binary) (Dynamo CRTC) | same | 20 / 6 | 11 of 20 | 678.1 [668.2, 679.9] | 3.3 [3.0, 3.5] | 13 [12, 14] | |
+| Dynamo CRTC, Dynamo harness | 750 ms window (427M offered) | 20 / 0 | 20 of 20 | 426.0 [426.0, 426.1] | 3.4 [3.3, 3.4] | 14 [13, 14] | +0.0 [-0.0, +0.1], +0.0 [-0.1, +0.1], +0.2 [-0.1, +0.4] |
+| control (same binary) (Dynamo CRTC) | same | 20 / 0 | 19 of 20 | 426.0 [426.0, 426.0] | 3.4 [3.3, 3.4] | 13 [13, 14] | |
+
+The control pairs put the noise floor at or below one unit in the last digit for throughput and
+lookup p50; lookup p99 for the SMG indexer has a wider floor (about ±10 us at 20 trials). Discarded
+trials were replaced; the reasons were other users' jobs crossing 50% of a core (git operations,
+a backup agent, a load generator). At 750 ms the competitor still keeps up (99.8% of 427M), so its
+capacity point needs a shorter window; the SMG indexer's 750 ms series and the competitor's 300 ms
+series are the next rows.
 
 ## Plugging in a new index
 
