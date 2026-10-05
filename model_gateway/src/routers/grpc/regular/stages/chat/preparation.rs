@@ -5,6 +5,7 @@ use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, ToolChoice, ToolChoiceValue},
+    profile::is_deepseek_v41_flash,
 };
 use tracing::{debug, error};
 
@@ -394,12 +395,7 @@ fn prepare_response_format_tag(
     // Respect parser overrides, including models served under aliases. With no
     // override, retain the bounded canonical V4.1 Flash auto-detection.
     let is_v41 = parser.map_or_else(
-        || {
-            request
-                .model
-                .split('/')
-                .any(|part| part.eq_ignore_ascii_case("deepseek-v4.1-flash"))
-        },
+        || is_deepseek_v41_flash(&request.model),
         |name| name.eq_ignore_ascii_case("deepseek_v41"),
     );
     if !is_v41 || !starts_in_reasoning || has_tool_constraint {
