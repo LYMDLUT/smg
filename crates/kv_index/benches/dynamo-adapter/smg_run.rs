@@ -11,8 +11,10 @@
 //! placed by the parent's tracked position (SMG ignores `start_position`), removals and clears by
 //! engine block hash, worker removal through the lane's map.
 
-use std::sync::RwLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use arc_swap::ArcSwap;
 
 use flume::Receiver;
 use kv_index::{ApplyError, ContentHash, RunBlockMap, RunIndex, SequenceHash, StoredBlock};
@@ -43,18 +45,27 @@ struct LaneWorker {
 
 pub struct SmgRun {
     inner: RunIndex,
-    /// SMG worker id -> Dynamo worker, for translating lookup scores back.
-    workers: RwLock<Vec<Option<WorkerWithDpRank>>>,
+    /// SMG worker id -> Dynamo worker, for translating lookup scores back. Replaced wholesale
+    /// when a worker is interned (rare) so lookups read it without a lock: a read lock taken by
+    /// 128 query lanes is a shared cache line every lookup writes.
+    workers: ArcSwap<Vec<Option<WorkerWithDpRank>>>,
+    intern_lock: Mutex<()>,
     /// Allocated slots across every lane map, kept current by the lanes.
     map_slots: AtomicUsize,
+    /// Lookups served and runs walked by them, for the fragmentation line of the report.
+    lookups: AtomicUsize,
+    runs_walked: AtomicUsize,
 }
 
 impl SmgRun {
     pub fn new(max_workers: usize) -> Self {
         Self {
             inner: RunIndex::with_max_workers(max_workers),
-            workers: RwLock::new(Vec::new()),
+            workers: ArcSwap::from_pointee(Vec::new()),
+            intern_lock: Mutex::new(()),
             map_slots: AtomicUsize::new(0),
+            lookups: AtomicUsize::new(0),
+            runs_walked: AtomicUsize::new(0),
         }
     }
 
@@ -86,11 +97,13 @@ impl SmgRun {
             .inner
             .intern_worker(&key)
             .expect("SMG run index worker slots exhausted; raise --max-workers");
-        let mut table = self.workers.write().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.intern_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut table: Vec<Option<WorkerWithDpRank>> = self.workers.load().as_ref().clone();
         if table.len() <= id as usize {
             table.resize(id as usize + 1, None);
         }
         table[id as usize] = Some(worker);
+        self.workers.store(std::sync::Arc::new(table));
         id
     }
 
@@ -282,13 +295,18 @@ impl SyncIndexer for SmgRun {
 
     fn find_matches(&self, sequence: &[LocalBlockHash], early_exit: bool) -> OverlapScores {
         let mut scores = OverlapScores::new();
-        let table = self.workers.read().unwrap_or_else(|e| e.into_inner());
-        self.inner
+        let table = self.workers.load();
+        // Every interned worker may score; size the map once instead of growing it per insert.
+        scores.scores.reserve(table.len());
+        let walked = self
+            .inner
             .score_into(sequence, |hash| hash.0, early_exit, |smg_id, score| {
                 if let Some(Some(worker)) = table.get(smg_id as usize) {
                     scores.scores.insert(*worker, score);
                 }
             });
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        self.runs_walked.fetch_add(walked, Ordering::Relaxed);
         scores
     }
 
@@ -321,7 +339,8 @@ impl SyncIndexer for SmgRun {
              runs allocated = {} live = {} blocks in live runs = {}\n  \
              arena bytes = {} header bytes = {} (index {:.1} B per membership)\n  \
              lane map slots = {map_slots} bytes = {map_bytes} ({:.1} B per membership)\n  \
-             total {:.1} B per membership",
+             total {:.1} B per membership\n  \
+             lookups = {} runs walked per lookup = {:.2}",
             stats.runs_allocated,
             stats.runs_live,
             stats.blocks_live,
@@ -330,6 +349,9 @@ impl SyncIndexer for SmgRun {
             per_membership(index_bytes),
             per_membership(map_bytes),
             per_membership(index_bytes + map_bytes),
+            self.lookups.load(Ordering::Relaxed),
+            self.runs_walked.load(Ordering::Relaxed) as f64
+                / self.lookups.load(Ordering::Relaxed).max(1) as f64,
         )
     }
 }

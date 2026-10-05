@@ -1543,15 +1543,16 @@ impl RunIndex {
     /// The lookup behind [`find_matches`](Self::find_matches), for callers that keep their own
     /// hash type and result shape: `hash_of` reads a block's content hash, `report` receives
     /// every `(worker, score)` with a non-empty prefix (once each). Nothing is allocated.
+    /// Returns the number of runs walked, a measure of how fragmented the matched path is.
     pub fn score_into<T>(
         &self,
         content_hashes: &[T],
         hash_of: impl Fn(&T) -> u64,
         early_exit: bool,
         mut report: impl FnMut(u32, u32),
-    ) {
+    ) -> usize {
         let Some(first) = content_hashes.first() else {
-            return;
+            return 0;
         };
         let first = hash_of(first);
         let root = self.slab.run(ROOT);
@@ -1561,13 +1562,14 @@ impl RunIndex {
             if root.confirm(version) {
                 match found {
                     Some(entry) => break entry,
-                    None => return,
+                    None => return 0,
                 }
             }
         };
         let words = self.words;
         let mut alive = [0u64; MAX_WORDS];
         let mut position = 0usize;
+        let mut walked = 0usize;
         loop {
             let run = self.slab.run(run_id);
             let (window, version) = run.snapshot();
@@ -1598,6 +1600,7 @@ impl RunIndex {
             if !run.confirm(version) {
                 continue;
             }
+            walked += 1;
             if matched == 0 {
                 break;
             }
@@ -1605,7 +1608,7 @@ impl RunIndex {
                 alive = held;
                 if early_exit {
                     emit(&alive[..words], 1, &mut report);
-                    return;
+                    return walked;
                 }
             } else {
                 for (index, word) in alive[..words].iter_mut().enumerate() {
@@ -1617,7 +1620,7 @@ impl RunIndex {
                 }
             }
             if alive[..words].iter().all(|word| *word == 0) {
-                return;
+                return walked;
             }
             position += matched;
             match next {
@@ -1629,6 +1632,7 @@ impl RunIndex {
             }
         }
         emit(&alive[..words], position as u32, &mut report);
+        walked
     }
 
     /// Every block every worker holds, as `(worker, position, content hash, prefix hash)`;
