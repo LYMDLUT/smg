@@ -35,7 +35,7 @@ again), `reset` (`POST /reset_prefix_cache` on vLLM, `POST /flush_cache` on SGLa
 Command: `launch-command.txt` (`run-vllm.sh`): `--prefix-caching-hash-algo sha256_cbor --block-size 16
 --enable-prompt-tokens-details --kv-cache-memory-bytes 1073741824` (585 GPU blocks) `--max-model-len 4096
 --enforce-eager`, `--kv-events-config` with the ZMQ publisher, topic `kv-events`, replay endpoint on,
-`PYTHONHASHSEED=0`, `VLLM_SERVER_DEV_MODE=1` (for `/reset_prefix_cache`). `cache_config_info.prom` is the
+`PYTHONHASHSEED=0` (note: vLLM seeds `NONE_HASH` with the verbatim value of `PYTHONHASHSEED` when it is set, so the hashes in this capture chain from `sha256(cbor("0"))`, not from the default `"vllm-none-hash"`; a reproduction must use the same seed), `VLLM_SERVER_DEV_MODE=1` (for `/reset_prefix_cache`). `cache_config_info.prom` is the
 engine's `vllm:cache_config_info` metric line.
 
 Stream: 57 batches, seq 0..56 without gaps, 7547 events (154 `BlockStored`, 7392 `BlockRemoved`, 1 `AllBlocksCleared`),
