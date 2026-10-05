@@ -282,14 +282,35 @@ const INLINE_WORKER_IDS: u32 = 128;
 ///
 /// Two inline words cover ids below [`INLINE_WORKER_IDS`] with no heap
 /// allocation, which is every worker in a typical fleet; larger ids spill
-/// into a boxed word slice that is regrown on demand (rare: a fleet past 128
-/// workers). Membership is a bit test and "does this set hold every active
-/// worker" a loop of bit tests, which is what the lookup path does at every
-/// landing and scan step.
+/// into a boxed vector that is grown on demand (rare: a fleet past 128
+/// workers). The spill sits behind one thin pointer so the set is 24 bytes and
+/// an [`IndexEntry`] 48, which keeps a map bucket (16-byte key included) at 64
+/// bytes. Membership is a bit test, which is what the lookup path does for
+/// every active worker at every position.
 #[derive(Debug, Clone, Default)]
 struct WorkerSet {
     low: [u64; 2],
-    high: Option<Box<[u64]>>,
+    high: Option<Box<Spill>>,
+}
+
+/// The spill words of a [`WorkerSet`] (ids at or above [`INLINE_WORKER_IDS`]), boxed as one
+/// thin pointer: a `Box<[u64]>` is two words and would put the set back at 32 bytes. The extra
+/// indirection is paid only on the rare spill path.
+#[derive(Debug, Clone, Default)]
+struct Spill(Vec<u64>);
+
+impl std::ops::Deref for Spill {
+    type Target = Vec<u64>;
+
+    fn deref(&self) -> &Vec<u64> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Spill {
+    fn deref_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.0
+    }
 }
 
 impl WorkerSet {
@@ -313,18 +334,12 @@ impl WorkerSet {
             return !was;
         }
         let index = word - 2;
-        let mut high = match self.high.take() {
-            Some(high) if high.len() > index => high,
-            Some(high) => {
-                let mut grown = vec![0u64; index + 1];
-                grown[..high.len()].copy_from_slice(&high);
-                grown.into_boxed_slice()
-            }
-            None => vec![0u64; index + 1].into_boxed_slice(),
-        };
+        let high = self.high.get_or_insert_with(Box::default);
+        if high.len() <= index {
+            high.resize(index + 1, 0);
+        }
         let was = high[index] & bit != 0;
         high[index] |= bit;
-        self.high = Some(high);
         !was
     }
 
@@ -1779,6 +1794,16 @@ mod tests {
             Some(&3)
         );
         assert!(indexer.find_matches_in(&raw[..0], false).scores.is_empty());
+    }
+
+    /// The index stores one `IndexEntry` per (position, content) key; its size sets the
+    /// bytes per unique block, so a regression here is a memory regression.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn index_entry_is_48_bytes() {
+        assert_eq!(size_of::<WorkerSet>(), 24);
+        assert_eq!(size_of::<SeqEntry>(), 40);
+        assert_eq!(size_of::<IndexEntry>(), 48);
     }
 
     // Jump search edge cases
