@@ -603,8 +603,9 @@ fn query_lane_worker<B: ReplayBackend>(
     epoch: Instant,
     cpus: Arc<[usize]>,
     mirror: bool,
-) -> (Vec<QueryCompletion>, Option<&'static str>) {
+) -> (Vec<QueryCompletion>, Option<&'static str>, u64) {
     let _ = pin_current_thread(&cpus);
+    let cpu_started = thread_cpu_time_ns();
     *lane.consumer.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread::current());
     let mut completions = Vec::with_capacity(lane.slots.len());
     let mut consumed = 0usize;
@@ -651,7 +652,11 @@ fn query_lane_worker<B: ReplayBackend>(
             thread::park();
         }
     }
-    (completions, failure)
+    (
+        completions,
+        failure,
+        thread_cpu_time_ns().saturating_sub(cpu_started),
+    )
 }
 
 #[derive(Clone, Copy, Default)]
@@ -668,8 +673,9 @@ fn event_lane_worker<B: ReplayBackend>(
     epoch: Instant,
     cpus: Arc<[usize]>,
     expected: usize,
-) -> Vec<EventCompletion> {
+) -> (Vec<EventCompletion>, u64) {
     let _ = pin_current_thread(&cpus);
+    let cpu_started = thread_cpu_time_ns();
     let mut lane = backend.new_lane();
     let mut completions = Vec::with_capacity(expected);
     while let Ok(EventMsg { id, payload }) = receiver.recv() {
@@ -722,7 +728,10 @@ fn event_lane_worker<B: ReplayBackend>(
             ok,
         });
     }
-    completions
+    (
+        completions,
+        thread_cpu_time_ns().saturating_sub(cpu_started),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1054,6 +1063,10 @@ struct Args {
     issue_lag_diagnostic_threshold_us: u64,
     #[arg(long, default_value = "5000")]
     pre_run_quiescence_ms: u64,
+    /// Pin each event lane to one backend CPU (round robin) instead of letting it float over
+    /// the set; a diagnostic for scheduler effects, not Dynamo's method.
+    #[arg(long)]
+    pin_event_lanes: bool,
     /// Charge what Dynamo's harness charges every backend: each event arrives as an owned payload
     /// in Dynamo's block layout (40 bytes per block, allocated before the trial) that the lane
     /// converts into this crate's blocks and frees after the apply, and each lookup copies its
@@ -1277,14 +1290,15 @@ fn run<B: ReplayBackend>(
     }
     let mut senders = Vec::with_capacity(args.event_lanes);
     let mut event_threads = Vec::with_capacity(args.event_lanes);
-    for &expected in &event_lane_expected {
+    for (idx, &expected) in event_lane_expected.iter().enumerate() {
         let (tx, rx) = mpsc::channel::<EventMsg>();
         senders.push(tx);
-        let (backend, corpus, cpus) = (
-            Arc::clone(&backend),
-            Arc::clone(&corpus),
-            Arc::clone(&backend_cpus),
-        );
+        let cpus: Arc<[usize]> = if args.pin_event_lanes && !backend_cpus.is_empty() {
+            Arc::from(vec![backend_cpus[idx % backend_cpus.len()]])
+        } else {
+            Arc::clone(&backend_cpus)
+        };
+        let (backend, corpus) = (Arc::clone(&backend), Arc::clone(&corpus));
         event_threads.push(thread::spawn(move || {
             event_lane_worker(backend, rx, corpus, epoch, cpus, expected)
         }));
@@ -1360,17 +1374,19 @@ fn run<B: ReplayBackend>(
     }
     let mut failure_reasons: Vec<String> = Vec::new();
     let mut query_results = Vec::with_capacity(lanes.len());
+    let mut query_lane_cpu_ns = 0u64;
     for handle in query_threads {
-        let (completions, failure) = handle.join().expect("query lane panicked");
+        let (completions, failure, cpu_ns) = handle.join().expect("query lane panicked");
         if let Some(failure) = failure {
             failure_reasons.push(failure.to_string());
         }
+        query_lane_cpu_ns += cpu_ns;
         query_results.push(completions);
     }
-    let event_results: Vec<Vec<EventCompletion>> = event_threads
+    let (event_results, event_lane_cpu_ns): (Vec<Vec<EventCompletion>>, Vec<u64>) = event_threads
         .into_iter()
         .map(|h| h.join().expect("event lane panicked"))
-        .collect();
+        .unzip();
 
     // Merge issue records.
     let n = corpus.ops.len();
@@ -1523,6 +1539,20 @@ fn run<B: ReplayBackend>(
     let generator_valid = failure_reasons.is_empty() && issue_span_valid;
     let kept_up = generator_valid && elapsed <= window_ns.saturating_mul(110) / 100;
 
+    // Per-lane diagnostics (not in Dynamo's result): CPU time, event count and the time of the
+    // last completion of each event lane, which tell scheduler starvation from slower work.
+    let event_lane_cpu_ms: Vec<f64> = event_lane_cpu_ns
+        .iter()
+        .map(|&ns| ns as f64 / 1e6)
+        .collect();
+    let event_lane_events: Vec<usize> = event_results.iter().map(Vec::len).collect();
+    let event_lane_last_finished_ms: Vec<f64> = event_results
+        .iter()
+        .map(|c| {
+            c.last()
+                .map_or(0.0, |c| c.finished_ns.saturating_sub(start_ns) as f64 / 1e6)
+        })
+        .collect();
     let result = json!({
         "schema_version": 3,
         "harness": "smg-mooncake-replay",
@@ -1592,6 +1622,11 @@ fn run<B: ReplayBackend>(
         "post_acceptance_completion_races": races,
         "rejected_events": failed_events,
         "issuer_cpu_ns": issuer_cpu_ns,
+        "pin_event_lanes": args.pin_event_lanes,
+        "event_lane_cpu_ms": event_lane_cpu_ms,
+        "event_lane_events": event_lane_events,
+        "event_lane_last_finished_ms": event_lane_last_finished_ms,
+        "query_lane_cpu_ms_total": query_lane_cpu_ns as f64 / 1e6,
         "issue_span_ns": issue_span_ns,
         "drain_ns": drain_ns,
         "generator_valid": generator_valid,
