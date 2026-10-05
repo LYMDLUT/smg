@@ -13,9 +13,18 @@ import time
 
 class MeasureLock:
     def __init__(
-        self, path: str, owner_file: str, workstream: str, series: str, max_hold_minutes: float
+        self,
+        path: str,
+        owner_file: str,
+        workstream: str,
+        series: str,
+        max_hold_minutes: float,
+        leave_note: bool = False,
     ):
         self.path = path
+        # A multi-step series leaves its note in place between holds (with the next expected
+        # end), so waiters see one continuing series; the driver truncates it at the very end.
+        self.leave_note = leave_note
         self.owner_file = owner_file
         self.workstream = workstream
         self.series = series
@@ -46,19 +55,26 @@ class MeasureLock:
     def over_cap(self) -> bool:
         return self.handle is not None and self.held_s() > self.max_hold_s
 
-    def release(self) -> None:
+    def release(self, expected_minutes: float | None = None) -> None:
         if self.handle is None:
             return
-        try:
-            with open(self.owner_file, "w"):
+        if self.leave_note and expected_minutes is not None:
+            self.note(expected_minutes)
+        elif not self.leave_note:
+            try:
+                with open(self.owner_file, "w"):
+                    pass
+            except OSError:
                 pass
-        except OSError:
-            pass
         fcntl.flock(self.handle, fcntl.LOCK_UN)
         self.handle.close()
         self.handle = None
 
     def rotate(self, expected_minutes: float) -> None:
-        """Give the lock back and queue for it again (between trials, when a hold hits the cap)."""
-        self.release()
+        """Give the lock back and queue for it again (between trials, when a hold hits the cap);
+        the note keeps announcing the series with its next expected end meanwhile."""
+        keep = self.leave_note
+        self.leave_note = True
+        self.release(expected_minutes)
+        self.leave_note = keep
         self.acquire(expected_minutes)

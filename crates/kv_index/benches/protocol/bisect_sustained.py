@@ -150,6 +150,11 @@ def main() -> int:
         "--trial-minutes", type=float, default=2.0, help="expected length of one trial"
     )
     parser.add_argument(
+        "--leave-owner-note",
+        action="store_true",
+        help="keep the owner note after the final release (a multi-step driver truncates it itself)",
+    )
+    parser.add_argument(
         "--point-minutes", type=float, default=6.0, help="expected length of one point"
     )
     parser.add_argument("--cores", default="0-63", help="cores to check for foreign load")
@@ -160,21 +165,22 @@ def main() -> int:
     )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+    out = pathlib.Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "runner.pid").write_text(f"{os.getpid()}\n")
     lock = measurelock.MeasureLock(
         args.lock,
         args.owner_file or re.sub(r"\.lock$", "", args.lock) + ".owner",
         args.workstream,
         args.series or pathlib.Path(args.out).name,
         args.max_hold_minutes,
+        leave_note=args.leave_owner_note,
     )
     if args.lock_scope == "run":
         lock.acquire(min(args.max_hold_minutes, args.max_points * args.point_minutes))
     if "{window_ms}" in args.command and not args.total_block_ops:
         parser.error("--total-block-ops is required with a {window_ms} template")
 
-    out = pathlib.Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "runner.pid").write_text(f"{os.getpid()}\n")
     lo, hi = args.lo, args.hi
     points: list[dict] = []
 

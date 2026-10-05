@@ -287,6 +287,11 @@ def main() -> int:
     parser.add_argument(
         "--trial-minutes", type=float, default=2.0, help="expected length of one trial"
     )
+    parser.add_argument(
+        "--leave-owner-note",
+        action="store_true",
+        help="keep the owner note after the final release (a multi-step driver truncates it itself)",
+    )
     parser.add_argument("--cores", default="0-63")
     parser.add_argument(
         "--record-pct", type=float, default=5.0, help="record processes above this CPU share"
@@ -315,6 +320,7 @@ def main() -> int:
         args.workstream,
         args.series or out.name,
         args.max_hold_minutes,
+        leave_note=args.leave_owner_note,
     )
     if args.lock_scope == "run":
         lock.acquire(min(args.max_hold_minutes, args.trials * 2 * args.trial_minutes))
