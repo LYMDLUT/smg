@@ -12,6 +12,7 @@
 //! engine block hash, worker removal through the lane's map.
 
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flume::Receiver;
 use kv_index::{ApplyError, ContentHash, RunBlockMap, RunIndex, SequenceHash, StoredBlock};
@@ -28,16 +29,24 @@ use crate::protocols::{
     WorkerWithDpRank,
 };
 
+/// Bytes per slot of the lane maps (`FxHashMap<SequenceHash, BlockRef>`: 16-byte entry plus a
+/// control byte), for the memory report.
+const MAP_SLOT_BYTES: usize = 17;
+
 /// One lane's view of a worker: SMG's interned id and SMG's per-worker block map.
 struct LaneWorker {
     smg_id: u32,
     blocks: RunBlockMap,
+    /// Capacity last charged to `SmgRun::map_slots`.
+    charged_slots: usize,
 }
 
 pub struct SmgRun {
     inner: RunIndex,
     /// SMG worker id -> Dynamo worker, for translating lookup scores back.
     workers: RwLock<Vec<Option<WorkerWithDpRank>>>,
+    /// Allocated slots across every lane map, kept current by the lanes.
+    map_slots: AtomicUsize,
 }
 
 impl SmgRun {
@@ -45,12 +54,30 @@ impl SmgRun {
         Self {
             inner: RunIndex::with_max_workers(max_workers),
             workers: RwLock::new(Vec::new()),
+            map_slots: AtomicUsize::new(0),
         }
     }
 
     /// Shape and memory counters of the index itself (lane maps excluded).
     pub fn stats(&self) -> kv_index::RunIndexStats {
         self.inner.stats()
+    }
+
+    fn charge_map(&self, entry: &mut LaneWorker) {
+        let slots = entry.blocks.capacity();
+        if slots > entry.charged_slots {
+            self.map_slots
+                .fetch_add(slots - entry.charged_slots, Ordering::Relaxed);
+        } else if slots < entry.charged_slots {
+            self.map_slots
+                .fetch_sub(entry.charged_slots - slots, Ordering::Relaxed);
+        }
+        entry.charged_slots = slots;
+    }
+
+    fn release_map(&self, entry: &LaneWorker) {
+        self.map_slots
+            .fetch_sub(entry.charged_slots, Ordering::Relaxed);
     }
 
     fn intern(&self, worker: WorkerWithDpRank) -> u32 {
@@ -78,6 +105,7 @@ impl SmgRun {
                 let entry = lane.entry(worker).or_insert_with(|| LaneWorker {
                     smg_id: self.intern(worker),
                     blocks: RunBlockMap::default(),
+                    charged_slots: 0,
                 });
                 let blocks: Vec<StoredBlock> = store
                     .blocks
@@ -88,13 +116,16 @@ impl SmgRun {
                     })
                     .collect();
                 let parent = store.parent_hash.map(|hash| SequenceHash(hash.0));
-                self.inner
+                let outcome = self
+                    .inner
                     .apply_stored(entry.smg_id, &blocks, parent, &mut entry.blocks)
                     .map_err(|error| match error {
                         ApplyError::ParentBlockNotFound | ApplyError::WorkerNotTracked => {
                             KvCacheEventError::ParentBlockNotFound
                         }
-                    })
+                    });
+                self.charge_map(entry);
+                outcome
             }
             KvCacheEventData::Removed(remove) => {
                 let Some(entry) = lane.get_mut(&worker) else {
@@ -107,11 +138,13 @@ impl SmgRun {
                     .collect();
                 self.inner
                     .apply_removed(entry.smg_id, &hashes, &mut entry.blocks);
+                self.charge_map(entry);
                 Ok(())
             }
             KvCacheEventData::Cleared => {
                 if let Some(entry) = lane.get_mut(&worker) {
                     self.inner.apply_cleared(entry.smg_id, &mut entry.blocks);
+                    self.charge_map(entry);
                 }
                 Ok(())
             }
@@ -126,6 +159,7 @@ impl SmgRun {
             .collect();
         for worker in gone {
             if let Some(entry) = lane.remove(&worker) {
+                self.release_map(&entry);
                 self.inner.remove_worker(entry.smg_id, entry.blocks);
             }
         }
@@ -137,6 +171,7 @@ impl SmgRun {
         worker: WorkerWithDpRank,
     ) {
         if let Some(entry) = lane.remove(&worker) {
+            self.release_map(&entry);
             self.inner.remove_worker(entry.smg_id, entry.blocks);
         }
     }
@@ -264,5 +299,38 @@ impl SyncIndexer for SmgRun {
 
     fn supports_routing_decision_pruning(&self) -> bool {
         false
+    }
+
+    fn timing_report(&self) -> String {
+        let stats = self.inner.stats();
+        let memberships = self.inner.current_size();
+        let distinct = self.inner.entry_count();
+        let map_slots = self.map_slots.load(Ordering::Relaxed);
+        let map_bytes = map_slots * MAP_SLOT_BYTES;
+        let index_bytes = stats.arena_bytes + stats.header_bytes;
+        let per_membership = |bytes: usize| {
+            if memberships == 0 {
+                0.0
+            } else {
+                bytes as f64 / memberships as f64
+            }
+        };
+        format!(
+            "SmgRun memory report:\n  \
+             memberships (worker, block) = {memberships}\n  \
+             distinct blocks = {distinct}\n  \
+             runs allocated = {} live = {} blocks in live runs = {}\n  \
+             arena bytes = {} header bytes = {} (index {:.1} B per membership)\n  \
+             lane map slots = {map_slots} bytes = {map_bytes} ({:.1} B per membership)\n  \
+             total {:.1} B per membership",
+            stats.runs_allocated,
+            stats.runs_live,
+            stats.blocks_live,
+            stats.arena_bytes,
+            stats.header_bytes,
+            per_membership(index_bytes),
+            per_membership(map_bytes),
+            per_membership(index_bytes + map_bytes),
+        )
     }
 }
