@@ -1,24 +1,37 @@
-//! A vLLM-wire KV-event publisher fed by a simulated engine: what
-//! `ZmqEventPublisher` in `vllm/distributed/kv_events.py` puts on the wire,
-//! so the servicers' relays (Rust and Python) can be exercised end to end
-//! without a GPU.
+//! A ZMQ KV-event publisher fed by a simulated engine, on either engine's
+//! wire, so the servicers' relays (Rust and Python) can be exercised end to
+//! end without a GPU.
 //!
-//! - One PUB socket per worker; one multipart message per pass:
+//! Common to both (`ZmqEventPublisher` in vLLM's `distributed/kv_events.py`
+//! and SGLang's `disaggregation/kv_events.py`):
+//!
+//! - one PUB socket per worker; one multipart message per pass:
 //!   `[topic, sequence as u64 big-endian, msgpack payload]`, the sequence
-//!   counting from 0 per publisher.
-//! - The payload is vLLM's `EventBatch`, array-like: `[ts, events,
-//!   data_parallel_rank]`. Events are tagged maps in vLLM's field order with
-//!   its `omit_defaults`: a `BlockStored` carries `type`, `block_hashes`,
-//!   `parent_block_hash`, `token_ids`, `block_size`, `lora_id`, `medium`,
-//!   `lora_name` (required, nil when unset) and then `group_idx` and
-//!   `kv_cache_spec_kind`; a `BlockRemoved` carries `type`, `block_hashes`,
-//!   `medium`, `group_idx`; `AllBlocksCleared` only its tag. Block hashes
-//!   are unsigned 64-bit integers, as vLLM's int form.
-//! - Optional replay on a ROUTER socket at the next port: a request's last
+//!   counting from 0 per publisher;
+//! - the payload is the array-like `EventBatch` `[ts, events, rank]` with
+//!   tagged-map events (`type`);
+//! - optional replay on a ROUTER socket at the next port: a request's last
 //!   frame is the start sequence (8 bytes big-endian); the reply is every
-//!   buffered batch from it as `[routing…, topic, seq, payload]` and then
-//!   `[routing…, b"", END, b""]`, END being eight 0xff bytes ((-1) signed);
-//!   the last `buffer_steps` batches are kept.
+//!   buffered batch from it, then an END marker with the sequence slot set to
+//!   eight 0xff bytes ((-1) signed); the last `buffer_steps` batches are kept.
+//!
+//! vLLM wire (`Wire::Vllm`): events in vLLM's field order with its
+//! `omit_defaults`: a `BlockStored` carries `block_hashes`,
+//! `parent_block_hash`, `token_ids`, `block_size`, `lora_id`, `medium`,
+//! `lora_name` (required, nil when unset) and then `group_idx` and
+//! `kv_cache_spec_kind`; a `BlockRemoved` carries `block_hashes`, `medium`,
+//! `group_idx`; hashes are unsigned 64-bit integers; replay replies are
+//! `[routing…, topic, seq, payload]` and `[routing…, b"", END, b""]`.
+//!
+//! SGLang wire (`Wire::Sglang`): hashes are signed 64-bit integers (SGLang
+//! takes the first eight digest bytes signed); a `BlockStored` carries
+//! `block_hashes`, `parent_block_hash`, `token_ids`, `block_size`, `lora_id`
+//! and nothing else (no medium, group or spec fields), one per radix node
+//! (here: per contiguous run of blocks a request completed); a `BlockRemoved`
+//! carries one node's hashes (here: one per evicted block); the batch's third
+//! slot (`attn_dp_rank`) is nil; the publisher starts with an
+//! `AllBlocksCleared` batch, as the scheduler does; replay replies are
+//! `[routing…, seq, payload]` and `[routing…, END, b""]`.
 
 use std::{
     collections::VecDeque,
@@ -35,8 +48,27 @@ use zeromq::{
 
 use crate::engine::Engine;
 
-/// vLLM's end-of-replay marker: `(-1).to_bytes(8, "big", signed=True)`.
+/// The engines' end-of-replay marker: `(-1).to_bytes(8, "big", signed=True)`.
 pub const END_SEQ: [u8; 8] = [0xff; 8];
+
+/// Which engine's publisher to imitate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    Vllm,
+    Sglang,
+}
+
+impl std::str::FromStr for Wire {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "vllm" => Ok(Self::Vllm),
+            "sglang" => Ok(Self::Sglang),
+            other => Err(format!("--kv-events-wire must be vllm|sglang, got {other}")),
+        }
+    }
+}
 
 /// Where and how one worker publishes.
 #[derive(Clone, Debug)]
@@ -48,6 +80,7 @@ pub struct KvZmqConfig {
     pub topic: String,
     pub buffer_steps: usize,
     pub dp_rank: i32,
+    pub wire: Wire,
 }
 
 /// Bind the sockets and publish the engine's events until its event channel
@@ -70,8 +103,9 @@ pub async fn serve(engine: Engine, cfg: KvZmqConfig) {
         replay = Some(router);
     }
     tracing::info!(
-        "kv-events publisher {} on {endpoint} (replay {}, topic {:?})",
+        "kv-events publisher {} on {endpoint} ({:?} wire, replay {}, topic {:?})",
         engine.name(),
+        cfg.wire,
         if cfg.replay { "on" } else { "off" },
         cfg.topic
     );
@@ -86,8 +120,20 @@ pub async fn run(
     mut replay: Option<RouterSocket>,
 ) {
     let mut events = engine.subscribe_published();
-    let mut state = Publisher::new(cfg.topic.into_bytes(), cfg.buffer_steps, cfg.dp_rank);
+    let mut state = Publisher::new(
+        cfg.topic.into_bytes(),
+        cfg.buffer_steps,
+        cfg.dp_rank,
+        cfg.wire,
+    );
     let mut generation = engine.fault_status().generation;
+    if cfg.wire == Wire::Sglang {
+        // SGLang's scheduler clears its cache at startup and says so.
+        let message = state.publish(&startup_cleared());
+        if let Err(e) = publisher.send(message).await {
+            tracing::warn!("kv-events publish failed: {e}");
+        }
+    }
     loop {
         tokio::select! {
             item = events.next() => {
@@ -134,16 +180,18 @@ pub struct Publisher {
     buffer: VecDeque<(u64, Vec<u8>)>,
     buffer_steps: usize,
     dp_rank: i32,
+    wire: Wire,
 }
 
 impl Publisher {
-    pub fn new(topic: Vec<u8>, buffer_steps: usize, dp_rank: i32) -> Self {
+    pub fn new(topic: Vec<u8>, buffer_steps: usize, dp_rank: i32, wire: Wire) -> Self {
         Self {
             topic,
             seq: 0,
             buffer: VecDeque::new(),
             buffer_steps: buffer_steps.max(1),
             dp_rank,
+            wire,
         }
     }
 
@@ -155,7 +203,7 @@ impl Publisher {
     /// Encode `batch`, assign it the next sequence, keep it for replay and
     /// return the PUB message.
     pub fn publish(&mut self, batch: &common::KvEventBatch) -> ZmqMessage {
-        let payload = encode_batch(batch, self.dp_rank);
+        let payload = encode_batch(batch, self.dp_rank, self.wire);
         let seq = self.seq;
         self.seq += 1;
         self.buffer.push_back((seq, payload.clone()));
@@ -187,13 +235,17 @@ impl Publisher {
         let mut replies = Vec::new();
         for (seq, payload) in self.buffer.iter().filter(|(seq, _)| *seq >= start) {
             let mut message = routed(routing);
-            message.push_back(self.topic.clone().into());
+            if self.wire == Wire::Vllm {
+                message.push_back(self.topic.clone().into());
+            }
             message.push_back(seq.to_be_bytes().to_vec().into());
             message.push_back(payload.clone().into());
             replies.push(message);
         }
         let mut end = routed(routing);
-        end.push_back(Vec::new().into());
+        if self.wire == Wire::Vllm {
+            end.push_back(Vec::new().into());
+        }
         end.push_back(END_SEQ.to_vec().into());
         end.push_back(Vec::new().into());
         replies.push(end);
@@ -226,23 +278,50 @@ fn unix_seconds() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// vLLM's `EventBatch` for a proto batch: `[ts, events, data_parallel_rank]`.
-pub fn encode_batch(batch: &common::KvEventBatch, dp_rank: i32) -> Vec<u8> {
-    let events: Vec<Value> = batch
-        .events
-        .iter()
-        .filter_map(|event| match &event.data {
-            Some(common::kv_cache_event::Data::Stored(stored)) => Some(stored_map(stored)),
-            Some(common::kv_cache_event::Data::Removed(removed)) => Some(removed_map(removed)),
-            Some(common::kv_cache_event::Data::Cleared(_)) => Some(cleared_map()),
-            None => None,
-        })
-        .collect();
-    let value = Value::Array(vec![
-        Value::F64(unix_seconds()),
-        Value::Array(events),
-        Value::from(dp_rank),
-    ]);
+/// The batch SGLang's scheduler publishes first: a lone `AllBlocksCleared`.
+pub fn startup_cleared() -> common::KvEventBatch {
+    common::KvEventBatch {
+        sequence_number: 0,
+        timestamp: 0.0,
+        events: vec![common::KvCacheEvent {
+            event_id: 0,
+            data: Some(common::kv_cache_event::Data::Cleared(
+                common::KvCacheCleared::default(),
+            )),
+        }],
+        dp_rank: None,
+    }
+}
+
+/// The engine's `EventBatch` for a proto batch: `[ts, events, rank]`, the
+/// rank being `data_parallel_rank` on the vLLM wire and a nil `attn_dp_rank`
+/// on SGLang's.
+pub fn encode_batch(batch: &common::KvEventBatch, dp_rank: i32, wire: Wire) -> Vec<u8> {
+    let mut events: Vec<Value> = Vec::new();
+    for event in &batch.events {
+        match (&event.data, wire) {
+            (Some(common::kv_cache_event::Data::Stored(stored)), Wire::Vllm) => {
+                events.push(stored_map(stored));
+            }
+            (Some(common::kv_cache_event::Data::Stored(stored)), Wire::Sglang) => {
+                events.push(sglang_stored_map(stored));
+            }
+            (Some(common::kv_cache_event::Data::Removed(removed)), Wire::Vllm) => {
+                events.push(removed_map(removed));
+            }
+            (Some(common::kv_cache_event::Data::Removed(removed)), Wire::Sglang) => {
+                // One remove per node; a node here is one evicted block.
+                events.extend(removed.block_hashes.iter().map(|h| sglang_removed_map(*h)));
+            }
+            (Some(common::kv_cache_event::Data::Cleared(_)), _) => events.push(cleared_map()),
+            (None, _) => {}
+        }
+    }
+    let rank = match wire {
+        Wire::Vllm => Value::from(dp_rank),
+        Wire::Sglang => Value::Nil,
+    };
+    let value = Value::Array(vec![Value::F64(unix_seconds()), Value::Array(events), rank]);
     let mut buf = Vec::new();
     // Writing into a Vec cannot fail.
     let _ = rmpv::encode::write_value(&mut buf, &value);
@@ -319,6 +398,51 @@ fn removed_map(removed: &common::KvBlocksRemoved) -> Value {
         ),
         (key("medium"), Value::String("GPU".into())),
         (key("group_idx"), Value::from(0)),
+    ])
+}
+
+/// `BlockStored` as SGLang encodes it: signed hashes, no medium, group or
+/// spec fields (SGLang omits its optional fields when unset).
+fn sglang_stored_map(stored: &common::KvBlocksStored) -> Value {
+    let block_size = stored
+        .blocks
+        .first()
+        .map(|b| i64::from(b.block_size))
+        .unwrap_or(0);
+    let token_ids: Vec<Value> = stored
+        .blocks
+        .iter()
+        .flat_map(|b| b.token_ids.iter().map(|t| Value::from(*t)))
+        .collect();
+    Value::Map(vec![
+        (key("type"), Value::String("BlockStored".into())),
+        (
+            key("block_hashes"),
+            Value::Array(
+                stored
+                    .blocks
+                    .iter()
+                    .map(|b| Value::from(b.block_hash))
+                    .collect(),
+            ),
+        ),
+        (
+            key("parent_block_hash"),
+            stored
+                .parent_block_hash
+                .map(Value::from)
+                .unwrap_or(Value::Nil),
+        ),
+        (key("token_ids"), Value::Array(token_ids)),
+        (key("block_size"), Value::from(block_size)),
+        (key("lora_id"), Value::Nil),
+    ])
+}
+
+fn sglang_removed_map(hash: i64) -> Value {
+    Value::Map(vec![
+        (key("type"), Value::String("BlockRemoved".into())),
+        (key("block_hashes"), Value::Array(vec![Value::from(hash)])),
     ])
 }
 
@@ -423,7 +547,7 @@ mod tests {
 
     #[test]
     fn encodes_vllm_event_batches_field_for_field() {
-        let payload = encode_batch(&sample_batch(), 3);
+        let payload = encode_batch(&sample_batch(), 3, Wire::Vllm);
         let value = rmpv::decode::read_value(&mut payload.as_slice()).expect("msgpack");
         let Value::Array(batch) = value else {
             panic!("batch is array-like");
@@ -486,7 +610,7 @@ mod tests {
 
     #[test]
     fn the_relay_normalizes_the_payload_back_into_the_proto() {
-        let payload = encode_batch(&sample_batch(), 0);
+        let payload = encode_batch(&sample_batch(), 0, Wire::Vllm);
         let wire: WireBatch = rmp_serde::from_slice(&payload).expect("the relay decodes it");
         let mut event_id = 0;
         let relayed = Normalizer::new().normalize_batch(wire, 7, &mut event_id);
@@ -524,7 +648,7 @@ mod tests {
 
     #[test]
     fn replay_answers_from_the_start_sequence_and_ends_with_the_marker() {
-        let mut publisher = Publisher::new(b"kv".to_vec(), 3, 0);
+        let mut publisher = Publisher::new(b"kv".to_vec(), 3, 0, Wire::Vllm);
         for _ in 0..5 {
             let message = publisher.publish(&sample_batch());
             assert_eq!(message.len(), 3);
@@ -575,6 +699,162 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sglang_wire_encodes_signed_hashes_without_group_or_spec_fields() {
+        let payload = encode_batch(&sample_batch(), 0, Wire::Sglang);
+        let value = rmpv::decode::read_value(&mut payload.as_slice()).expect("msgpack");
+        let Value::Array(batch) = value else {
+            panic!("batch is array-like");
+        };
+        assert_eq!(batch.len(), 3, "[ts, events, attn_dp_rank]");
+        assert!(batch[2].is_nil(), "attn_dp_rank is nil for a single rank");
+        let events = batch[1].as_array().expect("events");
+        assert_eq!(events.len(), 3, "stored, one remove per block, cleared");
+        assert_eq!(
+            keys(&events[0]),
+            [
+                "type",
+                "block_hashes",
+                "parent_block_hash",
+                "token_ids",
+                "block_size",
+                "lora_id"
+            ]
+        );
+        let hashes = field(&events[0], "block_hashes")
+            .as_array()
+            .expect("hashes");
+        assert_eq!(hashes[0].as_i64(), Some(11));
+        assert_eq!(hashes[1].as_i64(), Some(-2), "signed, as SGLang's int64");
+        assert_eq!(field(&events[0], "parent_block_hash").as_i64(), Some(10));
+        assert_eq!(keys(&events[1]), ["type", "block_hashes"]);
+        assert_eq!(field(&events[1], "type").as_str(), Some("BlockRemoved"));
+        assert_eq!(keys(&events[2]), ["type"]);
+    }
+
+    #[test]
+    fn the_relay_normalizes_the_sglang_payload_too() {
+        let payload = encode_batch(&sample_batch(), 0, Wire::Sglang);
+        let wire: WireBatch = rmp_serde::from_slice(&payload).expect("the relay decodes it");
+        assert_eq!(wire.dp_rank, None);
+        let mut event_id = 0;
+        let relayed = Normalizer::new().normalize_batch(wire, 3, &mut event_id);
+        let Some(common::kv_cache_event::Data::Stored(stored)) = &relayed.events[0].data else {
+            panic!("first event is the store");
+        };
+        assert_eq!(
+            stored
+                .blocks
+                .iter()
+                .map(|b| b.block_hash)
+                .collect::<Vec<_>>(),
+            [11, -2]
+        );
+        assert_eq!(stored.parent_block_hash, Some(10));
+        let Some(common::kv_cache_event::Data::Removed(removed)) = &relayed.events[1].data else {
+            panic!("second event is the remove");
+        };
+        assert_eq!(removed.block_hashes, [11]);
+        assert!(matches!(
+            relayed.events[2].data,
+            Some(common::kv_cache_event::Data::Cleared(_))
+        ));
+    }
+
+    #[test]
+    fn sglang_replay_frames_carry_no_topic() {
+        let mut publisher = Publisher::new(b"kv".to_vec(), 10, 0, Wire::Sglang);
+        publisher.publish(&startup_cleared());
+        publisher.publish(&sample_batch());
+        let mut request = ZmqMessage::from(b"peer".to_vec());
+        request.push_back(Vec::new().into());
+        request.push_back(0u64.to_be_bytes().to_vec().into());
+        let replies = publisher.replay(&request);
+        assert_eq!(replies.len(), 3, "two batches and the end marker");
+        assert_eq!(replies[0].len(), 4, "[peer, empty, seq, payload]");
+        assert_eq!(
+            replies[0].get(2).map(|f| f.as_ref()),
+            Some(&0u64.to_be_bytes()[..])
+        );
+        let first: WireBatch =
+            rmp_serde::from_slice(replies[0].get(3).expect("payload")).expect("decodes");
+        assert_eq!(first.events.len(), 1, "the startup clear comes first");
+        let end = replies.last().expect("end");
+        assert_eq!(end.len(), 4, "[peer, empty, END, empty]");
+        assert_eq!(end.get(2).map(|f| f.as_ref()), Some(&END_SEQ[..]));
+        assert!(end.get(3).is_some_and(|f| f.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn sglang_publisher_starts_with_all_blocks_cleared() {
+        let engine = Engine::spawn(EngineParams::default());
+        let mut pub_socket = PubSocket::new();
+        pub_socket
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("pub binds");
+        let mut router = RouterSocket::new();
+        let replay_endpoint = router
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("router binds")
+            .to_string();
+        let cfg = KvZmqConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            replay: true,
+            topic: String::new(),
+            buffer_steps: 100,
+            dp_rank: 0,
+            wire: Wire::Sglang,
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the publisher ends with the engine when the test drops it"
+        )]
+        let _publisher = tokio::spawn(run(engine.clone(), cfg, pub_socket, Some(router)));
+        let mut dealer = DealerSocket::new();
+        dealer
+            .connect(&replay_endpoint)
+            .await
+            .expect("dealer connects");
+        let mut request = ZmqMessage::from(Vec::new());
+        request.push_back(0u64.to_be_bytes().to_vec().into());
+        // The publisher binds before the startup batch is buffered; ask until
+        // the replay has it.
+        let mut first = None;
+        for _ in 0..50 {
+            dealer.send(request.clone()).await.expect("replay request");
+            let reply = timeout(Duration::from_secs(5), dealer.recv())
+                .await
+                .expect("replay answers")
+                .expect("reply");
+            assert_eq!(reply.len(), 3, "[empty, seq, payload] on the SGLang wire");
+            if reply.get(1).map(|f| f.as_ref()) == Some(&END_SEQ[..]) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            first = Some(reply);
+            break;
+        }
+        let first = first.expect("the startup batch is replayable");
+        assert_eq!(
+            first.get(1).map(|f| f.as_ref()),
+            Some(&0u64.to_be_bytes()[..])
+        );
+        let batch: WireBatch =
+            rmp_serde::from_slice(first.get(2).expect("payload")).expect("decodes");
+        assert_eq!(batch.events.len(), 1);
+        let mut event_id = 0;
+        let relayed = Normalizer::new().normalize_batch(batch, 0, &mut event_id);
+        assert!(matches!(
+            relayed.events[0].data,
+            Some(common::kv_cache_event::Data::Cleared(_))
+        ));
+        // Drain the end marker so the dealer is left clean.
+        let _ = timeout(Duration::from_secs(1), dealer.recv()).await;
+    }
+
     #[tokio::test]
     async fn a_subscriber_gets_live_frames_and_can_replay_what_it_missed() {
         let engine = Engine::spawn(EngineParams::default());
@@ -597,6 +877,7 @@ mod tests {
             topic: "kv".to_string(),
             buffer_steps: 100,
             dp_rank: 0,
+            wire: Wire::Vllm,
         };
         #[expect(
             clippy::disallowed_methods,

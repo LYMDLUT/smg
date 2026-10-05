@@ -54,6 +54,8 @@ pub struct Config {
     pub kv_events_topic: String,
     /// Batches each publisher keeps for replay.
     pub kv_events_buffer_steps: usize,
+    /// Which engine's wire the publishers speak.
+    pub kv_events_wire: crate::kv_zmq::Wire,
 }
 
 /// Timing flags collected while parsing; resolved into one [`TimingModel`]
@@ -130,6 +132,7 @@ impl Default for Config {
             kv_events_replay: true,
             kv_events_topic: String::new(),
             kv_events_buffer_steps: 10_000,
+            kv_events_wire: crate::kv_zmq::Wire::Vllm,
         }
     }
 }
@@ -209,6 +212,7 @@ impl Config {
                 "--kv-events-buffer-steps" => {
                     cfg.kv_events_buffer_steps = parse(value(&mut args, &flag)?, &flag)?;
                 }
+                "--kv-events-wire" => cfg.kv_events_wire = value(&mut args, &flag)?.parse()?,
                 "--block-size" => cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?,
                 "--admin-port" => cfg.admin_port = Some(parse(value(&mut args, &flag)?, &flag)?),
                 "--prefix-cache" => {
@@ -261,6 +265,7 @@ impl Config {
             topic: self.kv_events_topic.clone(),
             buffer_steps: self.kv_events_buffer_steps,
             dp_rank: 0,
+            wire: self.kv_events_wire,
         })
     }
 }
@@ -314,6 +319,7 @@ fn usage() -> String {
        --kv-events-replay <bool>  serve replay requests on the ROUTER port (default true)\n\
        --kv-events-topic <s>    topic frame (default empty, as vLLM)\n\
        --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
+       --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)"
         .to_string()

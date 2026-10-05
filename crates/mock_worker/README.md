@@ -94,7 +94,7 @@ replay, which models the same loop):
 | `--prefill-first` | false | SGLang-style prefill-only passes |
 | `--context-length` | 32768 | advertised context length |
 | `--admin-port` | off | process-wide admin API (below) |
-| `--kv-events-zmq-base-port` | off | vLLM-wire ZMQ KV-event publishers (below) |
+| `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
 
 ```bash
 cargo run --release -p mock-worker -- \
@@ -107,7 +107,7 @@ agreement for these polynomials (mean absolute percentage error 48.5% on TTFT,
 routing effects have no published validation. Treat the simulator as a relative
 A/B harness for policies and validate absolute numbers on GPUs.
 
-### vLLM-wire KV-event publisher (ZMQ)
+### KV-event publisher on the engines' ZMQ wire
 
 `--kv-events-zmq-base-port <port>` gives every realistic engine the publisher
 vLLM runs (`ZmqEventPublisher` in `vllm/distributed/kv_events.py`), so the
@@ -132,7 +132,16 @@ then ZMQ ranks) publishes on `base + 2i` and answers replay on `base + 2i + 1`.
   `[b"", b"", END, b""]` with END = eight 0xff bytes; the last
   `--kv-events-buffer-steps` (10000) batches are kept.
 
-The unit tests decode the frames with the Rust relay's own normalizer
+`--kv-events-wire sglang` speaks SGLang's publisher instead: signed 64-bit
+hashes (SGLang takes the first eight digest bytes signed), `BlockStored` with
+only `block_hashes`, `parent_block_hash`, `token_ids`, `block_size`, `lora_id`
+(one per radix node: here one per contiguous run a request completed),
+`BlockRemoved` with one node's hashes (here one per evicted block), a nil
+`attn_dp_rank`, an `AllBlocksCleared` batch at startup as the scheduler
+publishes, and replay replies without the topic frame (`[b"", seq, payload]`,
+then `[b"", END, b""]`).
+
+The unit tests decode both wires with the Rust relay's own normalizer
 (`engine_servicer::kv_wire`), so a change on either side shows up here.
 
 ### Admin API
