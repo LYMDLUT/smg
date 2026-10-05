@@ -662,7 +662,9 @@ impl RunIndex {
         let run = slab_run(&chunks, run_id);
         loop {
             let parent_id = run.parent.load(Ordering::Acquire);
-            let parent = slab_run(&chunks, parent_id);
+            // The parent may be a split suffix allocated after `chunks` was loaded.
+            let parent_chunks = self.slab.chunks.load();
+            let parent = slab_run(&parent_chunks, parent_id);
             // Child-then-parent is the only order in which two run locks are ever held. A split
             // of the parent may have re-parented this run while we waited; check and retry.
             let mut parent_meta = parent.meta.lock();
@@ -1098,8 +1100,10 @@ impl RunIndex {
 
     /// Shape and memory counters.
     pub fn stats(&self) -> RunIndexStats {
-        let chunks = self.slab.chunks.load();
+        // Ids below `allocated` may still be waiting for their chunk; count what is addressable.
         let allocated = self.slab.allocated();
+        let chunks = self.slab.chunks.load();
+        let allocated = allocated.min(chunks.len() * CHUNK_RUNS);
         let mut stats = RunIndexStats {
             runs_allocated: allocated,
             header_bytes: allocated
