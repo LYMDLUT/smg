@@ -23,6 +23,7 @@
 
 pub mod event;
 pub mod input;
+pub mod json;
 pub mod parser;
 
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
