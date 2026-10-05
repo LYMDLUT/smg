@@ -2,11 +2,11 @@
 //!
 //! [`delta`] maps one [`Event`] to at most one [`ChatStreamChoice`]. It is pure: call ids ride on
 //! the events, the finish reason is decided from the `Finish` event alone, and nothing is remembered
-//! between calls. The driver wraps the choices in the response envelope with the request id, the
-//! model, the timestamp, usage and the engine's matched stop, which belong to the response and not
-//! to a choice.
+//! between calls. The driver wraps the choices in the response envelope (request id, model,
+//! timestamp, usage) and sets `matched_stop` on the finishing choice, since the engine's stop match
+//! is not something the events carry.
 //!
-//! The shapes are the ones SMG's gateway sends today, so a client cannot tell the two apart:
+//! The shapes are the ones SMG's gateway sends today, the same fields in the same places:
 //!
 //! - content and reasoning deltas carry `role: "assistant"`; reasoning goes to `reasoning_content`;
 //! - a call begins with its `id`, `type: "function"` and `name` and no arguments; every later
@@ -19,7 +19,8 @@
 //! - `ReasoningStart`, `ReasoningEnd`, `ToolCallEnd` and `Dropped` have no representation and
 //!   produce nothing; the markers a format consumes never reach the client.
 //! - `Malformed` text is content: the model wrote it, and the client sees it rather than losing
-//!   it, which is what the old driver did on a parser error.
+//!   it. This is the opposite of the old driver, which logged a parser error and sent nothing for
+//!   that chunk.
 //! - An empty text or an empty argument fragment produces nothing; the gateway sends no empty deltas.
 
 use openai_protocol::{
