@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::engine::{EngineParams, TimingModel};
+use crate::engine::{Calibration, EngineParams, TimingModel};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -62,6 +62,7 @@ pub struct Config {
 /// at the end so flag order does not matter.
 #[derive(Default)]
 struct TimingFlags {
+    /// `polynomial`, `linear` or `fit:<path>`.
     kind: Option<String>,
     prefill_poly: Option<[f64; 3]>,
     decode_poly: Option<[f64; 3]>,
@@ -71,18 +72,27 @@ struct TimingFlags {
 }
 
 impl TimingFlags {
-    fn resolve(self) -> Result<TimingModel, String> {
+    /// The model, and the calibration it came from (for its capacity and overhead).
+    fn resolve(self) -> Result<(TimingModel, Option<Calibration>), String> {
+        if let Some(path) = self.kind.as_deref().and_then(|k| k.strip_prefix("fit:")) {
+            let calibration = Calibration::load(path)?;
+            return Ok((TimingModel::fitted(&calibration), Some(calibration)));
+        }
         let linear_override = self.prefill_tps.is_some()
             || self.decode_base_ms.is_some()
             || self.decode_per_req_ms.is_some();
         let kind = match self.kind.as_deref() {
             Some("polynomial") => "polynomial",
             Some("linear") => "linear",
-            Some(other) => return Err(format!("--timing must be polynomial|linear, got {other}")),
+            Some(other) => {
+                return Err(format!(
+                    "--timing must be polynomial|linear|fit:<path>, got {other}"
+                ))
+            }
             None if linear_override => "linear",
             None => "polynomial",
         };
-        Ok(if kind == "linear" {
+        let model = if kind == "linear" {
             TimingModel::Linear {
                 prefill_tps: self.prefill_tps.unwrap_or(8000.0),
                 decode_base_ms: self.decode_base_ms.unwrap_or(6.0),
@@ -93,7 +103,8 @@ impl TimingFlags {
                 prefill: self.prefill_poly.unwrap_or(TimingModel::POLY_PREFILL),
                 decode: self.decode_poly.unwrap_or(TimingModel::POLY_DECODE),
             }
-        })
+        };
+        Ok((model, None))
     }
 }
 
@@ -143,6 +154,7 @@ impl Config {
         let mut cfg = Self::default();
         let mut timing = TimingFlags::default();
         let mut kv_blocks: Option<u64> = None;
+        let (mut kv_tokens_given, mut block_size_given, mut overhead_given) = (false, false, false);
 
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
@@ -194,8 +206,13 @@ impl Config {
                 "--max-running" => cfg.engine.max_running = parse(value(&mut args, &flag)?, &flag)?,
                 "--kv-tokens" => {
                     cfg.engine.kv_capacity_tokens = parse(value(&mut args, &flag)?, &flag)?;
+                    kv_tokens_given = true;
                 }
                 "--kv-blocks" => kv_blocks = Some(parse(value(&mut args, &flag)?, &flag)?),
+                "--request-overhead-ms" => {
+                    cfg.engine.request_overhead_ms = parse(value(&mut args, &flag)?, &flag)?;
+                    overhead_given = true;
+                }
                 "--prefill-first" => {
                     cfg.engine.prefill_first = parse(value(&mut args, &flag)?, &flag)?;
                 }
@@ -213,7 +230,10 @@ impl Config {
                     cfg.kv_events_buffer_steps = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--kv-events-wire" => cfg.kv_events_wire = value(&mut args, &flag)?.parse()?,
-                "--block-size" => cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?,
+                "--block-size" => {
+                    cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?;
+                    block_size_given = true;
+                }
                 "--admin-port" => cfg.admin_port = Some(parse(value(&mut args, &flag)?, &flag)?),
                 "--prefix-cache" => {
                     cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
@@ -226,7 +246,22 @@ impl Config {
         if cfg.tokenizer_path.is_empty() {
             cfg.tokenizer_path = cfg.model_id.clone();
         }
-        cfg.engine.timing = timing.resolve()?;
+        let (model, calibration) = timing.resolve()?;
+        cfg.engine.timing = model;
+        if let Some(c) = calibration {
+            // The calibration's block size, capacity and overhead apply unless
+            // the flags say otherwise.
+            if let (Some(bs), false) = (c.block_size, block_size_given) {
+                cfg.engine.block_size = bs;
+            }
+            if let (Some(tokens), false, None) = (c.kv_capacity_tokens, kv_tokens_given, kv_blocks)
+            {
+                cfg.engine.kv_capacity_tokens = tokens;
+            }
+            if !overhead_given {
+                cfg.engine.request_overhead_ms = c.request_overhead_ms;
+            }
+        }
         if let Some(blocks) = kv_blocks {
             cfg.engine.kv_capacity_tokens = blocks * u64::from(cfg.engine.block_size);
         }
@@ -298,7 +333,9 @@ fn usage() -> String {
      \n\
      Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\
-       --timing <polynomial|linear>  pass duration model (default polynomial)\n\
+       --timing <polynomial|linear|fit:<path>>  pass duration model (default polynomial);\n\
+                                fit:<path> reads a hardware calibration JSON (polynomials, KV capacity,\n\
+                                block size, per-request overhead; flags given explicitly win)\n\
        --prefill-poly <a,b,c>   prefill ms = a + b*T + c*T^2 over uncached tokens T in the pass\n\
                                 (default 16.50142,1.518344e-2,4.209989e-7)\n\
        --decode-poly <a,b,c>    decode ms = max(1, a + b*u + c*u^2) over KV utilisation u\n\
@@ -310,6 +347,7 @@ fn usage() -> String {
        --max-running <n>        max sequences per pass (default 256)\n\
        --kv-tokens <n>          KV cache capacity in tokens (default 524288)\n\
        --kv-blocks <n>          KV cache capacity in blocks (overrides --kv-tokens)\n\
+       --request-overhead-ms <f>  fixed per-request latency added to every event of a stream (default 0)\n\
        --block-size <n>         cache block/page size in tokens (default 16)\n\
        --prefix-cache <bool>    enable prefix caching + KV events (default true)\n\
        --prefill-first <bool>   SGLang-style: a pass with prefill runs prefill only (default false)\n\

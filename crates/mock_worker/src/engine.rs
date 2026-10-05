@@ -78,6 +78,14 @@ impl TimingModel {
         }
     }
 
+    /// A calibration file's polynomials (`Calibration::load`).
+    pub fn fitted(c: &Calibration) -> Self {
+        Self::Polynomial {
+            prefill: c.prefill,
+            decode: c.decode,
+        }
+    }
+
     fn prefill_ms(&self, tokens: u32) -> f64 {
         if tokens == 0 {
             return 0.0;
@@ -113,6 +121,83 @@ impl TimingModel {
     }
 }
 
+/// A hardware calibration of the pass model, as the GPU harness writes it:
+/// prefill `a + b·T + c·T²` ms over the uncached tokens of a pass, decode
+/// `d + e·u + f·u²` ms over KV utilisation, the engine's KV capacity and a
+/// fixed per-request overhead. The JSON accepts the coefficients as objects
+/// (`{"a":..,"b":..,"c":..}` / `{"d":..,"e":..,"f":..}`) or arrays, under
+/// `prefill_ms`/`prefill` and `decode_ms`/`decode`; capacity as
+/// `kv_capacity_tokens` or `kv_capacity_blocks` (with `block_size`); the
+/// overhead as `request_overhead_ms`. Unknown keys are ignored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Calibration {
+    pub prefill: [f64; 3],
+    pub decode: [f64; 3],
+    pub kv_capacity_tokens: Option<u64>,
+    pub block_size: Option<u32>,
+    pub request_overhead_ms: f64,
+}
+
+impl Calibration {
+    pub fn load(path: &str) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read calibration {path}: {e}"))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("calibration {path} is not JSON: {e}"))?;
+        Self::from_value(&value).map_err(|e| format!("calibration {path}: {e}"))
+    }
+
+    pub fn from_value(v: &serde_json::Value) -> Result<Self, String> {
+        let poly = |keys: [&str; 2], names: [&str; 3]| -> Result<[f64; 3], String> {
+            let node = keys
+                .iter()
+                .find_map(|k| v.get(*k))
+                .ok_or_else(|| format!("missing {}", keys[0]))?;
+            if let Some(arr) = node.as_array() {
+                let got: Vec<f64> = arr.iter().filter_map(serde_json::Value::as_f64).collect();
+                return match got.as_slice() {
+                    [a, b, c] => Ok([*a, *b, *c]),
+                    _ => Err(format!("{} needs three numbers", keys[0])),
+                };
+            }
+            let mut out = [0.0; 3];
+            for (slot, name) in out.iter_mut().zip(names) {
+                *slot = node
+                    .get(name)
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or_else(|| format!("{} is missing {name}", keys[0]))?;
+            }
+            Ok(out)
+        };
+        let prefill = poly(["prefill_ms", "prefill"], ["a", "b", "c"])?;
+        let decode = poly(["decode_ms", "decode"], ["d", "e", "f"])
+            .or_else(|_| poly(["decode_ms", "decode"], ["a", "b", "c"]))?;
+        let block_size = v
+            .get("block_size")
+            .and_then(serde_json::Value::as_u64)
+            .map(|b| b as u32);
+        let kv_capacity_tokens = v
+            .get("kv_capacity_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                let blocks = v.get("kv_capacity_blocks")?.as_u64()?;
+                Some(blocks * u64::from(block_size?))
+            });
+        let request_overhead_ms = v
+            .get("request_overhead_ms")
+            .or_else(|| v.get("per_request_overhead_ms"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        Ok(Self {
+            prefill,
+            decode,
+            kv_capacity_tokens,
+            block_size,
+            request_overhead_ms,
+        })
+    }
+}
+
 /// Tunable parameters of the simulated engine. The scheduler is vLLM's pass
 /// loop (a token budget per pass, running requests first, then FCFS waiting,
 /// LIFO preemption when KV runs out) over a block-level KV pool with
@@ -137,6 +222,10 @@ pub struct EngineParams {
     pub prefill_first: bool,
     /// Output tokens to generate when a request does not specify `max_new_tokens`.
     pub max_new_default: u32,
+    /// Fixed per-request overhead in ms (a calibration's intercept that the
+    /// pass polynomials do not explain): every event of a request's stream is
+    /// delivered that much later, so TTFT and e2e grow by it and ITL does not.
+    pub request_overhead_ms: f64,
     /// Capacity of the live KV-event broadcast channel.
     pub kv_broadcast_capacity: usize,
     /// How many recent KV-event batches to retain for subscriber replay.
@@ -154,6 +243,7 @@ impl Default for EngineParams {
             prefix_cache: true,
             prefill_first: false,
             max_new_default: 128,
+            request_overhead_ms: 0.0,
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
         }
@@ -234,6 +324,9 @@ struct EngineShared {
     kv_tx: broadcast::Sender<Published>,
     /// Hands batches from the actor to the publisher task with their release time.
     publish_tx: mpsc::UnboundedSender<(Published, Instant)>,
+    /// Hands a request's events to the delivery task with their release time
+    /// (the per-request overhead); unused when the overhead is zero.
+    deliver_tx: mpsc::UnboundedSender<(Instant, mpsc::UnboundedSender<GenEvent>, GenEvent)>,
     kv_replay: Mutex<VecDeque<common::KvEventBatch>>,
     prefix_cache: bool,
     block_size: u32,
@@ -406,10 +499,12 @@ impl Engine {
         let (tx, rx) = mpsc::unbounded_channel();
         let (kv_tx, _) = broadcast::channel(params.kv_broadcast_capacity.max(1));
         let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        let (deliver_tx, deliver_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(EngineShared {
             snapshot: RwLock::new(LoadSnapshot::idle(&params)),
             kv_tx: kv_tx.clone(),
             publish_tx,
+            deliver_tx,
             kv_replay: Mutex::new(VecDeque::new()),
             prefix_cache: params.prefix_cache,
             block_size: params.block_size,
@@ -421,6 +516,7 @@ impl Engine {
         // The publisher task releases batches in order at their release time
         // (the delay hook) and ends with the actor, which owns its sender.
         tokio::spawn(publish(publish_rx, kv_tx));
+        tokio::spawn(deliver(deliver_rx));
         tokio::spawn(run(params, rx, shared.clone()));
         let engine = Engine { tx, shared };
         if register {
@@ -644,9 +740,18 @@ async fn run(
         if step.duration > Duration::ZERO {
             tokio::time::sleep(step.duration).await;
         }
-        // The step's outputs become observable only after its simulated time.
-        for (tx, ev) in step.sends {
-            let _ = tx.send(ev);
+        // The step's outputs become observable only after its simulated time,
+        // plus the fixed per-request overhead when one is calibrated (every
+        // event of a stream shifts by the same amount, so order is kept).
+        if params.request_overhead_ms > 0.0 {
+            let at = Instant::now() + Duration::from_secs_f64(params.request_overhead_ms / 1000.0);
+            for (tx, ev) in step.sends {
+                let _ = shared.deliver_tx.send((at, tx, ev));
+            }
+        } else {
+            for (tx, ev) in step.sends {
+                let _ = tx.send(ev);
+            }
         }
         if step.cleared || !step.inserted.is_empty() || !step.evicted.is_empty() {
             let mut mirror = shared
@@ -713,6 +818,16 @@ async fn publish(
     while let Some((item, release_at)) = rx.recv().await {
         tokio::time::sleep_until(release_at.into()).await;
         let _ = kv_tx.send(item);
+    }
+}
+
+/// Deliver request events in order, each at its release time.
+async fn deliver(
+    mut rx: mpsc::UnboundedReceiver<(Instant, mpsc::UnboundedSender<GenEvent>, GenEvent)>,
+) {
+    while let Some((at, tx, ev)) = rx.recv().await {
+        tokio::time::sleep_until(at.into()).await;
+        let _ = tx.send(ev);
     }
 }
 
@@ -2047,6 +2162,77 @@ mod tests {
         assert_eq!(
             passes, 3,
             "2500 tokens at a 1000-token budget take three passes"
+        );
+    }
+
+    #[test]
+    fn calibration_file_is_read_in_either_spelling() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"prefill_ms": {"a": 20.0, "b": 0.01, "c": 1e-7}, "decode_ms": {"d": 7.0, "e": 40.0, "f": -10.0},
+                "kv_capacity_blocks": 6144, "block_size": 64, "request_overhead_ms": 12.5, "engine": "vllm"}"#,
+        )
+        .unwrap();
+        let c = Calibration::from_value(&v).unwrap();
+        assert_eq!(c.prefill, [20.0, 0.01, 1e-7]);
+        assert_eq!(c.decode, [7.0, 40.0, -10.0]);
+        assert_eq!(c.kv_capacity_tokens, Some(6144 * 64));
+        assert_eq!(c.block_size, Some(64));
+        assert_eq!(c.request_overhead_ms, 12.5);
+        assert_eq!(
+            TimingModel::fitted(&c),
+            TimingModel::Polynomial {
+                prefill: [20.0, 0.01, 1e-7],
+                decode: [7.0, 40.0, -10.0]
+            }
+        );
+
+        let arrays: serde_json::Value = serde_json::from_str(
+            r#"{"prefill": [16.5, 0.015, 4e-7], "decode": [5.7, 54.0, -25.7], "kv_capacity_tokens": 393216}"#,
+        )
+        .unwrap();
+        let c = Calibration::from_value(&arrays).unwrap();
+        assert_eq!(c.kv_capacity_tokens, Some(393_216));
+        assert_eq!(c.block_size, None);
+        assert_eq!(c.request_overhead_ms, 0.0);
+
+        let bad: serde_json::Value = serde_json::from_str(r#"{"decode": [1, 2, 3]}"#).unwrap();
+        assert!(Calibration::from_value(&bad)
+            .unwrap_err()
+            .contains("prefill"));
+    }
+
+    #[tokio::test]
+    async fn request_overhead_delays_the_stream_without_stretching_it() {
+        let quick = Engine::spawn(EngineParams::default());
+        let slow = Engine::spawn(EngineParams {
+            request_overhead_ms: 300.0,
+            ..Default::default()
+        });
+        async fn first_and_second(engine: &Engine) -> (Duration, Duration) {
+            let (r, mut rx) = req("a", vec![1; 32], 3);
+            let t0 = Instant::now();
+            engine.submit(r);
+            let mut times = Vec::new();
+            while times.len() < 2 {
+                let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("events")
+                    .expect("open");
+                if matches!(ev, GenEvent::Token { .. }) {
+                    times.push(t0.elapsed());
+                }
+            }
+            (times[0], times[1] - times[0])
+        }
+        let (ttft_quick, itl_quick) = first_and_second(&quick).await;
+        let (ttft_slow, itl_slow) = first_and_second(&slow).await;
+        assert!(
+            ttft_slow >= ttft_quick + Duration::from_millis(250),
+            "the overhead adds to TTFT: {ttft_quick:?} vs {ttft_slow:?}"
+        );
+        assert!(
+            itl_slow < itl_quick + Duration::from_millis(50),
+            "and not to the inter-token gap: {itl_quick:?} vs {itl_slow:?}"
         );
     }
 

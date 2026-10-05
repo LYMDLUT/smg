@@ -80,9 +80,10 @@ replay, which models the same loop):
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--timing` | polynomial | `polynomial` or `linear` pass-duration model |
+| `--timing` | polynomial | `polynomial`, `linear`, or `fit:<path>` (a hardware calibration JSON, below) |
 | `--prefill-poly a,b,c` | AISimulate | prefill ms = a + b·T + c·T² |
 | `--decode-poly a,b,c` | AISimulate | decode ms = max(1, a + b·u + c·u²) |
+| `--request-overhead-ms` | 0 | fixed per-request latency added to every event of a stream (TTFT and e2e grow by it, ITL does not) |
 | `--prefill-tps` | 8000 | linear model: prefill tokens/s (selects `linear`) |
 | `--decode-base-ms` | 6.0 | linear model: fixed decode-pass ms |
 | `--decode-per-req-ms` | 0.35 | linear model: decode ms per running request |
@@ -100,6 +101,15 @@ replay, which models the same loop):
 cargo run --release -p mock-worker -- \
   --engine realistic --grpc-base-port 19000 --grpc-count 8 --model mock-model --admin-port 19100
 ```
+
+`--timing fit:<path>` replaces the uncalibrated polynomials with a hardware
+calibration the GPU harness writes: a JSON with `prefill_ms` (`{"a","b","c"}`
+or `[a,b,c]`, ms over the uncached tokens of a pass), `decode_ms`
+(`{"d","e","f"}` or `[d,e,f]`, ms over KV utilisation), the engine's capacity
+as `kv_capacity_tokens` or `kv_capacity_blocks` with `block_size`, and
+`request_overhead_ms`; unknown keys are ignored, and `--block-size`,
+`--kv-tokens`/`--kv-blocks` and `--request-overhead-ms` given explicitly win
+over the file. The defaults stay AISimulate's uncalibrated baseline.
 
 Agreement with hardware is the caller's problem: AISimulate's published
 agreement for these polynomials (mean absolute percentage error 48.5% on TTFT,
