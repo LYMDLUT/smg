@@ -178,7 +178,7 @@ impl Harness {
         let blocks = blocks_of(&contents);
         let held = self.maps.get(&worker).expect("worker map");
         let mut known = 0;
-        while known < blocks.len() && held.contains_key(&blocks[known].seq_hash) {
+        while known < blocks.len() && held.contains_key(blocks[known].seq_hash) {
             known += 1;
         }
         let start = if known == blocks.len() {

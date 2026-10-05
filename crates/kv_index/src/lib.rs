@@ -13,6 +13,7 @@
 
 mod common;
 mod event_tree;
+mod lane_map;
 mod path_hash;
 pub mod reference;
 pub mod run_index;
@@ -27,9 +28,10 @@ pub use event_tree::{
     ContentHash, ContentSeq, OverlapScores, PositionalIndexer, PruneStats, SequenceHash,
     StoredBlock, WorkerBlockMap, WorkerId, WorkerIdExhausted, XXH3_SEED,
 };
+pub use lane_map::RunBlockMap;
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
 pub use reference::{request_prefix_hashes, ReferenceIndexer};
-pub use run_index::{BlockRef, RunBlockMap, RunIndex, RunIndexStats};
+pub use run_index::{BlockRef, RunIndex, RunIndexStats};
 // Re-export under names matching old tree.rs API for easier migration
 pub use string_tree::Tree;
 pub use string_tree::{

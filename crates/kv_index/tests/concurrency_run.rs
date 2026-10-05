@@ -133,7 +133,7 @@ impl Lane<'_> {
     fn store(&mut self, contents: &[ContentHash]) {
         let blocks = blocks_of(contents);
         let mut known = 0;
-        while known < blocks.len() && self.map.contains_key(&blocks[known].seq_hash) {
+        while known < blocks.len() && self.map.contains_key(blocks[known].seq_hash) {
             known += 1;
         }
         let start = if known == blocks.len() {
@@ -160,7 +160,7 @@ impl Lane<'_> {
     fn remove_some(&mut self, contents: &[ContentHash]) {
         let blocks = blocks_of(contents);
         let held: Vec<usize> = (0..blocks.len())
-            .filter(|&i| self.map.contains_key(&blocks[i].seq_hash))
+            .filter(|&i| self.map.contains_key(blocks[i].seq_hash))
             .collect();
         if held.is_empty() {
             return;

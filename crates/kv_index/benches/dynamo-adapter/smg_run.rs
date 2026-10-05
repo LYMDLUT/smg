@@ -31,9 +31,9 @@ use crate::protocols::{
     WorkerWithDpRank,
 };
 
-/// Bytes per slot of the lane maps (`FxHashMap<SequenceHash, BlockRef>`: 16-byte entry plus a
-/// control byte), for the memory report.
-const MAP_SLOT_BYTES: usize = 17;
+/// Bytes per slot of the lane maps (`RunBlockMap`: open addressing, 16-byte slots), for the
+/// memory report.
+const MAP_SLOT_BYTES: usize = 16;
 
 /// One lane's view of a worker: SMG's interned id and SMG's per-worker block map.
 struct LaneWorker {
@@ -293,7 +293,7 @@ impl SyncIndexer for SmgRun {
                 } => {
                     let resident = lane
                         .get(&worker)
-                        .is_some_and(|entry| entry.blocks.contains_key(&SequenceHash(block_hash.0)));
+                        .is_some_and(|entry| entry.blocks.contains_key(SequenceHash(block_hash.0)));
                     let _ = resp.send(resident);
                 }
                 WorkerTask::Flush(sender) => {

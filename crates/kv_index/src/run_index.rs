@@ -100,10 +100,7 @@ pub struct BlockRef {
     pub offset: u32,
 }
 
-/// One worker's blocks by engine hash, owned by that worker's event lane (the gateway's
-/// `KvEventMonitor` task). Entries may point at a run that has since been split; the index
-/// forwards them on use.
-pub type RunBlockMap = FxHashMap<SequenceHash, BlockRef>;
+pub use crate::lane_map::RunBlockMap;
 
 /// Hash array capacity class: `8, 16, .., 128, 256, 512, ..`.
 fn array_class(capacity: usize) -> usize {
@@ -1875,8 +1872,8 @@ impl RunIndex {
                 if map.is_empty() {
                     return Err(ApplyError::WorkerNotTracked);
                 }
-                match map.get(&hash) {
-                    Some(&at) => Some((hash, at)),
+                match map.get(hash) {
+                    Some(at) => Some((hash, at)),
                     None => return Err(ApplyError::ParentBlockNotFound),
                 }
             }
@@ -1906,18 +1903,15 @@ impl RunIndex {
         lap(self.counter_slot(1), walk);
         let writes = tick();
         for placed in pending {
-            for (index, stored) in blocks[placed.start..placed.start + placed.count]
-                .iter()
-                .enumerate()
-            {
-                map.insert(
-                    stored.seq_hash,
-                    BlockRef {
-                        run: placed.run,
-                        offset: placed.offset + index as u32,
-                    },
-                );
-            }
+            map.insert_run(
+                blocks[placed.start..placed.start + placed.count]
+                    .iter()
+                    .map(|stored| stored.seq_hash),
+                BlockRef {
+                    run: placed.run,
+                    offset: placed.offset,
+                },
+            );
         }
         lap(self.counter_slot(2), writes);
         outcome
@@ -1955,7 +1949,7 @@ impl RunIndex {
             None => (ROOT, 0usize, self.slab.run(ROOT).generation()),
             Some((hash, at)) => {
                 let Some((at, generation)) = self.resolve(at) else {
-                    map.remove(&hash);
+                    map.remove(hash);
                     return Walk::NoParent;
                 };
                 map.insert(hash, at);
@@ -2337,7 +2331,8 @@ impl RunIndex {
                 .fetch_add(hashes.len() as u64, Ordering::Relaxed);
         }
         let unmapping = tick();
-        let mut refs: Vec<BlockRef> = hashes.iter().filter_map(|hash| map.remove(hash)).collect();
+        let mut refs: Vec<BlockRef> = Vec::with_capacity(hashes.len());
+        map.remove_all(hashes, |at| refs.push(at));
         lap(self.counter_slot(3), unmapping);
         let grouping = tick();
         refs.sort_unstable_by_key(|at| at.run);
