@@ -160,12 +160,16 @@ impl WordArena {
         self.dir[index].get_or_init(|| (0..WORD_CHUNK).map(|_| AtomicU64::new(0)).collect())
     }
 
-    /// `count` consecutive words starting at `start` (all within one chunk, as allocated).
+    /// `count` consecutive words starting at `start` (all within one chunk, as allocated). A
+    /// lock-free reader may compute `count` from a header that is being recycled under it; it
+    /// confirms the run's version afterwards and discards what it read, so the slice is clamped
+    /// to the chunk rather than trusted.
     #[inline]
     fn words(&self, start: u32, count: usize) -> &[AtomicU64] {
         let start = start as usize;
         let offset = start & (WORD_CHUNK - 1);
-        &self.chunk(start >> WORD_CHUNK_BITS)[offset..offset + count]
+        let end = offset.saturating_add(count).min(WORD_CHUNK);
+        &self.chunk(start >> WORD_CHUNK_BITS)[offset..end]
     }
 
     #[inline]
@@ -300,15 +304,19 @@ impl WordArena {
             return None;
         }
         let slots = self.table_slots(table);
+        if slots == 0 || !slots.is_power_of_two() {
+            // A header being recycled under a lock-free reader; the version check discards this.
+            return None;
+        }
         let words = self.words(table + 2, 2 * slots);
         let mask = slots - 1;
         let mut index = head as usize & mask;
         for _ in 0..slots {
-            let entry = words[2 * index + 1].load(Ordering::Acquire);
+            let entry = words.get(2 * index + 1)?.load(Ordering::Acquire);
             if entry == 0 {
                 return None;
             }
-            if entry != TOMB && words[2 * index].load(Ordering::Relaxed) == head {
+            if entry != TOMB && words.get(2 * index)?.load(Ordering::Relaxed) == head {
                 return Some((entry as u32, (entry >> 32) as u32));
             }
             index = (index + 1) & mask;
@@ -531,6 +539,101 @@ impl WordArena {
         self.word(table + 1).fetch_sub(1, Ordering::Relaxed) as usize - 1
     }
 
+    // ---- forwarding records: [slots | count << 32][0][(at | suffix << 32), generation; slots] ----
+    // Appended under the run's lock, read without it: `count` is published with a release store
+    // after the record, and a reader checks the run's version around the read. Same word count as
+    // a child table of the same slot count, so the two share free lists.
+
+    fn alloc_forwards(&self, slots: usize) -> u32 {
+        let class = table_class(slots);
+        let recycled = self.free_tables[class].pop();
+        let table = recycled.unwrap_or_else(|| self.bump(2 + 2 * slots));
+        self.word(table + 1).store(0, Ordering::Relaxed);
+        self.word(table).store(slots as u64, Ordering::Release);
+        table
+    }
+
+    #[inline]
+    fn forwards_shape(&self, table: u32) -> (usize, usize) {
+        let header = self.word(table).load(Ordering::Acquire);
+        (header as u32 as usize, (header >> 32) as usize)
+    }
+
+    /// The records of a table, oldest first.
+    fn forward_records(&self, table: u32) -> Vec<(u32, u32, u32)> {
+        if table == NONE {
+            return Vec::new();
+        }
+        let (_, count) = self.forwards_shape(table);
+        let words = self.words(table + 2, 2 * count);
+        (0..count)
+            .map(|index| {
+                let first = words[2 * index].load(Ordering::Relaxed);
+                (
+                    first as u32,
+                    (first >> 32) as u32,
+                    words[2 * index + 1].load(Ordering::Relaxed) as u32,
+                )
+            })
+            .collect()
+    }
+
+    /// Where a block at `offset` of the run went: the oldest record whose split point is at or
+    /// before it (later splits cut the shorter prefix).
+    #[inline]
+    fn forwards_find(&self, table: u32, offset: u32) -> Option<(BlockRef, u32)> {
+        if table == NONE {
+            return None;
+        }
+        let (_, count) = self.forwards_shape(table);
+        let words = self.words(table + 2, 2 * count);
+        (0..count).find_map(|index| {
+            let first = words.get(2 * index)?.load(Ordering::Relaxed);
+            let at = first as u32;
+            if at > offset {
+                return None;
+            }
+            Some((
+                BlockRef {
+                    run: (first >> 32) as u32,
+                    offset: offset - at,
+                },
+                words.get(2 * index + 1)?.load(Ordering::Relaxed) as u32,
+            ))
+        })
+    }
+
+    /// Append a record; `false` when the table is full.
+    fn forwards_push(&self, table: u32, at: u32, suffix: u32, generation: u32) -> bool {
+        if table == NONE {
+            return false;
+        }
+        let (slots, count) = self.forwards_shape(table);
+        if count >= slots {
+            return false;
+        }
+        let words = self.words(table + 2, 2 * slots);
+        words[2 * count].store(u64::from(at) | (u64::from(suffix) << 32), Ordering::Relaxed);
+        words[2 * count + 1].store(u64::from(generation), Ordering::Relaxed);
+        self.word(table)
+            .store(slots as u64 | ((count as u64 + 1) << 32), Ordering::Release);
+        true
+    }
+
+    /// A new table with the records of `table` and room for more.
+    fn forwards_grown(&self, table: u32) -> u32 {
+        let records = self.forward_records(table);
+        let mut slots = MIN_TABLE_SLOTS;
+        while slots < 2 * (records.len() + 1) {
+            slots *= 2;
+        }
+        let grown = self.alloc_forwards(slots);
+        for (at, suffix, generation) in records {
+            self.forwards_push(grown, at, suffix, generation);
+        }
+        grown
+    }
+
     /// A partial table holding `entries`; `NONE` for none.
     fn partials_from(&self, entries: &[(u32, u32)]) -> u32 {
         if entries.is_empty() {
@@ -576,11 +679,6 @@ fn unpack(header: u64) -> (u32, u32) {
 /// Writer-side bookkeeping of a run, under its lock.
 #[derive(Default)]
 struct RunMeta {
-    /// Splits this run has undergone, oldest first: `(offset, suffix run, suffix generation)`.
-    /// A block that sat at `offset >= o` before the split lives in the suffix at `offset - o`
-    /// (and may have been forwarded again from there); `GONE` means nobody holds it any more.
-    /// Offsets decrease along the vector: a run never grows after a split.
-    splits: Vec<(u32, u32, u32)>,
     /// Unlinked from the tree; its id may be reused (with the next generation).
     dead: bool,
 }
@@ -597,6 +695,11 @@ struct Window {
     children: u32,
     /// Partial-holder table, or `NONE`.
     partials: u32,
+    /// Forwarding records of the splits this run has undergone, or `NONE`: a block that sat at
+    /// `offset >= at` before a split lives in that split's suffix at `offset - at` (and may have
+    /// been forwarded again from there); a `GONE` suffix means nobody holds it any more. Split
+    /// points decrease along the records: a run never grows after a split.
+    forwards: u32,
 }
 
 struct Run {
@@ -613,6 +716,7 @@ struct Run {
     /// Workers holding only a prefix of the run, with how much: `(worker, cutoff)` entries in the
     /// arena. A worker is either in the coverage bitset (whole run) or here, never both.
     partials: AtomicU32,
+    forwards: AtomicU32,
     meta: Mutex<RunMeta>,
 }
 
@@ -627,6 +731,7 @@ impl Run {
             len: AtomicU32::new(0),
             children: AtomicU32::new(NONE),
             partials: AtomicU32::new(NONE),
+            forwards: AtomicU32::new(NONE),
             meta: Mutex::new(RunMeta::default()),
         }
     }
@@ -663,6 +768,7 @@ impl Run {
                 len: self.len.load(Ordering::Acquire),
                 children: self.children.load(Ordering::Relaxed),
                 partials: self.partials.load(Ordering::Relaxed),
+                forwards: self.forwards.load(Ordering::Relaxed),
             };
             fence(Ordering::Acquire);
             if self.version.load(Ordering::Relaxed) == before {
@@ -696,6 +802,7 @@ impl Run {
         self.len.store(window.len, Ordering::Relaxed);
         self.children.store(window.children, Ordering::Relaxed);
         self.partials.store(window.partials, Ordering::Relaxed);
+        self.forwards.store(window.forwards, Ordering::Relaxed);
         self.end_update();
     }
 }
@@ -756,7 +863,6 @@ impl RunSlab {
             let run = self.run(id);
             let mut meta = run.meta.lock();
             debug_assert!(meta.dead && coverage_is_empty(self.coverage(id)));
-            meta.splits.clear();
             meta.dead = false;
             run.reincarnate(start, parent, window);
             return id;
@@ -774,6 +880,7 @@ impl RunSlab {
         run.len.store(window.len, Ordering::Relaxed);
         run.children.store(window.children, Ordering::Relaxed);
         run.partials.store(window.partials, Ordering::Relaxed);
+        run.forwards.store(window.forwards, Ordering::Relaxed);
         id
     }
 
@@ -826,23 +933,6 @@ fn workers(coverage: &[AtomicU64]) -> Vec<u32> {
                 .map(move |bit| (index * 64 + bit) as u32)
         })
         .collect()
-}
-
-/// Where a block that sat at `at` before this run's splits lives now, one hop, with the
-/// generation the suffix had when the split happened.
-fn forward(splits: &[(u32, u32, u32)], at: BlockRef) -> Option<(BlockRef, u32)> {
-    splits
-        .iter()
-        .find(|(offset, _, _)| *offset <= at.offset)
-        .map(|&(offset, suffix, generation)| {
-            (
-                BlockRef {
-                    run: suffix,
-                    offset: at.offset - offset,
-                },
-                generation,
-            )
-        })
 }
 
 /// Memory and shape counters, for the scoreboard.
@@ -945,6 +1035,16 @@ enum Walk {
     NoParent,
 }
 
+/// What the lock-free look at a run during a store walk decided.
+enum Plan {
+    /// Nothing changes here: `matched` blocks are already held; carry on after them.
+    Skip(usize),
+    /// Continue in the child `(id, generation)` from its first block.
+    Descend(u32, u32),
+    /// The run must change: take its lock and re-read it.
+    Lock,
+}
+
 /// What [`RunIndex::store_in_run`] found.
 enum InRun<'b> {
     /// Every block is placed.
@@ -993,6 +1093,7 @@ impl RunIndex {
                 len: 0,
                 children: NONE,
                 partials: NONE,
+                forwards: NONE,
             },
         );
         debug_assert_eq!(root, ROOT);
@@ -1202,30 +1303,33 @@ impl RunIndex {
             .load(Ordering::Relaxed)
     }
 
-    /// Follow split forwarding records to where a block lives now, returning with the final run
-    /// locked so nothing can move the block before the caller uses it. `None` when the block is
-    /// not held any more (its run died, or it was forwarded to nowhere).
-    fn resolve_locked(
-        &self,
-        worker: u32,
-        mut at: BlockRef,
-    ) -> Option<(BlockRef, MutexGuard<'_, RunMeta>)> {
+    /// Follow the forwarding records to where a block lives now, without a lock: `(place,
+    /// generation of its run)`, or `None` when the block is not held any more (its run died, or
+    /// it was forwarded to nowhere).
+    fn resolve(&self, mut at: BlockRef) -> Option<(BlockRef, u32)> {
         let mut expected: Option<u32> = None;
         loop {
             if at.run == GONE {
                 return None;
             }
             let run = self.slab.run(at.run);
-            let meta = self.lock_run(at.run, worker);
-            if meta.dead || expected.is_some_and(|generation| generation != run.generation()) {
+            let (window, version) = run.snapshot();
+            let generation = (version >> 32) as u32;
+            if expected.is_some_and(|wanted| wanted != generation)
+                || (at.run != ROOT && window.len == 0)
+            {
                 return None;
             }
-            match forward(&meta.splits, at) {
-                Some((next, generation)) => {
+            let hop = self.arena.forwards_find(window.forwards, at.offset);
+            if !run.confirm(version) {
+                continue;
+            }
+            match hop {
+                Some((next, next_generation)) => {
                     at = next;
-                    expected = Some(generation);
+                    expected = Some(next_generation);
                 }
-                None => return Some((at, meta)),
+                None => return Some((at, generation)),
             }
         }
     }
@@ -1271,15 +1375,18 @@ impl RunIndex {
         let run = self.slab.run(run_id);
         let block = run.block.load(Ordering::Relaxed);
         let partials = run.partials.load(Ordering::Relaxed);
+        let forwards = run.forwards.load(Ordering::Relaxed);
         run.begin_update();
         run.block.store(NONE, Ordering::Relaxed);
         run.base.store(0, Ordering::Relaxed);
         run.len.store(0, Ordering::Relaxed);
         run.children.store(NONE, Ordering::Relaxed);
         run.partials.store(NONE, Ordering::Relaxed);
+        run.forwards.store(NONE, Ordering::Relaxed);
         run.end_update();
         self.arena.array_release(block);
         self.arena.free_partials(partials);
+        self.arena.free_table(forwards);
         meta.dead = true;
         freed.push(run_id);
     }
@@ -1431,12 +1538,12 @@ impl RunIndex {
         }
     }
 
-    /// Split `run` (locked by the caller) at `at`: the run keeps `[0, at)`; a new suffix run takes
+    /// Split `run` (locked by the caller, whose guard is `_meta`) at `at`: the run keeps `[0, at)`; a new suffix run takes
     /// `[at, len)` on the same hash array, with the run's children, its full holders and the
     /// partial holders reaching past `at`; partial holders reaching `at` become full holders of
     /// the prefix. A suffix nobody would hold is not created when the run has no children: the
     /// forwarding record says those blocks are gone. No worker's holdings change in total.
-    fn split_locked(&self, run_id: u32, meta: &mut RunMeta, at: usize) -> u32 {
+    fn split_locked(&self, run_id: u32, _meta: &mut RunMeta, at: usize) -> u32 {
         let run = self.slab.run(run_id);
         let coverage = self.slab.coverage(run_id);
         let len = run.len();
@@ -1470,6 +1577,7 @@ impl RunIndex {
                     len: (len - at) as u32,
                     children,
                     partials: suffix_partials,
+                    forwards: NONE,
                 },
             );
             let suffix = self.slab.run(suffix_id);
@@ -1503,8 +1611,28 @@ impl RunIndex {
         } else {
             self.slab.run(suffix_id).generation()
         };
-        meta.splits.push((at as u32, suffix_id, generation));
+        self.add_forward(run, at as u32, suffix_id, generation);
         suffix_id
+    }
+
+    /// Record a split on the run (locked by the caller); a full table is replaced under a version
+    /// step so a lock-free reader never follows a recycled one.
+    fn add_forward(&self, run: &Run, at: u32, suffix: u32, generation: u32) {
+        let table = run.forwards.load(Ordering::Relaxed);
+        if self.arena.forwards_push(table, at, suffix, generation) {
+            return;
+        }
+        let grown = if table == NONE {
+            self.arena.alloc_forwards(MIN_TABLE_SLOTS)
+        } else {
+            self.arena.forwards_grown(table)
+        };
+        let placed = self.arena.forwards_push(grown, at, suffix, generation);
+        debug_assert!(placed);
+        run.begin_update();
+        run.forwards.store(grown, Ordering::Relaxed);
+        run.end_update();
+        self.arena.free_table(table);
     }
 
     /// Unlink `run` (locked by the caller, known to be an uncovered leaf) from its parent and
@@ -1604,57 +1732,147 @@ impl RunIndex {
         map: &mut RunBlockMap,
         pending: &mut Vec<Placed>,
     ) -> Walk {
-        let (mut run_id, mut offset, mut meta) = match origin {
-            None => (ROOT, 0usize, self.lock_run(ROOT, worker)),
+        let (mut run_id, mut offset, mut expected) = match origin {
+            None => (ROOT, 0usize, self.slab.run(ROOT).generation()),
             Some((hash, at)) => {
-                let Some((at, meta)) = self.resolve_locked(worker, at) else {
+                let Some((at, generation)) = self.resolve(at) else {
                     map.remove(&hash);
                     return Walk::NoParent;
                 };
                 map.insert(hash, at);
-                (at.run, at.offset as usize + 1, meta)
+                (at.run, at.offset as usize + 1, generation)
             }
         };
         let mut remaining = blocks;
         loop {
-            let next = match self.store_in_run(
-                worker,
-                run_id,
-                &mut meta,
-                offset,
-                remaining,
-                blocks.len() - remaining.len(),
-                pending,
-            ) {
-                InRun::Done => return Walk::Done,
-                InRun::Continue(rest) => {
-                    remaining = rest;
-                    self.store_at_end(
+            // Look at the run under its version first: a run this worker already holds up to
+            // the blocks in hand, or a run whose child continues them, is passed without its
+            // lock. Only a run that must change is locked, and re-read under the lock.
+            let run = self.slab.run(run_id);
+            let (window, version) = run.snapshot();
+            if (version >> 32) as u32 != expected || (run_id != ROOT && window.len == 0) {
+                return self.restart();
+            }
+            let len = window.len as usize;
+            if offset > len {
+                // A split moved the blocks after the parent into a suffix: resolve again.
+                return self.restart();
+            }
+            let block_start = blocks.len() - remaining.len();
+            let plan = if offset < len {
+                let held = self.held_in(run_id, &window, worker);
+                if held < offset {
+                    Plan::Lock
+                } else {
+                    let data = window.block + window.base + offset as u32;
+                    let hashes = self.arena.words(data, len - offset);
+                    let matched = remaining
+                        .iter()
+                        .zip(hashes)
+                        .take_while(|(stored, slot)| {
+                            stored.content_hash.0 == slot.load(Ordering::Relaxed)
+                        })
+                        .count();
+                    let diverge = matched < len - offset && matched < remaining.len();
+                    if !diverge && offset + matched <= held {
+                        Plan::Skip(matched)
+                    } else {
+                        Plan::Lock
+                    }
+                }
+            } else {
+                match self
+                    .arena
+                    .table_find(window.children, remaining[0].content_hash.0)
+                {
+                    Some((child, generation)) => Plan::Descend(child, generation),
+                    None => Plan::Lock,
+                }
+            };
+            if !run.confirm(version) {
+                continue;
+            }
+            match plan {
+                Plan::Skip(matched) => {
+                    pending.push(Placed {
+                        run: run_id,
+                        offset: offset as u32,
+                        start: block_start,
+                        count: matched,
+                    });
+                    if matched == remaining.len() {
+                        return Walk::Done;
+                    }
+                    remaining = &remaining[matched..];
+                    offset += matched;
+                }
+                Plan::Descend(child, generation) => {
+                    run_id = child;
+                    expected = generation;
+                    offset = 0;
+                }
+                Plan::Lock => {
+                    let mut meta = self.lock_run(run_id, worker);
+                    if meta.dead || run.generation() != expected || offset > run.len() {
+                        return self.restart();
+                    }
+                    let next = match self.store_in_run(
                         worker,
                         run_id,
-                        &meta,
+                        &mut meta,
+                        offset,
                         remaining,
-                        blocks.len() - remaining.len(),
+                        block_start,
                         pending,
-                    )
+                    ) {
+                        InRun::Done => return Walk::Done,
+                        InRun::Continue(rest) => {
+                            remaining = rest;
+                            self.store_at_end(
+                                worker,
+                                run_id,
+                                &meta,
+                                remaining,
+                                blocks.len() - remaining.len(),
+                                pending,
+                            )
+                        }
+                        InRun::MoveTo(child, generation) => Some((child, generation)),
+                    };
+                    drop(meta);
+                    match next {
+                        Some((child, generation)) => {
+                            run_id = child;
+                            expected = generation;
+                            offset = 0;
+                        }
+                        None => return Walk::Done,
+                    }
                 }
-                InRun::MoveTo(child, generation) => Some((child, generation)),
-            };
-            let Some((child, generation)) = next else {
-                return Walk::Done;
-            };
-            drop(meta);
-            // Between the parent's lock and the child's, the child may have been unlinked and
-            // its id given to another run: start over from the parent block if so.
-            run_id = child;
-            offset = 0;
-            meta = self.lock_run(run_id, worker);
-            if meta.dead || self.slab.run(run_id).generation() != generation {
-                #[cfg(feature = "lane-stats")]
-                self.counters.restarts.fetch_add(1, Ordering::Relaxed);
-                return Walk::Restart;
             }
         }
+    }
+
+    /// Blocks of a run `worker` holds, read from a snapshot (no lock).
+    #[inline]
+    fn held_in(&self, run_id: u32, window: &Window, worker: u32) -> usize {
+        if has(self.slab.coverage(run_id), worker) {
+            window.len as usize
+        } else {
+            self.arena
+                .partial_find(window.partials, worker)
+                .map_or(0, |(_, cutoff)| cutoff as usize)
+        }
+    }
+
+    /// A store walk that must start over from the parent block.
+    #[inline]
+    fn restart(&self) -> Walk {
+        #[cfg(feature = "lane-stats")]
+        self.counters.restarts.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(feature = "lane-stats"))]
+        let _ = self;
+        Walk::Restart
     }
 
     /// Match `remaining` against the run from `offset`: join or split the run as needed, record
@@ -1724,7 +1942,7 @@ impl RunIndex {
         &self,
         worker: u32,
         run_id: u32,
-        meta: &RunMeta,
+        _meta: &RunMeta,
         remaining: &[StoredBlock],
         block_start: usize,
         pending: &mut Vec<Placed>,
@@ -1743,7 +1961,7 @@ impl RunIndex {
             .collect();
         let own_leaf = run_id != ROOT
             && children == NONE
-            && meta.splits.is_empty()
+            && run.forwards.load(Ordering::Relaxed) == NONE
             && covered_only_by(coverage, worker);
         let (target, first) = if own_leaf {
             self.append(run, &contents);
@@ -1761,6 +1979,7 @@ impl RunIndex {
                     len: contents.len() as u32,
                     children: NONE,
                     partials: NONE,
+                    forwards: NONE,
                 },
             );
             set(self.slab.coverage(new_id), worker);
@@ -1868,7 +2087,12 @@ impl RunIndex {
         {
             return;
         }
-        let offsets = reforward(&meta, removal.offsets, work);
+        let offsets = reforward(
+            &self.arena,
+            run.forwards.load(Ordering::Relaxed),
+            removal.offsets,
+            work,
+        );
         if offsets.is_empty() || self.held_by(removal.run, worker) == 0 {
             return;
         }
@@ -1944,7 +2168,10 @@ impl RunIndex {
                 continue;
             }
             // Blocks of this worker may have moved into suffixes since the map was written.
-            for &(_, suffix, suffix_generation) in &meta.splits {
+            for (_, suffix, suffix_generation) in self
+                .arena
+                .forward_records(run.forwards.load(Ordering::Relaxed))
+            {
                 if suffix != GONE && seen.insert((suffix, Some(suffix_generation))) {
                     work.push((suffix, Some(suffix_generation)));
                 }
@@ -2173,25 +2400,28 @@ impl RunIndex {
 
 /// Offsets taken from the map may have moved into suffixes since they were written: send those
 /// on, tagged with the generation the suffix had at the split.
-fn reforward(meta: &RunMeta, mut offsets: Vec<u32>, work: &mut Vec<Removal>) -> Vec<u32> {
-    if meta.splits.is_empty() {
+fn reforward(
+    arena: &WordArena,
+    forwards: u32,
+    mut offsets: Vec<u32>,
+    work: &mut Vec<Removal>,
+) -> Vec<u32> {
+    if forwards == NONE {
         return offsets;
     }
     let mut forwarded: FxHashMap<(u32, u32), Vec<u32>> = FxHashMap::default();
-    offsets.retain(
-        |&offset| match forward(&meta.splits, BlockRef { run: ROOT, offset }) {
-            Some((next, generation)) => {
-                if next.run != GONE {
-                    forwarded
-                        .entry((next.run, generation))
-                        .or_default()
-                        .push(next.offset);
-                }
-                false
+    offsets.retain(|&offset| match arena.forwards_find(forwards, offset) {
+        Some((next, generation)) => {
+            if next.run != GONE {
+                forwarded
+                    .entry((next.run, generation))
+                    .or_default()
+                    .push(next.offset);
             }
-            None => true,
-        },
-    );
+            false
+        }
+        None => true,
+    });
     work.extend(
         forwarded
             .into_iter()
