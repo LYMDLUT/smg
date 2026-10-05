@@ -297,6 +297,12 @@ impl SyncIndexer for SmgRun {
                     let _ = resp.send(resident);
                 }
                 WorkerTask::Flush(sender) => {
+                    // The report is taken after a flush and before the lanes end: publish the
+                    // lane's idle and busy time so far.
+                    self.idle_ns.fetch_add(idle_ns as usize, Ordering::Relaxed);
+                    self.busy_ns.fetch_add(busy_ns as usize, Ordering::Relaxed);
+                    idle_ns = 0;
+                    busy_ns = 0;
                     let _ = sender.send(());
                 }
                 WorkerTask::Terminate => {}
@@ -361,9 +367,11 @@ impl SyncIndexer for SmgRun {
              lane map slots = {map_slots} bytes = {map_bytes} ({:.1} B per membership)\n  \
              total {:.1} B per membership\n  \
              lookups = {} runs walked per lookup = {:.2}\n  \
-             lanes: busy {:.3} s idle {:.3} s (finished lanes only)\n  \
+             lanes: busy {:.3} s idle {:.3} s (up to the last flush)\n  \
              locks root/own/shared = {:?} contended = {:?} wait_ms = {:?}\n  \
-             restarts = {} splits divergence/hole/stale-parent = {}/{}/{}",
+             restarts = {} splits divergence/hole/stale-parent = {}/{}/{} lock-free inserts = {}\n  \
+             stores = {} ({:.1} blocks each): resolve {:.0} ns, walk {:.0} ns, lane map {:.0} ns per event\n  \
+             removals = {} ({:.1} blocks each): lane map {:.0} ns, grouping {:.0} ns, runs {:.0} ns per event",
             stats.runs_allocated,
             stats.runs_live,
             stats.blocks_live,
@@ -388,6 +396,17 @@ impl SyncIndexer for SmgRun {
             lane.splits_divergence,
             lane.splits_hole,
             lane.splits_stale_parent,
+            lane.inserts,
+            lane.stores,
+            lane.store_blocks as f64 / lane.stores.max(1) as f64,
+            lane.store_ns[0] as f64 / lane.stores.max(1) as f64,
+            lane.store_ns[1] as f64 / lane.stores.max(1) as f64,
+            lane.store_ns[2] as f64 / lane.stores.max(1) as f64,
+            lane.removes,
+            lane.remove_blocks as f64 / lane.removes.max(1) as f64,
+            lane.remove_ns[0] as f64 / lane.removes.max(1) as f64,
+            lane.remove_ns[1] as f64 / lane.removes.max(1) as f64,
+            lane.remove_ns[2] as f64 / lane.removes.max(1) as f64,
         )
     }
 }

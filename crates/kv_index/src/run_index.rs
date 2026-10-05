@@ -1033,6 +1033,18 @@ pub struct LaneStats {
     pub splits_stale_parent: u64,
     /// Children linked without the parent's lock.
     pub inserts: u64,
+    /// Store events and the blocks they carried.
+    pub stores: u64,
+    pub store_blocks: u64,
+    /// Time in stores: resolving the parent block, walking the runs (lock-free and locked), and
+    /// writing the lane map.
+    pub store_ns: [u64; 3],
+    /// Removal events and the blocks they named.
+    pub removes: u64,
+    pub remove_blocks: u64,
+    /// Time in removals: taking the hashes out of the lane map, grouping them by run, and the
+    /// per-run work (locks, splits, holdings).
+    pub remove_ns: [u64; 3],
 }
 
 #[cfg(feature = "lane-stats")]
@@ -1046,6 +1058,49 @@ struct LaneCounters {
     splits_hole: CachePadded<AtomicU64>,
     splits_stale_parent: CachePadded<AtomicU64>,
     inserts: CachePadded<AtomicU64>,
+    stores: CachePadded<AtomicU64>,
+    store_blocks: CachePadded<AtomicU64>,
+    store_ns: [CachePadded<AtomicU64>; 3],
+    removes: CachePadded<AtomicU64>,
+    remove_blocks: CachePadded<AtomicU64>,
+    remove_ns: [CachePadded<AtomicU64>; 3],
+}
+
+/// A phase timer that costs nothing without `lane-stats`.
+#[cfg(feature = "lane-stats")]
+type Tick = std::time::Instant;
+/// Stands in for the timer when the feature is off.
+#[cfg(not(feature = "lane-stats"))]
+#[derive(Clone, Copy)]
+struct Tick;
+
+#[inline]
+fn tick() -> Tick {
+    #[cfg(feature = "lane-stats")]
+    {
+        std::time::Instant::now()
+    }
+    #[cfg(not(feature = "lane-stats"))]
+    {
+        Tick
+    }
+}
+
+#[cfg(feature = "lane-stats")]
+type LaneCounterSlot = CachePadded<AtomicU64>;
+/// Stands in for a counter when the feature is off.
+#[cfg(not(feature = "lane-stats"))]
+struct LaneCounterSlot;
+
+#[cfg(not(feature = "lane-stats"))]
+static NO_COUNTER: LaneCounterSlot = LaneCounterSlot;
+
+#[inline]
+fn lap(counter: &LaneCounterSlot, since: Tick) {
+    #[cfg(feature = "lane-stats")]
+    counter.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    #[cfg(not(feature = "lane-stats"))]
+    let _ = (counter, since);
 }
 
 /// Worker slots: a slot is in use from `intern_worker` until `remove_worker`, after which it is
@@ -1206,6 +1261,12 @@ impl RunIndex {
                 splits_hole: self.counters.splits_hole.load(Ordering::Relaxed),
                 splits_stale_parent: self.counters.splits_stale_parent.load(Ordering::Relaxed),
                 inserts: self.counters.inserts.load(Ordering::Relaxed),
+                stores: self.counters.stores.load(Ordering::Relaxed),
+                store_blocks: self.counters.store_blocks.load(Ordering::Relaxed),
+                store_ns: load(&self.counters.store_ns),
+                removes: self.counters.removes.load(Ordering::Relaxed),
+                remove_blocks: self.counters.remove_blocks.load(Ordering::Relaxed),
+                remove_ns: load(&self.counters.remove_ns),
             }
         }
         #[cfg(not(feature = "lane-stats"))]
@@ -1801,6 +1862,13 @@ impl RunIndex {
         if blocks.is_empty() {
             return Ok(());
         }
+        #[cfg(feature = "lane-stats")]
+        {
+            self.counters.stores.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .store_blocks
+                .fetch_add(blocks.len() as u64, Ordering::Relaxed);
+        }
         let origin = match parent {
             None => None,
             Some(hash) => {
@@ -1833,7 +1901,10 @@ impl RunIndex {
         map: &mut RunBlockMap,
     ) -> Walk {
         let mut pending: Vec<Placed> = Vec::new();
+        let walk = tick();
         let outcome = self.store_walk_locked(worker, blocks, origin, map, &mut pending);
+        lap(self.counter_slot(1), walk);
+        let writes = tick();
         for placed in pending {
             for (index, stored) in blocks[placed.start..placed.start + placed.count]
                 .iter()
@@ -1848,7 +1919,27 @@ impl RunIndex {
                 );
             }
         }
+        lap(self.counter_slot(2), writes);
         outcome
+    }
+
+    /// The timer slot for a phase: stores 0-2 (resolve, walk, map), removals 3-5 (map, group,
+    /// runs).
+    #[inline]
+    fn counter_slot(&self, phase: usize) -> &LaneCounterSlot {
+        #[cfg(feature = "lane-stats")]
+        {
+            if phase < 3 {
+                &self.counters.store_ns[phase]
+            } else {
+                &self.counters.remove_ns[phase - 3]
+            }
+        }
+        #[cfg(not(feature = "lane-stats"))]
+        {
+            let _ = (self, phase);
+            &NO_COUNTER
+        }
     }
 
     fn store_walk_locked(
@@ -1859,6 +1950,7 @@ impl RunIndex {
         map: &mut RunBlockMap,
         pending: &mut Vec<Placed>,
     ) -> Walk {
+        let resolving = tick();
         let (mut run_id, mut offset, mut expected) = match origin {
             None => (ROOT, 0usize, self.slab.run(ROOT).generation()),
             Some((hash, at)) => {
@@ -1870,6 +1962,7 @@ impl RunIndex {
                 (at.run, at.offset as usize + 1, generation)
             }
         };
+        lap(self.counter_slot(0), resolving);
         let mut remaining = blocks;
         // Set when a lock-free insert found the child table full: the next look at the same run
         // takes its lock, whose path grows the table.
@@ -2236,7 +2329,17 @@ impl RunIndex {
 
     /// Forget the named blocks of `worker`; unknown hashes are ignored.
     pub fn apply_removed(&self, worker: u32, hashes: &[SequenceHash], map: &mut RunBlockMap) {
+        #[cfg(feature = "lane-stats")]
+        {
+            self.counters.removes.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .remove_blocks
+                .fetch_add(hashes.len() as u64, Ordering::Relaxed);
+        }
+        let unmapping = tick();
         let mut refs: Vec<BlockRef> = hashes.iter().filter_map(|hash| map.remove(hash)).collect();
+        lap(self.counter_slot(3), unmapping);
+        let grouping = tick();
         refs.sort_unstable_by_key(|at| at.run);
         let mut work: Vec<Removal> = Vec::new();
         let mut index = 0;
@@ -2253,11 +2356,14 @@ impl RunIndex {
             });
             index = end;
         }
+        lap(self.counter_slot(4), grouping);
+        let applying = tick();
         let mut freed = Vec::new();
         while let Some(removal) = work.pop() {
             self.remove_from_run(worker, removal, &mut work, &mut freed);
             self.recycle(&mut freed);
         }
+        lap(self.counter_slot(5), applying);
     }
 
     /// Drop `worker` from the offsets of one run, forwarding offsets a split moved on.
