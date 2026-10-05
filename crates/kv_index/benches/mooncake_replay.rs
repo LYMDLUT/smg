@@ -45,7 +45,8 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 use kv_index::{
-    ContentHash, PositionalIndexer, ReferenceIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
+    ContentHash, PositionalIndexer, ReferenceIndexer, RunBlockMap, RunIndex, SequenceHash,
+    StoredBlock, WorkerBlockMap,
 };
 use rustc_hash::FxHashMap;
 use serde_json::json;
@@ -432,6 +433,74 @@ impl ReplayBackend for Positional {
 
     fn lookup(&self, hashes: &[ContentHash]) -> usize {
         self.inner.find_matches(hashes, false).scores.len()
+    }
+}
+
+struct Run {
+    inner: RunIndex,
+}
+
+struct RunLane {
+    workers: FxHashMap<(u64, u32), (u32, RunBlockMap)>,
+}
+
+impl ReplayBackend for Run {
+    type Lane = RunLane;
+
+    fn name(&self) -> &'static str {
+        "smg-run"
+    }
+
+    fn new_lane(&self) -> Self::Lane {
+        RunLane {
+            workers: FxHashMap::default(),
+        }
+    }
+
+    fn apply_stored(
+        &self,
+        lane: &mut Self::Lane,
+        worker: (u64, u32),
+        blocks: &[StoredBlock],
+        parent: Option<SequenceHash>,
+    ) -> bool {
+        let (smg_id, blocks_map) = lane.workers.entry(worker).or_insert_with(|| {
+            let id = self
+                .inner
+                .intern_worker(&format!("{}:{}", worker.0, worker.1))
+                .expect("worker slots; raise --max-workers");
+            (id, RunBlockMap::default())
+        });
+        self.inner
+            .apply_stored(*smg_id, blocks, parent, blocks_map)
+            .is_ok()
+    }
+
+    fn apply_removed(
+        &self,
+        lane: &mut Self::Lane,
+        worker: (u64, u32),
+        hashes: &[SequenceHash],
+    ) -> bool {
+        let Some((smg_id, blocks_map)) = lane.workers.get_mut(&worker) else {
+            return false;
+        };
+        self.inner.apply_removed(*smg_id, hashes, blocks_map);
+        true
+    }
+
+    fn apply_cleared(&self, lane: &mut Self::Lane, worker: (u64, u32)) -> bool {
+        if let Some((smg_id, blocks_map)) = lane.workers.get_mut(&worker) {
+            self.inner.apply_cleared(*smg_id, blocks_map);
+        }
+        true
+    }
+
+    fn lookup(&self, hashes: &[ContentHash]) -> usize {
+        let mut scored = 0usize;
+        self.inner
+            .score_into(hashes, |content| content.0, false, |_, _| scored += 1);
+        scored
     }
 }
 
@@ -1018,6 +1087,8 @@ enum BackendKind {
     Positional,
     /// The single-threaded reference indexer (small corpora only).
     Reference,
+    /// This crate's run-compressed RunIndex (worker slots from `--max-workers`).
+    Run,
     /// No indexer: the harness's own ceiling on this layout.
     Null,
 }
@@ -1032,6 +1103,9 @@ struct Args {
     /// Jump size of the positional indexer's lookup.
     #[arg(long, default_value = "8")]
     jump_size: usize,
+    /// Worker slots of the run index (one coverage bit per slot per run, at most 1024).
+    #[arg(long, default_value = "256")]
+    max_workers: usize,
     /// Replay window in milliseconds; deadlines are rescaled linearly from the corpus's
     /// reference window when they differ.
     #[arg(long, conflicts_with = "offered_block_ops_per_sec")]
@@ -1117,6 +1191,14 @@ fn main() -> anyhow::Result<()> {
                 }),
             )
         }
+        BackendKind::Run => run(
+            &args,
+            corpus,
+            window_ns,
+            Arc::new(Run {
+                inner: RunIndex::with_max_workers(args.max_workers),
+            }),
+        ),
         BackendKind::Null => run(&args, corpus, window_ns, Arc::new(Null)),
     }
 }
