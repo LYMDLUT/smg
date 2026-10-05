@@ -126,8 +126,26 @@ per-request overlap number in metrics or headers for gRPC workers (`x-smg-routed
 `smg_cache_aware_match_ratio` is recorded by the tree path, not the event path), so the comparison needs the
 debug log.
 
-Qwen3-8B was not deployed: the time went into the gateway anomaly below; the scripts take the model id and
-`--gpu-memory-utilization 0.4` leaves room for two 8B instances per GPU (16 GB weights each).
+Qwen3-8B fleet: four workers, one per GPU, run **from the host venv instead of podman** (`scripts/run-vllm-grpc-host.sh`;
+podman wedged for good mid-session, see pitfalls). Results in `gpu-harness-8b-baseline.md`: warm run at 16 req/s,
+cache_aware TTFT p50/p90/p99 58/90/369 ms and TPOT 4.5 ms with 15.1 req/s delivered, round robin 73 ms/5.0 s/9.8 s
+with 12.6 req/s delivered; one plain 8B engine at one worker's share (4 req/s) 112/278/689 ms.
+
+Hash-check drill (`gpu-harness-hash-drill.md`, `scripts/hash-drill.sh`): four 0.6B workers through the loop-head
+servicer (f4dc134b wheel) with `SMG_KV_EVENT_HASH_CHECK=vllm-sha256-cbor`; the worker started with
+`PYTHONHASHSEED=12345` logged `hash_checked 964, hash_mismatch 964`, the other three `962 / 0`, nothing dropped,
+and the workload through the loop-head gateway completed 256/256 with 240 prefix hits.
+
+### Container-free path (used for everything after the podman wedge)
+
+`~/smg-perf/gpu/venv-vllm`: `pip install vllm==0.31.0 ninja` plus `crates/grpc_client/python`, `grpc_servicer/` and the
+`smg` wheel. Two things the wheel needs on this host: `LD_PRELOAD=<venv>/nvidia/cu13/lib/libcublas.so.13` (the
+aarch64 extension `vllm/_C_stable_libtorch.abi3.so` references `cublasHgemm` without a `DT_NEEDED` on cuBLAS, so the
+import fails with an undefined symbol until it is preloaded) and `ninja` + `/usr/local/cuda/bin` on `PATH` for
+FlashInfer's JIT (first start of each model takes 3-6 min of kernel builds, cached under `~/.cache/flashinfer`
+afterwards; a cold engine also autotunes on the first benchmark, so quote the second run). GPUs are selected with
+`CUDA_VISIBLE_DEVICES`; everything runs under `taskset -c 72-143`. `~/smg-perf/gpu/venv-sglang` holds
+`sglang[all]==0.5.21` the same way (`scripts/run-sglang-host.sh`).
 
 ## 5. Baseline (deliverable 3)
 
@@ -176,8 +194,25 @@ healthy: wait for the `Tokenizer '<model>' ... registered` log line before loadi
 - SGLang omits `prompt_tokens_details` when nothing was cached; vLLM always sends it (0).
 - `nvidia-smi topo -m` puts GPUs 0/1 on cores 0-17 and GPUs 2/3 on 18-33; our cpuset 72-143 is remote to all
   four, which did not matter for these runs (SM utilisation stayed near zero).
+- Rootless podman can wedge for the rest of a session: a killed `podman stop`/`podman rm` leaves a zombie whose
+  last thread sits in `ovl_sync_fs`/`wb_wait_for_completion` (unmounting the container's overlay on btrfs) while
+  still owning `overlay-layers/layers.lock`; every later podman command blocks on that lock (`/proc/locks` shows
+  the holder, `lslocks` does not). Nothing short of the writeback finishing clears it. Containers keep running;
+  their processes can be killed by pid. This is why the second half of the session ran engines from the host venv.
+- `pgrep -f`/`pkill -f` with a pattern that also appears in your own command line kills your shell (twice here);
+  bracket one character of the pattern (`'vllm serve Qwen/Qwen3-0.6[B]'`) or use pid files.
+- Do not set `PYTHONHASHSEED` on vLLM workers unless every worker and the relay's hash check agree on it: vLLM
+  seeds `NONE_HASH` with its verbatim value, so a worker with a different value publishes different hashes for
+  the same tokens (that is exactly what the hash-check drill exploits).
+- A single-engine reference needs KV room for the benchmark's concurrency: at `--gpu-memory-utilization 0.1` an
+  8B instance holds about 80 k tokens, which 64 in-flight requests of 1216 tokens exceed; its tails were queueing,
+  not compute.
+- `vllm serve` inside a container and from the host do not share the torch.compile / FlashInfer caches; warm the
+  one you measure.
 
 ## 7. What is running / where things are
+
+As of the end of the session: host processes `8b-w0..w3` (gRPC 20061-20064, logs `logs/host-8b-w*.log`, pids `logs/host-8b-w*.pid`), `http-8b` (:8104), `drill-w0..w3` (gRPC 20071-20074), `sgl-dp2` (:8201), `sgl-hicache` (:8202); the podman containers were killed by pid and podman itself is still wedged. `kill $(cat logs/host-*.pid)` stops the host processes.
 
 - `~/smg-perf/gpu/scripts`: everything above; `fixtures/{vllm,sglang}`: raw captures and summaries;
   `results/`: bench JSONs, T4 table, anomaly note; `logs/`: container and gateway logs; `models/hub`: copies
