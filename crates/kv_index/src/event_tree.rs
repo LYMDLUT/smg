@@ -653,6 +653,22 @@ pub struct PositionalIndexer {
     test_now: AtomicU32,
 }
 
+/// Per-thread scratch for the lookup path: the request's chain hashes and the active worker
+/// set, reused across lookups so a query allocates nothing before it builds its result.
+struct LookupScratch {
+    seq_hashes: Vec<SequenceHash>,
+    active: Vec<u32>,
+}
+
+thread_local! {
+    static LOOKUP_SCRATCH: std::cell::RefCell<LookupScratch> = const {
+        std::cell::RefCell::new(LookupScratch {
+            seq_hashes: Vec::new(),
+            active: Vec::new(),
+        })
+    };
+}
+
 impl PositionalIndexer {
     /// Create a new PositionalIndexer with the given jump size.
     ///
@@ -1093,25 +1109,25 @@ impl PositionalIndexer {
     // Internal: query helpers
     // -----------------------------------------------------------------------
 
-    /// Workers holding the request's block at `position`: same content hash and the same
-    /// prefix hash (the chain of content hashes up to `position`), whatever the entry's shape.
-    /// Copies worker IDs into a Vec; used once, at position 0, to initialize `active`.
-    fn get_workers_lazy(
+    /// Workers holding the request's first block (position 0: same content hash and prefix
+    /// hash), appended to the caller's `active` buffer. False when no entry exists at all.
+    fn collect_workers_at_start(
         index: &PosIndex,
-        position: usize,
         content_hash: ContentHash,
         seq_hashes: &mut Vec<SequenceHash>,
         sequence: &[ContentHash],
         now: u32,
-    ) -> Option<Vec<u32>> {
-        let entry = index.get(&(position, content_hash))?;
+        active: &mut Vec<u32>,
+    ) -> bool {
+        let Some(entry) = index.get(&(0, content_hash)) else {
+            return false;
+        };
         entry.value().touch(now);
-        Self::ensure_seq_hash_computed(seq_hashes, position, sequence);
-        entry
-            .value()
-            .seq
-            .get(seq_hashes[position])
-            .map(|workers| workers.iter().collect())
+        Self::ensure_seq_hash_computed(seq_hashes, 0, sequence);
+        if let Some(workers) = entry.value().seq.get(seq_hashes[0]) {
+            active.extend(workers.iter());
+        }
+        true
     }
 
     /// Whether every worker in `active` still holds the request's exact block at `position`
@@ -1202,28 +1218,40 @@ impl PositionalIndexer {
         content_hashes: &[ContentHash],
         early_exit: bool,
     ) -> OverlapScores {
+        LOOKUP_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let LookupScratch { seq_hashes, active } = &mut *scratch;
+            seq_hashes.clear();
+            active.clear();
+            self.jump_search_with(content_hashes, early_exit, seq_hashes, active)
+        })
+    }
+
+    /// The jump search proper, over caller-provided scratch buffers (see [`LookupScratch`]).
+    fn jump_search_with(
+        &self,
+        content_hashes: &[ContentHash],
+        early_exit: bool,
+        seq_hashes: &mut Vec<SequenceHash>,
+        active: &mut Vec<u32>,
+    ) -> OverlapScores {
         let mut scores = OverlapScores::default();
 
         if content_hashes.is_empty() {
             return scores;
         }
 
-        let mut seq_hashes = Vec::with_capacity(content_hashes.len());
         let now = self.now_secs();
 
-        let Some(initial_workers) = Self::get_workers_lazy(
+        if !Self::collect_workers_at_start(
             &self.index,
-            0,
             content_hashes[0],
-            &mut seq_hashes,
+            seq_hashes,
             content_hashes,
             now,
-        ) else {
-            return scores;
-        };
-
-        let mut active = initial_workers;
-        if active.is_empty() {
+            active,
+        ) || active.is_empty()
+        {
             return scores;
         }
 
@@ -1232,7 +1260,7 @@ impl PositionalIndexer {
 
         // Early exit: just record that workers matched at position 0.
         if early_exit {
-            for &w in &active {
+            for &w in active.iter() {
                 internal_scores.insert(w, 1);
             }
             scores.scores = internal_scores;
@@ -1255,18 +1283,18 @@ impl PositionalIndexer {
                 &self.index,
                 next_pos,
                 content_hashes[next_pos],
-                &mut seq_hashes,
+                seq_hashes,
                 content_hashes,
                 now,
-                &active,
+                active,
             ) {
                 current_pos = next_pos;
             } else {
                 Self::linear_scan_drain(
                     &self.index,
                     content_hashes,
-                    &mut seq_hashes,
-                    &mut active,
+                    seq_hashes,
+                    active,
                     &mut internal_scores,
                     current_pos + 1,
                     next_pos + 1,
@@ -1278,7 +1306,7 @@ impl PositionalIndexer {
         }
 
         let final_score = len as u32;
-        for &w in &active {
+        for &w in active.iter() {
             internal_scores.insert(w, final_score);
         }
 
