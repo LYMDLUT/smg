@@ -33,12 +33,22 @@ Stores and removals are forwarded one for one. vLLM keeps several physical
 copies of one hash and removes them one at a time; the relay does not
 reference-count those (a replayed batch would inflate the counts), the
 gateway counts copies per worker and tier.
+
+``SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor`` (or ``relay(...,
+hash_check=...)``) turns on engine-hash verification: every store whose
+parent is known is rehashed the worker's way (SGLang's per-page SHA-256
+chain; vLLM's ``sha256_cbor`` with the default seed) and mismatches are
+counted, never dropped, so a worker with a different algorithm, seed or page
+size shows up as a counter. The algorithms and their test vectors mirror
+``crates/engine_servicer/src/engine_hash.rs``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -53,6 +63,8 @@ from smg_grpc_proto.generated import common_pb2
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "HASH_CHECKS",
+    "HASH_CHECK_ENV",
     "Counts",
     "Engine",
     "Normalizer",
@@ -66,6 +78,14 @@ __all__ = [
     "rank_sources",
     "relay",
     "replay_frames",
+    "sglang_chain",
+    "sglang_event_int",
+    "sglang_page",
+    "sglang_salt_seed",
+    "vllm_block",
+    "vllm_chain",
+    "vllm_event_int",
+    "vllm_none_hash",
 ]
 
 _U64_MASK = 0xFFFF_FFFF_FFFF_FFFF
@@ -146,11 +166,14 @@ def _hashes(value: object) -> list[int] | None:
     return None if any(item is None for item in folded) else folded  # type: ignore[return-value]
 
 
-def _tokens(value: object) -> tuple[list[int], bool] | None:
-    """Token ids as plain ints, or bigram ``[token, next]`` cells folded to their tokens."""
+def _tokens(value: object) -> tuple[list[int], list[int] | None] | None:
+    """Token ids as plain ints, or bigram ``[token, next]`` cells folded to their
+    tokens; the second item is both words of every bigram (for the engine-hash
+    check), ``None`` for plain ids."""
     if not isinstance(value, (list, tuple)):
         return None
     ids: list[int] = []
+    words: list[int] = []
     pairs = 0
     for cell in value:
         if isinstance(cell, int) and not isinstance(cell, bool):
@@ -163,12 +186,13 @@ def _tokens(value: object) -> tuple[list[int], bool] | None:
             and all(isinstance(t, int) and not isinstance(t, bool) and 0 <= t < 2**32 for t in cell)
         ):
             ids.append(cell[0])
+            words.extend(cell)
             pairs += 1
         else:
             return None
     if pairs and pairs != len(value):
         return None
-    return ids, bool(pairs)
+    return ids, (words if pairs else None)
 
 
 def _extra_key(value: object) -> tuple | None:
@@ -249,6 +273,7 @@ class WireEvent:
     parent_block_hash: int | None = None
     token_ids: list[int] = field(default_factory=list)
     bigrams: bool = False
+    bigram_words: list[int] | None = None
     block_size: int = 0
     lora_id: int | None = None
     lora_name: str | None = None
@@ -296,7 +321,8 @@ def _event_from_fields(kind: str, raw: dict[str, Any]) -> WireEvent:
             block_hashes=hashes,
             parent_block_hash=fold_hash(raw.get("parent_block_hash")),
             token_ids=tokens[0],
-            bigrams=tokens[1],
+            bigrams=tokens[1] is not None,
+            bigram_words=tokens[1],
             block_size=block_size,
             lora_id=_signed(raw.get("lora_id")),
             lora_name=_text(raw.get("lora_name")),
@@ -368,6 +394,9 @@ class Counts:
     forwarded_cleared: int = 0
     duplicate_stores: int = 0
     bigram_stores: int = 0
+    hash_checked: int = 0
+    hash_mismatch: int = 0
+    hash_unverifiable: int = 0
     dropped: dict[str, int] = field(default_factory=dict)
 
 
@@ -414,20 +443,23 @@ class _RankState:
     __slots__ = ("tiers", "groups")
 
     def __init__(self) -> None:
-        # tier -> engine hash -> (lora_name, cache_salt) it was stored under
-        self.tiers: dict[int, dict[int, tuple[str | None, str | None]]] = {}
+        # tier -> engine hash -> ((lora_name, cache_salt), recomputed digest or None)
+        self.tiers: dict[int, dict[int, tuple[tuple[str | None, str | None], bytes | None]]] = {}
         # cache group -> whether it is a main-attention group
         self.groups: dict[int, bool] = {}
 
 
 class Normalizer:
     """Per-stream normalization: the drop rules, the namespace inheritance and
-    the counters, as ``kv_wire::Normalizer`` keeps them."""
+    the counters, as ``kv_wire::Normalizer`` keeps them. ``hash_check`` names
+    the engine hash to recompute per store (one of :data:`HASH_CHECKS`), or
+    ``None`` for no verification; an unknown name is logged and ignored."""
 
-    def __init__(self) -> None:
+    def __init__(self, hash_check: str | None = None) -> None:
         self.ranks: dict[int, _RankState] = {}
         self.counts = Counts()
         self._event_id = 0
+        self.hash_check = _hash_check_name(hash_check)
 
     def _drop(self, reason: str, event_id: int) -> None:
         count = self.counts.dropped.get(reason, 0) + 1
@@ -540,18 +572,20 @@ class Normalizer:
         if (lora_name is None or cache_salt is None) and event.parent_block_hash is not None:
             parent = blocks_state.get(event.parent_block_hash)
             if parent is not None:
-                lora_name = lora_name if lora_name is not None else parent[0]
-                cache_salt = cache_salt if cache_salt is not None else parent[1]
+                lora_name = lora_name if lora_name is not None else parent[0][0]
+                cache_salt = cache_salt if cache_salt is not None else parent[0][1]
         namespace = (lora_name, cache_salt)
         all_seen = True
         for block_hash in event.block_hashes:
             if block_hash not in blocks_state:
                 all_seen = False
-            blocks_state[block_hash] = namespace
+            blocks_state[block_hash] = (namespace, None)
         if all_seen:
             self.counts.duplicate_stores += 1
         if event.bigrams:
             self.counts.bigram_stores += 1
+        if self.hash_check is not None:
+            self._verify_hashes(blocks_state, event, width, lora_name, cache_salt)
 
         cache_level = _CACHE_LEVEL[tier]
         extra_keys = event.extra_keys or []
@@ -614,6 +648,211 @@ class Normalizer:
                 setattr(removed, name, value)
         self.counts.forwarded_removed += 1
         return removed
+
+    def _verify_hashes(self, blocks_state, event: WireEvent, width: int, lora_name, cache_salt):
+        """Rehash the store's blocks the worker's way and count the outcome;
+        what is forwarded never changes. Digests stay on the records so
+        children can chain on them."""
+        check = self.hash_check
+        blocks = len(event.block_hashes)
+        if event.parent_block_hash is not None:
+            record = blocks_state.get(event.parent_block_hash)
+            prior = record[1] if record is not None else None
+            if prior is None:
+                self.counts.hash_unverifiable += blocks
+                return
+        elif check == "sglang" and cache_salt:
+            prior = sglang_salt_seed(cache_salt)
+        else:
+            prior = None  # vllm_block applies NONE_HASH itself
+        if check == "vllm-sha256-cbor" and (
+            lora_name is not None or event.lora_id is not None or event.bigram_words is not None
+        ):
+            self.counts.hash_unverifiable += blocks
+            return
+        extra_keys = event.extra_keys or []
+        for index, block_hash in enumerate(event.block_hashes):
+            tokens = event.token_ids[index * width : (index + 1) * width]
+            if check == "sglang":
+                words = (
+                    event.bigram_words[index * 2 * width : (index + 1) * 2 * width]
+                    if event.bigram_words is not None
+                    else tokens
+                )
+                digest = sglang_page(prior, words)
+                expected = sglang_event_int(digest)
+            else:
+                keys = _vllm_hash_keys(
+                    extra_keys[index] if index < len(extra_keys) else None, index
+                )
+                if keys is _UNVERIFIABLE:
+                    self.counts.hash_unverifiable += blocks - index
+                    return
+                digest = vllm_block(prior, tokens, keys)
+                expected = vllm_event_int(digest)
+            self.counts.hash_checked += 1
+            if expected != block_hash:
+                self.counts.hash_mismatch += 1
+            record = blocks_state.get(block_hash)
+            if record is not None:
+                blocks_state[block_hash] = (record[0], digest)
+            prior = digest
+
+
+# ---------------------------------------------------------------------------
+# Engine-exact hashes (verification only; the index uses SMG content hashes)
+# ---------------------------------------------------------------------------
+
+HASH_CHECK_ENV = "SMG_KV_EVENT_HASH_CHECK"
+HASH_CHECKS = ("sglang", "vllm-sha256-cbor")
+_UNVERIFIABLE = object()
+
+
+def _hash_check_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    name = value.strip().lower().replace("_", "-")
+    if not name:
+        return None
+    if name not in HASH_CHECKS:
+        logger.warning("%s names no known engine hash (%r); check off", HASH_CHECK_ENV, value)
+        return None
+    return name
+
+
+def sglang_salt_seed(cache_salt: str) -> bytes:
+    """The chain seed of a salted SGLang request."""
+    return hashlib.sha256(b"sglang-cache-salt-v1\0" + cache_salt.encode("utf-8")).digest()
+
+
+def sglang_page(prior: bytes | None, words) -> bytes:
+    """One SGLang page: the prior digest (if any), then each word as four
+    little-endian bytes (both words of every bigram under Eagle hashing)."""
+    hasher = hashlib.sha256()
+    if prior is not None:
+        hasher.update(prior)
+    for word in words:
+        hasher.update(int(word).to_bytes(4, "little"))
+    return hasher.digest()
+
+
+def sglang_event_int(digest: bytes) -> int:
+    """The integer SGLang publishes: the first eight digest bytes, big-endian, signed."""
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+def sglang_chain(tokens, page_size: int, prior: bytes | None = None) -> list[tuple[bytes, int]]:
+    """Every full page of ``tokens`` chained from ``prior``: (digest, published int)."""
+    out = []
+    if page_size <= 0:
+        return out
+    for start in range(0, len(tokens) - page_size + 1, page_size):
+        prior = sglang_page(prior, tokens[start : start + page_size])
+        out.append((prior, sglang_event_int(prior)))
+    return out
+
+
+def _cbor_head(out: bytearray, major: int, value: int) -> None:
+    major <<= 5
+    if value < 24:
+        out.append(major | value)
+    elif value <= 0xFF:
+        out += bytes((major | 24, value))
+    elif value <= 0xFFFF:
+        out += bytes((major | 25,)) + value.to_bytes(2, "big")
+    elif value <= 0xFFFF_FFFF:
+        out += bytes((major | 26,)) + value.to_bytes(4, "big")
+    else:
+        out += bytes((major | 27,)) + value.to_bytes(8, "big")
+
+
+def _cbor(out: bytearray, value) -> None:
+    """Canonical CBOR for the shapes vLLM's hash input uses (what ``cbor2.dumps(
+    value, canonical=True)`` emits for them): ints, bytes, text, tuples/lists, None."""
+    if value is None:
+        out.append(0xF6)
+    elif isinstance(value, bool):
+        raise TypeError("booleans are not part of a block hash input")
+    elif isinstance(value, int):
+        if value >= 0:
+            _cbor_head(out, 0, value)
+        else:
+            _cbor_head(out, 1, -1 - value)
+    elif isinstance(value, (bytes, bytearray)):
+        _cbor_head(out, 2, len(value))
+        out += value
+    elif isinstance(value, str):
+        encoded = value.encode("utf-8")
+        _cbor_head(out, 3, len(encoded))
+        out += encoded
+    elif isinstance(value, (list, tuple)):
+        _cbor_head(out, 4, len(value))
+        for item in value:
+            _cbor(out, item)
+    else:
+        raise TypeError(f"unsupported hash input {type(value).__name__}")
+
+
+_VLLM_NONE_HASH_SEED = "vllm-none-hash"
+
+
+def vllm_none_hash() -> bytes:
+    """``NONE_HASH``: sha256 of the CBOR text ``vllm-none-hash`` (PYTHONHASHSEED unset)."""
+    out = bytearray()
+    _cbor(out, _VLLM_NONE_HASH_SEED)
+    return hashlib.sha256(out).digest()
+
+
+def vllm_block(parent: bytes | None, tokens, extra_keys=None) -> bytes:
+    """One vLLM ``sha256_cbor`` block hash: ``sha256(cbor([parent or NONE,
+    [tokens...], extra_keys or None]))`` with the keys as the tagged tuples the
+    engine folds in (``("lora", name, path)``, ``("mm", identifier, offset)``,
+    ``("cache_salt", salt)``, ``("prompt_embeds", digest)``)."""
+    out = bytearray()
+    _cbor(
+        out,
+        (
+            parent if parent is not None else vllm_none_hash(),
+            tuple(int(t) for t in tokens),
+            tuple(extra_keys) if extra_keys else None,
+        ),
+    )
+    return hashlib.sha256(out).digest()
+
+
+def vllm_event_int(digest: bytes) -> int:
+    """The integer vLLM publishes: the low 64 bits, carried as the same bits in an int64."""
+    return fold_hash(digest)
+
+
+def vllm_chain(tokens, block_size: int, parent: bytes | None = None) -> list[tuple[bytes, int]]:
+    """Every full block of ``tokens`` chained from ``parent`` with no extra keys."""
+    out = []
+    if block_size <= 0:
+        return out
+    for start in range(0, len(tokens) - block_size + 1, block_size):
+        parent = vllm_block(parent, tokens[start : start + block_size])
+        out.append((parent, vllm_event_int(parent)))
+    return out
+
+
+def _vllm_hash_keys(keys, index: int):
+    """vLLM's untagged event keys as the tagged keys inside the hash: block 0's
+    text is the cache salt (a LoRA request was excluded before), a pair is a
+    multimodal item, bytes are a prompt-embeddings digest."""
+    if not keys:
+        return None
+    tagged = []
+    for key in keys:
+        if key[0] == "text" and index == 0:
+            tagged.append(("cache_salt", key[1]))
+        elif key[0] == "multimodal":
+            tagged.append(("mm", key[1], key[2]))
+        elif key[0] == "blob":
+            tagged.append(("prompt_embeds", key[1]))
+        else:
+            return _UNVERIFIABLE
+    return tagged
 
 
 # ---------------------------------------------------------------------------
@@ -743,13 +982,16 @@ async def relay(
     replay_timeout: float = 5.0,
     zmq_context: zmq.asyncio.Context | None = None,
     normalizer: Normalizer | None = None,
+    hash_check: str | None = None,
     on_counts: Callable[[Counts], Awaitable[None] | None] | None = None,
 ) -> AsyncIterator[common_pb2.KvEventBatch]:
     """Relay every rank in ``sources`` into one ``KvEventBatch`` stream.
 
     See the module docstring for the contract. ``engine`` is informational
-    (both replay reply framings are accepted); ``on_counts`` is called with the
-    stream's counters when it ends.
+    (both replay reply framings are accepted); ``hash_check`` (default: the
+    ``SMG_KV_EVENT_HASH_CHECK`` environment variable) turns engine-hash
+    verification on; ``on_counts`` is called with the stream's counters when
+    it ends.
     """
     if start_sequence_number:
         await context.abort(
@@ -764,7 +1006,10 @@ async def relay(
         return
 
     ctx = zmq_context or zmq.asyncio.Context.instance()
-    normalizer = normalizer or Normalizer()
+    if normalizer is None:
+        normalizer = Normalizer(
+            hash_check if hash_check is not None else os.environ.get(HASH_CHECK_ENV)
+        )
     streams: dict[Any, _RankStream] = {}
     poller = zmq.asyncio.Poller()
     relay_seq = 0

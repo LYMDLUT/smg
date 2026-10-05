@@ -4,6 +4,12 @@
 //! with the client. The wire format and the normalization each event goes
 //! through live in [`crate::kv_wire`].
 //!
+//! `SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor` turns on the relay's
+//! engine-hash verification ([`crate::engine_hash`]): every store whose
+//! parent is known is rehashed the worker's way and mismatches are counted
+//! in the stream's counters, never dropped. The counters are logged when the
+//! stream closes.
+//!
 //! A publisher restart is visible only as its sequence counter starting over
 //! (the SUB socket reconnects silently). The relay ends the stream with
 //! `DATA_LOSS` when a sequence goes backwards, so the gateway clears what it
@@ -119,7 +125,7 @@ impl Relay {
                     socket,
                     event_id: 0,
                     last_sequence: None,
-                    normalizer: Normalizer::new(),
+                    normalizer: Normalizer::from_env(),
                 }),
                 Err(status) => return Some((Err(status), Self::Ended)),
             },
@@ -147,7 +153,11 @@ struct Live {
 
 impl Drop for Live {
     fn drop(&mut self) {
-        info!(endpoint = %self.endpoint, "SubscribeKvEvents: stream closed");
+        info!(
+            endpoint = %self.endpoint,
+            counts = ?self.normalizer.counts(),
+            "SubscribeKvEvents: stream closed"
+        );
     }
 }
 

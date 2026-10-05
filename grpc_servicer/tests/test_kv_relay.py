@@ -5,6 +5,7 @@ and gRPC (no engine needed)."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -436,3 +437,173 @@ async def test_cancellation_releases_every_subscription(bridge):
     call.cancel()
     for pub in bridge.pubs:
         assert await asyncio.wait_for(pub.recv(), 3) == b"\x00kv"
+
+
+# ---------------------------------------------------------------------------
+# Engine-exact hashes and the opt-in check
+# ---------------------------------------------------------------------------
+
+
+def test_sglang_hashes_reproduce_the_published_vectors():
+    def ints(tokens, page, prior=None):
+        return [i for _, i in kv_relay.sglang_chain(tokens, page, prior)]
+
+    assert ints([1, 2, 3, 4], 4) == [-3488128144981237669]
+    assert ints([10, 20, 30, 40, 50, 60, 70, 80], 2) == [
+        978178666101069530,
+        -895308556211281782,
+        -8033692805846017938,
+        835415944263129316,
+    ]
+    assert kv_relay.sglang_event_int(hashlib.sha256(b"").digest()) == -2039914840885289964
+    seed = kv_relay.sglang_salt_seed("tenant-a")
+    assert seed.hex() == "f5d0f785efe6042a4e4b0297a4d712917e1763c850835e93df58b373fd47fd2c"
+    assert ints([1, 2, 3, 4, 5, 6, 7, 8], 4, seed) == [3718046898735569995, 3308615664605479373]
+    assert (
+        kv_relay.sglang_event_int(kv_relay.sglang_page(None, [1, 2, 2, 3, 3, 4, 4, 5]))
+        == -638950109823820341
+    )
+    assert ints([1, 2, 3], 4) == [], "only full pages"
+
+
+def test_vllm_sha256_cbor_hashes_reproduce_the_reference_run():
+    # hash_block_tokens with sha256_cbor from vLLM at 0c16eee3f1, PYTHONHASHSEED unset.
+    assert (
+        kv_relay.vllm_none_hash().hex()
+        == "9bd96a485ad84efdafb72ee48a1d7a69bcead0f8f0433173941b276b9581eef0"
+    )
+    a = kv_relay.vllm_block(None, [1, 2, 3, 4])
+    assert a.hex() == "58d0879dff3800f65f8c5fd449d73048c0f7699dd238a03b84b146b151d55111"
+    assert kv_relay.vllm_event_int(a) == -8885242862429187823
+    b = kv_relay.vllm_block(a, [5, 6, 7, 8])
+    assert b.hex() == "e1bc29393a2da9fd798f35ff04d215f846aee6df4b803ce3d43b57df56b58fb1"
+    assert [i for _, i in kv_relay.vllm_chain([1, 2, 3, 4, 5, 6, 7, 8], 4)] == [
+        -8885242862429187823,
+        -3153830497298837583,
+    ]
+    lora = ("lora", "adapter", "/adapters/adapter")
+    c = kv_relay.vllm_block(
+        None,
+        [1, 2, 3, 4],
+        [lora, ("mm", "mm-abc", 0), ("cache_salt", "salt-1"), ("prompt_embeds", bytes(range(32)))],
+    )
+    assert c.hex() == "280bce663478b44320e68be593605214c94f7648ac34b4b94274fdcd0f2a8a04"
+    d = kv_relay.vllm_block(c, [5, 6, 7, 8], [lora, ("mm", "mm-abc", -4)])
+    assert d.hex() == "33e7394e25b7be46c7bf0c090da02e903b4e9d9536b1c18eed4d6e57e7a3658a"
+    e = kv_relay.vllm_block(
+        None,
+        [1, 2, 3, 4],
+        [("mm", "mm-abc", 0), ("cache_salt", "salt-1"), ("prompt_embeds", bytes(range(32)))],
+    )
+    assert e.hex() == "0d7b0d8344b79ad5e183b117cacc04aeb415bfdfa968fd28f611bc6971f4abba"
+    f = kv_relay.vllm_block(e, [5, 6, 7, 8], [("mm", "mm-abc", -4)])
+    assert f.hex() == "b81a4631bec909b72bcd0081cc2d7c87bcce5652c48318f9615e4aa3370c1d69"
+    g = kv_relay.vllm_block(f, [9, 10, 11, 12])
+    assert g.hex() == "024cf74ecdb93c6049fe59a66321192aab04701a75ac3e86619395104df937c4"
+
+
+def _checked(normalizer):
+    c = normalizer.counts
+    return c.hash_checked, c.hash_mismatch, c.hash_unverifiable
+
+
+def test_hash_check_verifies_sglang_chains_and_counts_mismatches():
+    chain = kv_relay.sglang_chain([1, 2, 3, 4, 5, 6, 7, 8], 4)
+    first, second = chain[0][1], chain[1][1]
+    normalizer = kv_relay.Normalizer(hash_check="sglang")
+    batch = normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch(
+                [
+                    _store([first], [1, 2, 3, 4]),
+                    _store([second], [5, 6, 7, 8], parent_block_hash=first),
+                    _store([second + 1], [5, 6, 7, 8], parent_block_hash=first),  # tampered
+                    _store([99], [9, 10, 11, 12], parent_block_hash=12345),  # unknown parent
+                ]
+            )
+        ),
+        1,
+    )
+    assert len(batch.events) == 4, "a mismatch never drops"
+    assert _checked(normalizer) == (3, 1, 1)
+
+    seed = kv_relay.sglang_salt_seed("tenant-a")
+    salted = kv_relay.sglang_chain([1, 2, 3, 4, 5, 6, 7, 8], 4, seed)
+    normalizer = kv_relay.Normalizer(hash_check="SGLANG")
+    normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch([_store([salted[0][1], salted[1][1]], list(range(1, 9)), cache_salt="tenant-a")])
+        ),
+        1,
+    )
+    assert _checked(normalizer) == (2, 0, 0)
+
+    normalizer = kv_relay.Normalizer(hash_check="sglang")
+    normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch([_store([-638950109823820341], [[1, 2], [2, 3], [3, 4], [4, 5]])])
+        ),
+        1,
+    )
+    assert _checked(normalizer) == (1, 0, 0)
+
+
+def test_hash_check_verifies_vllm_sha256_cbor_chains():
+    a, b = -8885242862429187823, -3153830497298837583
+    normalizer = kv_relay.Normalizer(hash_check="vllm_sha256_cbor")
+    batch = normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch(
+                [
+                    _store([a, b], list(range(1, 9))),
+                    _store([7], [9, 10, 11, 12], parent_block_hash=b, lora_name="adapter"),
+                    _store(
+                        [8], [9, 10, 11, 12, 13], parent_block_hash=b
+                    ),  # unaligned, dropped first
+                ]
+            )
+        ),
+        1,
+    )
+    assert len(batch.events) == 2
+    assert _checked(normalizer) == (2, 0, 1)
+
+    embeds = bytes(range(32))
+    e = kv_relay.vllm_block(
+        None,
+        [1, 2, 3, 4],
+        [("mm", "mm-abc", 0), ("cache_salt", "salt-1"), ("prompt_embeds", embeds)],
+    )
+    f = kv_relay.vllm_block(e, [5, 6, 7, 8], [("mm", "mm-abc", -4)])
+    g = kv_relay.vllm_block(f, [9, 10, 11, 12])
+    ei, fi, gi = (kv_relay.vllm_event_int(x) for x in (e, f, g))
+    normalizer = kv_relay.Normalizer(hash_check="vllm-sha256-cbor")
+    batch = normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch(
+                [
+                    _store([ei], [1, 2, 3, 4], extra_keys=[[["mm-abc", 0], "salt-1", embeds]]),
+                    _store([fi], [5, 6, 7, 8], parent_block_hash=ei, extra_keys=[[["mm-abc", -4]]]),
+                    _store([gi], [9, 10, 11, 12], parent_block_hash=fi),
+                    _store(
+                        [5], [13, 14, 15, 16], parent_block_hash=gi, extra_keys=[[3]]
+                    ),  # unknown key shape
+                ]
+            )
+        ),
+        1,
+    )
+    assert len(batch.events) == 4
+    assert _checked(normalizer) == (3, 0, 1)
+    assert batch.events[0].stored.cache_salt == "salt-1"
+
+
+def test_hash_check_is_off_unless_asked(caplog):
+    assert kv_relay.Normalizer().hash_check is None
+    assert kv_relay.Normalizer(hash_check="").hash_check is None
+    with caplog.at_level("WARNING"):
+        assert kv_relay.Normalizer(hash_check="xxhash").hash_check is None
+    assert "names no known engine hash" in caplog.text
+    normalizer = kv_relay.Normalizer()
+    normalizer.normalize_batch(kv_relay.decode_batch(_batch([_store([1], [1, 2, 3, 4])])), 1)
+    assert _checked(normalizer) == (0, 0, 0)

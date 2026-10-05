@@ -48,7 +48,9 @@ use serde::{
 use smg_grpc_client::common_proto::{
     self as common, kv_block_extra_key, kv_cache_event, KvCacheLocality, KvCacheTier,
 };
-use tracing::debug;
+use tracing::{debug, warn};
+
+use crate::engine_hash::{self, Digest32, EngineHash, VllmExtraKey};
 
 /// `int.from_bytes(bytes, "big")` kept to 64 bits: the whole value for the
 /// publisher's eight-byte sequence frame, the low 64 bits of a longer hash.
@@ -613,6 +615,14 @@ pub struct Counts {
     pub duplicate_stores: u64,
     /// Forwarded stores whose tokens arrived as speculative-decoding bigrams.
     pub bigram_stores: u64,
+    /// Blocks rehashed the worker's way under the opt-in engine-hash check.
+    pub hash_checked: u64,
+    /// Checked blocks whose published hash differs from the recomputed one.
+    pub hash_mismatch: u64,
+    /// Blocks the check could not rehash: an unknown parent, a LoRA block
+    /// (the adapter path is not in the event), or a key shape it does not
+    /// model.
+    pub hash_unverifiable: u64,
     pub dropped: HashMap<DropReason, u64>,
 }
 
@@ -635,12 +645,21 @@ impl Namespace {
     }
 }
 
+/// What this stream remembers about a stored engine hash.
+#[derive(Clone, Debug, Default)]
+struct BlockRecord {
+    /// The namespace it was stored under, for children that omit theirs.
+    namespace: Option<Namespace>,
+    /// Its recomputed full digest when the hash check ran: what a child
+    /// chains on.
+    digest: Option<Digest32>,
+}
+
 #[derive(Default)]
 struct RankState {
     /// Per tier: the engine hashes this stream has seen stored and not yet
-    /// removed, with the namespace each was stored under (for children that
-    /// omit theirs).
-    tiers: HashMap<i32, HashMap<i64, Option<Namespace>>>,
+    /// removed, with what it remembers about each.
+    tiers: HashMap<i32, HashMap<i64, BlockRecord>>,
     /// KV cache groups seen on stores: whether each is a main-attention group.
     groups: HashMap<u32, bool>,
 }
@@ -650,7 +669,13 @@ struct RankState {
 pub struct Normalizer {
     ranks: HashMap<i32, RankState>,
     counts: Counts,
+    /// The engine hash to recompute per store, when verification is on.
+    hash_check: Option<EngineHash>,
 }
+
+/// The environment variable that turns the engine-hash check on for every
+/// relay in the process: `sglang` or `vllm-sha256-cbor`.
+pub const HASH_CHECK_ENV: &str = "SMG_KV_EVENT_HASH_CHECK";
 
 const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
 
@@ -726,8 +751,37 @@ impl Normalizer {
         Self::default()
     }
 
+    /// A normalizer that also rehashes every verifiable store with `check`
+    /// and counts mismatches; nothing is dropped for it. See
+    /// [`crate::engine_hash`].
+    pub fn with_hash_check(check: EngineHash) -> Self {
+        Self {
+            hash_check: Some(check),
+            ..Self::default()
+        }
+    }
+
+    /// [`Self::new`], or [`Self::with_hash_check`] when [`HASH_CHECK_ENV`]
+    /// names an algorithm; an unknown value is logged and the check stays off.
+    pub fn from_env() -> Self {
+        match std::env::var(HASH_CHECK_ENV) {
+            Ok(value) if !value.trim().is_empty() => match EngineHash::parse(&value) {
+                Some(check) => Self::with_hash_check(check),
+                None => {
+                    warn!(%value, "{HASH_CHECK_ENV} names no known engine hash; check off");
+                    Self::new()
+                }
+            },
+            _ => Self::new(),
+        }
+    }
+
     pub fn counts(&self) -> &Counts {
         &self.counts
+    }
+
+    pub fn hash_check(&self) -> Option<EngineHash> {
+        self.hash_check
     }
 
     fn drop(&mut self, reason: DropReason, event_id: u64) -> DropReason {
@@ -837,13 +891,22 @@ impl Normalizer {
         event_id: u64,
     ) -> Result<kv_cache_event::Data, DropReason> {
         let (tier, locality) = self.admit(&stored.tail, rank, event_id, true)?;
-        let bigrams = matches!(stored.token_ids, WireTokens::Bigrams(_));
-        let token_ids = match stored.token_ids {
-            WireTokens::Ids(ids) => ids,
-            // A bigram page lists (token, next token) per position; its
-            // tokens are the first elements and the page grid is unchanged.
-            WireTokens::Bigrams(pairs) => pairs.into_iter().map(|(token, _)| token).collect(),
+        // A bigram page lists (token, next token) per position; its tokens
+        // are the first elements and the page grid is unchanged. The pairs
+        // stay around for the engine-hash check, which hashes both words.
+        let (token_ids, bigram_words): (Vec<u32>, Option<Vec<u32>>) = match stored.token_ids {
+            WireTokens::Ids(ids) => (ids, None),
+            WireTokens::Bigrams(pairs) => (
+                pairs.iter().map(|&(token, _)| token).collect(),
+                Some(
+                    pairs
+                        .iter()
+                        .flat_map(|&(token, next)| [token, next])
+                        .collect(),
+                ),
+            ),
         };
+        let bigrams = bigram_words.is_some();
         if stored.block_hashes.is_empty() || token_ids.is_empty() {
             return Err(self.drop(DropReason::Placeholder, event_id));
         }
@@ -889,7 +952,7 @@ impl Normalizer {
             if let Some(parent) = stored
                 .parent_block_hash
                 .and_then(|parent| blocks_state.get(&parent.0))
-                .and_then(Clone::clone)
+                .and_then(|record| record.namespace.clone())
             {
                 if namespace.lora_name.is_none() {
                     namespace.lora_name = parent.lora_name;
@@ -902,10 +965,11 @@ impl Normalizer {
         let stored_namespace = (!namespace.is_empty()).then(|| namespace.clone());
         let mut all_seen = true;
         for hash in &stored.block_hashes {
-            if blocks_state
-                .insert(hash.0, stored_namespace.clone())
-                .is_none()
-            {
+            let record = BlockRecord {
+                namespace: stored_namespace.clone(),
+                digest: None,
+            };
+            if blocks_state.insert(hash.0, record).is_none() {
                 all_seen = false;
             }
         }
@@ -914,6 +978,23 @@ impl Normalizer {
         }
         if bigrams {
             self.counts.bigram_stores += 1;
+        }
+        if let Some(check) = self.hash_check {
+            verify_hashes(
+                check,
+                blocks_state,
+                &mut self.counts,
+                HashInput {
+                    hashes: &stored.block_hashes,
+                    parent: stored.parent_block_hash,
+                    tokens: &token_ids,
+                    width,
+                    bigram_words: bigram_words.as_deref(),
+                    extra_keys: stored.extra_keys.as_deref(),
+                    lora: stored.lora_id.is_some() || namespace.lora_name.is_some(),
+                    cache_salt: namespace.cache_salt.as_deref(),
+                },
+            );
         }
 
         let cache_level = cache_level_of(tier);
@@ -995,6 +1076,108 @@ impl Normalizer {
             ownership,
         }))
     }
+}
+
+/// The engine-hash check's view of one admitted store.
+struct HashInput<'a> {
+    hashes: &'a [BlockHash],
+    parent: Option<BlockHash>,
+    tokens: &'a [u32],
+    width: usize,
+    /// Both words of every bigram, when the page came as bigrams.
+    bigram_words: Option<&'a [u32]>,
+    extra_keys: Option<&'a [Option<Vec<ExtraKey>>]>,
+    /// The store belongs to a LoRA request (vLLM folds the adapter path into
+    /// the hash and does not publish it).
+    lora: bool,
+    cache_salt: Option<&'a str>,
+}
+
+/// Rehash a store's blocks the way `check` says the worker did and count the
+/// outcome; what is forwarded never changes. Digests are kept on the records
+/// so children can chain on them.
+fn verify_hashes(
+    check: EngineHash,
+    records: &mut HashMap<i64, BlockRecord>,
+    counts: &mut Counts,
+    input: HashInput<'_>,
+) {
+    let blocks = input.hashes.len() as u64;
+    let mut prior: Option<Digest32> = match input.parent {
+        Some(parent) => match records.get(&parent.0).and_then(|record| record.digest) {
+            Some(digest) => Some(digest),
+            None => {
+                counts.hash_unverifiable += blocks;
+                return;
+            }
+        },
+        None => match check {
+            EngineHash::Sglang => input.cache_salt.map(engine_hash::sglang_salt_seed),
+            // `vllm_block` applies NONE_HASH itself.
+            EngineHash::VllmSha256Cbor => None,
+        },
+    };
+    if check == EngineHash::VllmSha256Cbor && (input.lora || input.bigram_words.is_some()) {
+        counts.hash_unverifiable += blocks;
+        return;
+    }
+    for (index, hash) in input.hashes.iter().enumerate() {
+        let tokens = &input.tokens[index * input.width..(index + 1) * input.width];
+        let digest = match check {
+            EngineHash::Sglang => {
+                let words = match input.bigram_words {
+                    Some(words) => &words[index * 2 * input.width..(index + 1) * 2 * input.width],
+                    None => tokens,
+                };
+                engine_hash::sglang_page(prior.as_ref(), words)
+            }
+            EngineHash::VllmSha256Cbor => {
+                let keys = input
+                    .extra_keys
+                    .and_then(|keys| keys.get(index))
+                    .and_then(Option::as_deref);
+                let Ok(keys) = vllm_keys(keys, index) else {
+                    counts.hash_unverifiable += blocks - index as u64;
+                    return;
+                };
+                engine_hash::vllm_block(prior.as_ref(), tokens, keys.as_deref())
+            }
+        };
+        let expected = match check {
+            EngineHash::Sglang => engine_hash::sglang_event_int(&digest),
+            EngineHash::VllmSha256Cbor => engine_hash::vllm_event_int(&digest),
+        };
+        counts.hash_checked += 1;
+        if expected != hash.0 {
+            counts.hash_mismatch += 1;
+        }
+        if let Some(record) = records.get_mut(&hash.0) {
+            record.digest = Some(digest);
+        }
+        prior = Some(digest);
+    }
+}
+
+/// vLLM's untagged event keys as the tagged keys inside the hash: block 0's
+/// text is the cache salt (a LoRA request was excluded before), a pair is a
+/// multimodal item, bytes are a prompt-embeddings digest. `Err` for a shape
+/// the hash input cannot be rebuilt from.
+fn vllm_keys(keys: Option<&[ExtraKey]>, index: usize) -> Result<Option<Vec<VllmExtraKey>>, ()> {
+    let Some(keys) = keys.filter(|keys| !keys.is_empty()) else {
+        return Ok(None);
+    };
+    keys.iter()
+        .map(|key| match key {
+            ExtraKey::Text(text) if index == 0 => Ok(VllmExtraKey::CacheSalt(text.clone())),
+            ExtraKey::Multimodal { identifier, offset } => Ok(VllmExtraKey::Mm {
+                identifier: identifier.clone(),
+                offset: *offset,
+            }),
+            ExtraKey::Blob(blob) => Ok(VllmExtraKey::PromptEmbeds(blob.clone())),
+            ExtraKey::Text(_) | ExtraKey::Number(_) | ExtraKey::Opaque => Err(()),
+        })
+        .collect::<Result<Vec<_>, ()>>()
+        .map(Some)
 }
 
 #[cfg(test)]
@@ -1523,5 +1706,224 @@ mod tests {
             1
         );
         assert_eq!(normalizer.counts().dropped(DropReason::NonLocalLocality), 1);
+    }
+
+    #[test]
+    fn hash_check_verifies_sglang_chains_and_counts_mismatches() {
+        use crate::engine_hash::{sglang_chain, sglang_salt_seed};
+
+        let chain = sglang_chain(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None);
+        let (first, second) = (chain[0].1, chain[1].1);
+        assert_eq!(first, -3488128144981237669);
+        let mut normalizer = Normalizer::with_hash_check(EngineHash::Sglang);
+        let mut event_id = 0;
+        let batch = normalize(
+            &mut normalizer,
+            one(vec![
+                store(&[first], None, &[1, 2, 3, 4]),
+                store(&[second], Some(first), &[5, 6, 7, 8]),
+                // Tampered: still forwarded, counted.
+                store(&[second + 1], Some(first), &[5, 6, 7, 8]),
+                // A parent this stream never saw: nothing to chain on.
+                store(&[99], Some(12345), &[9, 10, 11, 12]),
+            ]),
+            1,
+            &mut event_id,
+        );
+        assert_eq!(batch.events.len(), 4, "a mismatch never drops");
+        let counts = normalizer.counts();
+        assert_eq!(
+            (
+                counts.hash_checked,
+                counts.hash_mismatch,
+                counts.hash_unverifiable
+            ),
+            (3, 1, 1)
+        );
+
+        // A salted request seeds its chain; a coalesced two-page store
+        // chains page to page.
+        let seed = sglang_salt_seed("tenant-a");
+        let salted = sglang_chain(&[1, 2, 3, 4, 5, 6, 7, 8], 4, Some(&seed));
+        let mut normalizer = Normalizer::with_hash_check(EngineHash::Sglang);
+        normalize(
+            &mut normalizer,
+            one(vec![with(
+                store(&[salted[0].1, salted[1].1], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
+                "cache_salt",
+                json!("tenant-a"),
+            )]),
+            1,
+            &mut 0,
+        );
+        let counts = normalizer.counts();
+        assert_eq!((counts.hash_checked, counts.hash_mismatch), (2, 0));
+
+        // An Eagle bigram page hashes both words of every pair.
+        let mut normalizer = Normalizer::with_hash_check(EngineHash::Sglang);
+        normalize(
+            &mut normalizer,
+            one(vec![with(
+                store(&[-638950109823820341], None, &[]),
+                "token_ids",
+                json!([[1, 2], [2, 3], [3, 4], [4, 5]]),
+            )]),
+            1,
+            &mut 0,
+        );
+        let counts = normalizer.counts();
+        assert_eq!((counts.hash_checked, counts.hash_mismatch), (1, 0));
+    }
+
+    #[test]
+    fn hash_check_verifies_vllm_sha256_cbor_chains() {
+        use crate::engine_hash::{vllm_block, vllm_event_int};
+
+        // Vectors A and B from the reference run.
+        let (a, b) = (-8885242862429187823i64, -3153830497298837583i64);
+        let mut normalizer = Normalizer::with_hash_check(EngineHash::VllmSha256Cbor);
+        let batch = normalize(
+            &mut normalizer,
+            one(vec![
+                store(&[a, b], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
+                // A LoRA block: the adapter path is not in the event.
+                with(
+                    store(&[7], Some(b), &[9, 10, 11, 12]),
+                    "lora_name",
+                    json!("adapter"),
+                ),
+                // Unaligned: dropped before the check runs.
+                store(&[8], Some(b), &[9, 10, 11, 12, 13]),
+            ]),
+            1,
+            &mut 0,
+        );
+        assert_eq!(batch.events.len(), 2);
+        let counts = normalizer.counts();
+        assert_eq!(
+            (
+                counts.hash_checked,
+                counts.hash_mismatch,
+                counts.hash_unverifiable
+            ),
+            (2, 0, 1)
+        );
+
+        // Multimodal, salt and prompt-embeddings keys rebuild the tagged hash
+        // input (vectors E, F, G); the events carry the bytes JSON cannot.
+        let embeds: Vec<u8> = (0..32).collect();
+        let e = vllm_block(
+            None,
+            &[1, 2, 3, 4],
+            Some(&[
+                VllmExtraKey::Mm {
+                    identifier: "mm-abc".into(),
+                    offset: 0,
+                },
+                VllmExtraKey::CacheSalt("salt-1".into()),
+                VllmExtraKey::PromptEmbeds(embeds.clone()),
+            ]),
+        );
+        let f = vllm_block(
+            Some(&e),
+            &[5, 6, 7, 8],
+            Some(&[VllmExtraKey::Mm {
+                identifier: "mm-abc".into(),
+                offset: -4,
+            }]),
+        );
+        let g = vllm_block(Some(&f), &[9, 10, 11, 12], None);
+        let stored = |hashes: Vec<i64>, parent: Option<i64>, tokens: Vec<u32>, keys| {
+            WireEvent::BlockStored(WireStored {
+                block_hashes: hashes.into_iter().map(BlockHash).collect(),
+                parent_block_hash: parent.map(BlockHash),
+                token_ids: WireTokens::Ids(tokens),
+                block_size: 4,
+                lora_id: None,
+                lora_name: None,
+                cache_salt: None,
+                extra_keys: keys,
+                tail: EventTail {
+                    medium: Some("GPU".into()),
+                    group_idx: Some(0),
+                    kv_cache_spec_kind: Some("full_attention".into()),
+                    ..EventTail::default()
+                },
+            })
+        };
+        let mut normalizer = Normalizer::with_hash_check(EngineHash::VllmSha256Cbor);
+        let events = [
+            stored(
+                vec![vllm_event_int(&e)],
+                None,
+                vec![1, 2, 3, 4],
+                Some(vec![Some(vec![
+                    ExtraKey::Multimodal {
+                        identifier: "mm-abc".into(),
+                        offset: 0,
+                    },
+                    ExtraKey::Text("salt-1".into()),
+                    ExtraKey::Blob(embeds),
+                ])]),
+            ),
+            stored(
+                vec![vllm_event_int(&f)],
+                Some(vllm_event_int(&e)),
+                vec![5, 6, 7, 8],
+                Some(vec![Some(vec![ExtraKey::Multimodal {
+                    identifier: "mm-abc".into(),
+                    offset: -4,
+                }])]),
+            ),
+            stored(
+                vec![vllm_event_int(&g)],
+                Some(vllm_event_int(&f)),
+                vec![9, 10, 11, 12],
+                None,
+            ),
+            // A key shape the hash input cannot be rebuilt from.
+            stored(
+                vec![5],
+                Some(vllm_event_int(&g)),
+                vec![13, 14, 15, 16],
+                Some(vec![Some(vec![ExtraKey::Number(3)])]),
+            ),
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            assert!(normalizer
+                .normalize(event, Some(0), index as u64 + 1)
+                .is_ok());
+        }
+        let counts = normalizer.counts();
+        assert_eq!(
+            (
+                counts.hash_checked,
+                counts.hash_mismatch,
+                counts.hash_unverifiable
+            ),
+            (3, 0, 1)
+        );
+        assert_eq!(stored_salt(&normalizer), Some("salt-1".to_string()));
+    }
+
+    fn stored_salt(normalizer: &Normalizer) -> Option<String> {
+        normalizer
+            .ranks
+            .get(&0)
+            .and_then(|rank| rank.tiers.get(&(KvCacheTier::Device as i32)))
+            .and_then(|tier| tier.values().find_map(|record| record.namespace.clone()))
+            .and_then(|namespace| namespace.cache_salt)
+    }
+
+    #[test]
+    fn hash_check_is_off_unless_asked() {
+        assert_eq!(Normalizer::new().hash_check(), None);
+        assert_eq!(
+            Normalizer::with_hash_check(EngineHash::Sglang).hash_check(),
+            Some(EngineHash::Sglang)
+        );
+        // Without the check, a wrong hash is nobody's business here.
+        let (_, normalizer) = normalize_all(vec![one(vec![store(&[1], None, &[1, 2, 3, 4])])]);
+        assert_eq!(normalizer.counts().hash_checked, 0);
     }
 }

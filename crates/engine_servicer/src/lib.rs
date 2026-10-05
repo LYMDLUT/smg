@@ -15,6 +15,7 @@
 //! after [`kv_wire`] normalizes them; that module documents the per-engine
 //! hash folding rule and the one-for-one forwarding of stores and removals.
 
+pub mod engine_hash;
 mod engine_link;
 mod error;
 mod health;
