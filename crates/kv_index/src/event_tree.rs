@@ -146,13 +146,13 @@ impl std::error::Error for WorkerIdExhausted {}
 /// Overlap scores: how many consecutive blocks each worker has cached.
 ///
 /// Keys are internal `u32` worker IDs. Use [`PositionalIndexer::worker_id`] to
-/// map a worker URL to its internal ID for lookups.
+/// map a worker URL to its internal ID for lookups. A worker's total block count
+/// is available separately through [`PositionalIndexer::worker_block_count`]; it
+/// is not collected per lookup, since no routing decision reads it there.
 #[derive(Debug, Default)]
 pub struct OverlapScores {
     /// internal_worker_id → number of matching prefix blocks (depth in indexer)
     pub scores: FxHashMap<u32, u32>,
-    /// internal_worker_id → total blocks cached by this worker
-    pub tree_sizes: FxHashMap<u32, usize>,
 }
 
 /// Compute content hash from token IDs (position-independent): XXH3-64 with
@@ -878,6 +878,11 @@ impl PositionalIndexer {
         self.tree_sizes.reset(worker_id);
     }
 
+    /// Number of blocks the index currently holds for `worker_id` (a lock-free counter read).
+    pub fn worker_block_count(&self, worker_id: u32) -> usize {
+        self.tree_sizes.load(worker_id)
+    }
+
     /// Get total number of blocks across all workers.
     pub fn current_size(&self) -> usize {
         self.tree_sizes.total()
@@ -1237,11 +1242,6 @@ impl PositionalIndexer {
                 internal_scores.insert(w, 1);
             }
             scores.scores = internal_scores;
-            for &int_id in scores.scores.keys() {
-                scores
-                    .tree_sizes
-                    .insert(int_id, self.tree_sizes.load(int_id));
-            }
             return scores;
         }
 
@@ -1268,14 +1268,6 @@ impl PositionalIndexer {
         }
 
         scores.scores = internal_scores;
-
-        // Populate tree_sizes from atomic counters — lock-free array index.
-        for &int_id in scores.scores.keys() {
-            scores
-                .tree_sizes
-                .insert(int_id, self.tree_sizes.load(int_id));
-        }
-
         scores
     }
 }
@@ -1410,7 +1402,7 @@ mod tests {
 
         let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert_eq!(scores.scores.get(&w1), Some(&3));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+        assert_eq!(indexer.worker_block_count(w1), 3);
     }
 
     #[test]
@@ -1472,7 +1464,7 @@ mod tests {
         // After removing block at position 2, w1 should only match 2 blocks
         let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert_eq!(scores.scores.get(&w1), Some(&2));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&2));
+        assert_eq!(indexer.worker_block_count(w1), 2);
     }
 
     #[test]
@@ -1514,9 +1506,8 @@ mod tests {
             .apply_stored(w2, &blocks_w2, None, &mut wb2)
             .unwrap();
 
-        let scores = indexer.find_matches(&hashes(&[10]), false);
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
-        assert_eq!(scores.tree_sizes.get(&w2), Some(&2));
+        assert_eq!(indexer.worker_block_count(w1), 3);
+        assert_eq!(indexer.worker_block_count(w2), 2);
     }
 
     #[test]
@@ -1546,7 +1537,7 @@ mod tests {
 
         let scores = indexer.find_matches(&hashes(&[10, 20, 30, 40]), false);
         assert_eq!(scores.scores.get(&w1), Some(&4));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&4));
+        assert_eq!(indexer.worker_block_count(w1), 4);
     }
 
     #[test]
@@ -1873,8 +1864,8 @@ mod tests {
         let scores = indexer.find_matches(&hashes(&[10, 20, 30]), true);
         // early_exit: score is 1 (matched at position 0), not full depth
         assert_eq!(scores.scores.get(&w1), Some(&1));
-        // tree_sizes still populated
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+        // the worker's block count does not depend on the lookup mode
+        assert_eq!(indexer.worker_block_count(w1), 3);
     }
 
     #[test]
@@ -1927,9 +1918,7 @@ mod tests {
         indexer.apply_removed(w1, &[blocks[3].seq_hash, blocks[4].seq_hash], &mut wb1);
         assert_eq!(indexer.current_size(), 3);
 
-        // Verify tree_sizes in query results
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+        assert_eq!(indexer.worker_block_count(w1), 3);
     }
 
     #[test]
@@ -1941,19 +1930,18 @@ mod tests {
 
         // First store: 3 new blocks
         indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&3));
+        assert_eq!(indexer.worker_block_count(w1), 3);
 
         // Replay the same store event — tree_size must not change
         indexer.apply_stored(w1, &blocks, None, &mut wb1).unwrap();
-        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert_eq!(
-            scores.tree_sizes.get(&w1),
-            Some(&3),
+            indexer.worker_block_count(w1),
+            3,
             "Duplicate store event must not inflate tree_size"
         );
 
         // Overlap scores should also be unchanged
+        let scores = indexer.find_matches(&hashes(&[10, 20, 30]), false);
         assert_eq!(scores.scores.get(&w1), Some(&3));
     }
 
@@ -2073,7 +2061,7 @@ mod tests {
 
         let scores = indexer.find_matches(&hashes(&[10, 20]), false);
         assert_eq!(scores.scores.get(&w1), Some(&2));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&5));
+        assert_eq!(indexer.worker_block_count(w1), 5);
     }
 
     #[test]
@@ -2243,7 +2231,7 @@ mod tests {
         let query_hashes = compute_request_content_hashes(&query_tokens, block_size);
         let scores = indexer.find_matches(&query_hashes, false);
         assert_eq!(scores.scores.get(&w1), Some(&2));
-        assert_eq!(scores.tree_sizes.get(&w1), Some(&2));
+        assert_eq!(indexer.worker_block_count(w1), 2);
     }
 
     #[test]
@@ -2632,8 +2620,8 @@ mod tests {
                 "worker at depth {depth} has wrong score"
             );
             assert_eq!(
-                scores.tree_sizes.get(&wid),
-                Some(&depth),
+                indexer.worker_block_count(wid),
+                depth,
                 "worker at depth {depth} has wrong tree_size"
             );
         }
@@ -2694,11 +2682,7 @@ mod tests {
         let scores = indexer.find_matches(&hashes(&shared), false);
         for &wid in &probe_ids {
             assert_eq!(scores.scores.get(&wid), Some(&3), "worker {wid} score");
-            assert_eq!(
-                scores.tree_sizes.get(&wid),
-                Some(&4),
-                "worker {wid} tree_size"
-            );
+            assert_eq!(indexer.worker_block_count(wid), 4, "worker {wid} tree_size");
         }
 
         // Only worker 2049 has the tail block — the rest drain at depth 3.
