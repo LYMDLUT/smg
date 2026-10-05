@@ -260,9 +260,16 @@ binding wheel from the same tree (`scripts/build-head.sh`, maturin `--compatibil
    ~113 ms, 16x1024 in ~200 ms, 8x4096 in two passes ~335 ms; the HTTP front end admits one request per engine step and
    must not be used to calibrate batching).
 
-## 9. What is running / where things are
+9. HiCache on 2d37b25a (`gpu-harness-hicache-routing-2d37b25a.md`): with the HiCache worker's prefix blocks demoted
+   (`Remove GPU`, host copies kept) and a healthy empty worker added through `POST /workers` before the recheck, the gateway
+   routed all eight recheck requests to the demoted worker with `event_hit` and the engine answered `cached_tokens` 624
+   (load-back visible in its stream). When both workers hold the prefix, the event path prefers the device copy.
+   Servicer parity: one cache_aware and one round-robin replay on the fleet running the 2d37b25a servicer wheel gave
+   goodput 8.5 and 8.3 req/s at the restricted pool, inside the spread of the f4dc134b-servicer runs.
 
-As of the end of round 3: host processes `8b-w0..w3` (kept up for the policy comparison, 40 960 context) (gRPC 20061-20064, logs `logs/host-8b-w*.log`, pids `logs/host-8b-w*.pid`), `http-8b` (:8104), `drill-w0..w3` (gRPC 20071-20074), `sgl-dp2` (:8201), `sgl-hicache` (:8202); the podman containers were killed by pid and podman itself is still wedged. `kill $(cat logs/host-*.pid)` stops the host processes.
+## 10. What is running / where things are
+
+As of the end of round 4: host processes `8b-w0..w3` on the 2d37b25a servicer wheel (kept up for the policy comparison; 40 960 context, **12 000-block pools** for the restricted setting, drop `--num-gpu-blocks-override` for the full pool) (gRPC 20061-20064, logs `logs/host-8b-w*.log`, pids `logs/host-8b-w*.pid`), `http-8b` (:8104), `drill-w0..w3` (gRPC 20071-20074), `sgl-dp2` (:8201), `sgl-hicache` (:8202); the podman containers were killed by pid and podman itself is still wedged. `kill $(cat logs/host-*.pid)` stops the host processes.
 
 - `~/smg-perf/gpu/scripts`: everything above; `fixtures/{vllm,sglang}`: raw captures and summaries;
   `results/`: bench JSONs, T4 table, anomaly note; `logs/`: container and gateway logs; `models/hub`: copies
