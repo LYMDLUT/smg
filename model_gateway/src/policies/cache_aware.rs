@@ -76,8 +76,8 @@ use std::{
 
 use dashmap::DashMap;
 use kv_index::{
-    compute_request_content_hashes, request_prefix_hashes, ContentHash, PositionalIndexer,
-    TenantId, TokenTree, Tree,
+    compute_request_content_hashes, request_prefix_hashes, salt::request_content_hashes_with_seed,
+    ContentHash, PositionalIndexer, TenantId, TokenTree, Tree,
 };
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
@@ -1206,10 +1206,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         //   3. Approximate string tree: Tree prefix matching (HTTP)
         if let Some(tokens) = request_tokens {
             // Event-driven mode re-hashes engine-reported blocks from their
-            // token ids on both sides, so a namespace marker on the request
-            // side alone would break every same-namespace match. It stays
-            // unpartitioned here; the approximate and hash modes below key
-            // under the request's cache namespace.
+            // token ids on both sides, so it keys a namespace through the
+            // hash seed rather than a marker (see cache_namespace.rs); the
+            // approximate and hash modes below key under the marker.
             if let Some(index) = self.event_index_for(model_id) {
                 self.select_worker_event_driven(
                     workers,
@@ -1722,7 +1721,16 @@ impl CacheAwarePolicy {
             waiting_prefill_tokens: waiting_prefill_tokens.as_deref(),
         };
 
-        let content_hashes = compute_request_content_hashes(tokens, block_size);
+        // The engines fold the LoRA name and cache salt into their block
+        // hashes and the monitor recomputes stored blocks under the same
+        // seed, so a request in a namespace is hashed under it and matches
+        // only its own blocks; a plain request keeps the plain hash.
+        let content_hashes = match info.cache_namespace {
+            Some(namespace) => {
+                request_content_hashes_with_seed(tokens, block_size, namespace.event_seed())
+            }
+            None => compute_request_content_hashes(tokens, block_size),
+        };
         let candidates = Self::overlap_candidates_for_hashes(
             workers,
             &content_hashes,
@@ -6226,5 +6234,72 @@ mod tests {
             ..test_config()
         });
         assert_eq!(policy.selection.name(), cost::DEFAULT_POLICY);
+    }
+
+    #[test]
+    fn event_driven_salted_request_matches_only_its_namespace() {
+        use kv_index::salt::{content_hash_with_seed, namespace_seed};
+        use openai_protocol::common::CachePartition;
+
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let w1 = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+        let w2 = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+        // w1 carries more live load, so every miss resolves to w2.
+        for _ in 0..3 {
+            w1.increment_load();
+        }
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
+        policy.init_workers(&workers);
+
+        // Blocks stored on w1 under (lora "adapter", salt "tenant-a"), as the
+        // monitor hashes a salted KvBlocksStored event.
+        let indexer = Arc::new(PositionalIndexer::new(4));
+        let worker_id = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerBlockMap::default();
+        let seed = namespace_seed(Some("adapter"), Some("tenant-a"));
+        let blocks: Vec<StoredBlock> = [[1u32, 2, 3, 4], [5, 6, 7, 8]]
+            .iter()
+            .enumerate()
+            .map(|(i, tokens)| StoredBlock {
+                seq_hash: SequenceHash(i as u64 + 1),
+                content_hash: content_hash_with_seed(tokens, seed),
+            })
+            .collect();
+        indexer
+            .apply_stored(worker_id, &blocks, None, &mut wb)
+            .unwrap();
+        let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+        monitor.indexers.insert("unknown".to_string(), indexer);
+        policy.set_kv_event_monitor(Some(monitor));
+
+        let namespace = |salt: &'static str| {
+            CacheNamespace::derive(&CachePartition {
+                cache_salt: Some(salt),
+                extra_key: None,
+                lora_path: Some("adapter"),
+            })
+        };
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let route = |cache_namespace: Option<CacheNamespace>| {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(&tokens),
+                        cache_namespace,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(route(namespace("tenant-a")), 0, "same namespace hits w1");
+        assert_eq!(route(namespace("tenant-b")), 1, "another salt misses");
+        assert_eq!(route(None), 1, "a plain request misses salted blocks");
     }
 }

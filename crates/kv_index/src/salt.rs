@@ -45,22 +45,31 @@ pub fn namespaced_content_hash(
     content_hash_with_seed(token_ids, namespace_seed(lora_name, cache_salt))
 }
 
-/// [`crate::compute_request_content_hashes`] under a cache namespace: one
-/// hash per full block of `block_size` tokens, the partial tail ignored.
+/// [`crate::compute_request_content_hashes`] under an explicit seed (see
+/// [`namespace_seed`]): one hash per full block of `block_size` tokens, the
+/// partial tail ignored.
+pub fn request_content_hashes_with_seed(
+    token_ids: &[u32],
+    block_size: usize,
+    seed: u64,
+) -> Vec<ContentHash> {
+    if block_size == 0 {
+        return Vec::new();
+    }
+    token_ids
+        .chunks_exact(block_size)
+        .map(|block| content_hash_with_seed(block, seed))
+        .collect()
+}
+
+/// [`crate::compute_request_content_hashes`] under a cache namespace.
 pub fn namespaced_request_content_hashes(
     token_ids: &[u32],
     block_size: usize,
     lora_name: Option<&str>,
     cache_salt: Option<&str>,
 ) -> Vec<ContentHash> {
-    if block_size == 0 {
-        return Vec::new();
-    }
-    let seed = namespace_seed(lora_name, cache_salt);
-    token_ids
-        .chunks_exact(block_size)
-        .map(|block| content_hash_with_seed(block, seed))
-        .collect()
+    request_content_hashes_with_seed(token_ids, block_size, namespace_seed(lora_name, cache_salt))
 }
 
 #[cfg(test)]
