@@ -241,6 +241,14 @@ binding wheel from the same tree (`scripts/build-head.sh`, maturin `--compatibil
 4. HiCache check against the loop-head gateway: `gpu-harness-hicache-routing.md` (recheck routed to the demoted worker with
    `event_hit`, `cached_tokens` 624, after its prefix blocks went `Remove GPU` with the host copy kept).
 
+5. Engine calibration for the mock's `--timing` mode: `gpu-harness-calibration.md` / `.json` (`scripts/calibrate_engine.py`
+   against one warm worker over gRPC: prefill TTFC minus the 1-token overhead at 128..16 384 tokens, steady-window decode
+   ITL at 8..128 concurrent streams with 512/2048-token prompts, capacity 676 128 tokens at the fleet setting; prefill is a
+   plateau-and-steps curve on this stack, so use the points, not only the quadratic).
+6. Restricted pool (`--num-gpu-blocks-override 12000`, 192 k tokens per worker = fleet 7 % of the rows 0-1999 working set):
+   `gpu-harness-replay-8b-kv12k.md`. Both policies lose half their goodput; cache_aware collapses run over run when the
+   gateway is not restarted between runs (index credit outlives the engine's lazy block removals), round robin does not.
+
 ## 8. What is running / where things are
 
 As of the end of round 3: host processes `8b-w0..w3` (kept up for the policy comparison, 40 960 context) (gRPC 20061-20064, logs `logs/host-8b-w*.log`, pids `logs/host-8b-w*.pid`), `http-8b` (:8104), `drill-w0..w3` (gRPC 20071-20074), `sgl-dp2` (:8201), `sgl-hicache` (:8202); the podman containers were killed by pid and podman itself is still wedged. `kill $(cat logs/host-*.pid)` stops the host processes.

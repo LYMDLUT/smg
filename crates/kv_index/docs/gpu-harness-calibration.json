@@ -1,0 +1,383 @@
+{
+ "model": "Qwen/Qwen3-8B (bf16)",
+ "gpu": "NVIDIA GB300 (284 GB)",
+ "engine": "vLLM 0.31.0, FlashInfer backend (TRTLLM prefill auto-detected), torch 2.13.0+cu130, block size 16, chunked prefill max_num_batched_tokens 16384, max_num_seqs 128",
+ "path": "servicer gRPC Generate with token ids (no gateway, no tokenization); times are time-to-first-chunk at the client, 1 ms-class transport",
+ "capacity": {
+  "fleet_setting": {
+   "gpu_memory_utilization": 0.4,
+   "max_model_len": 40960,
+   "kv_tokens": 676128,
+   "kv_blocks": 42258,
+   "available_kv_gib": 92.85,
+   "kv_bytes_per_token": 147453
+  },
+  "reference_0_3": {
+   "gpu_memory_utilization": 0.3,
+   "max_model_len": 40960,
+   "kv_tokens": 474704,
+   "kv_blocks": 29669
+  },
+  "reference_http_0_3_ctx8192": {
+   "gpu_memory_utilization": 0.3,
+   "max_model_len": 8192,
+   "kv_tokens": 460736,
+   "num_gpu_blocks_metric": 28796
+  },
+  "restricted_pool": {
+   "num_gpu_blocks_override": 12000,
+   "kv_tokens": 192000
+  }
+ },
+ "prefill_ms_minus_overhead": {
+  "pass2_median": {
+   "a_ms": 35.24493286701422,
+   "b_ms_per_token": 0.005654632401458599,
+   "c_ms_per_token2": 2.076488660783445e-07,
+   "fixed_overhead_ms": 23.84,
+   "points": [
+    {
+     "tokens": 128,
+     "prefill_ms": 13.49
+    },
+    {
+     "tokens": 256,
+     "prefill_ms": 24.32
+    },
+    {
+     "tokens": 512,
+     "prefill_ms": 57.88
+    },
+    {
+     "tokens": 1024,
+     "prefill_ms": 51.1
+    },
+    {
+     "tokens": 2048,
+     "prefill_ms": 53.14
+    },
+    {
+     "tokens": 3072,
+     "prefill_ms": 52.6
+    },
+    {
+     "tokens": 4096,
+     "prefill_ms": 74.55
+    },
+    {
+     "tokens": 6144,
+     "prefill_ms": 79.26
+    },
+    {
+     "tokens": 8192,
+     "prefill_ms": 81.89
+    },
+    {
+     "tokens": 12288,
+     "prefill_ms": 133.9
+    },
+    {
+     "tokens": 16384,
+     "prefill_ms": 187.2
+    }
+   ]
+  },
+  "pass2_min": {
+   "a_ms": 29.876479990490584,
+   "b_ms_per_token": 0.005584007794947245,
+   "c_ms_per_token2": 2.3503094146026262e-07,
+   "fixed_overhead_ms": 23.27,
+   "points": [
+    {
+     "tokens": 128,
+     "prefill_ms": 11.33
+    },
+    {
+     "tokens": 256,
+     "prefill_ms": 15.47
+    },
+    {
+     "tokens": 512,
+     "prefill_ms": 49.9
+    },
+    {
+     "tokens": 1024,
+     "prefill_ms": 48.54
+    },
+    {
+     "tokens": 2048,
+     "prefill_ms": 51.29
+    },
+    {
+     "tokens": 3072,
+     "prefill_ms": 51.5
+    },
+    {
+     "tokens": 4096,
+     "prefill_ms": 58.11
+    },
+    {
+     "tokens": 6144,
+     "prefill_ms": 74.11
+    },
+    {
+     "tokens": 8192,
+     "prefill_ms": 82.01
+    },
+    {
+     "tokens": 12288,
+     "prefill_ms": 132.05
+    },
+    {
+     "tokens": 16384,
+     "prefill_ms": 187.37
+    }
+   ]
+  },
+  "pass1_median": {
+   "a_ms": 24.15962040332816,
+   "b_ms_per_token": 0.0027897358894699653,
+   "c_ms_per_token2": 4.960043542279998e-07,
+   "fixed_overhead_ms": 17.01,
+   "points": [
+    {
+     "tokens": 128,
+     "prefill_ms": 9.16
+    },
+    {
+     "tokens": 512,
+     "prefill_ms": 35.76
+    },
+    {
+     "tokens": 1024,
+     "prefill_ms": 35.65
+    },
+    {
+     "tokens": 2048,
+     "prefill_ms": 34.86
+    },
+    {
+     "tokens": 4096,
+     "prefill_ms": 36.77
+    },
+    {
+     "tokens": 8192,
+     "prefill_ms": 81.74
+    }
+   ]
+  }
+ },
+ "decode_step_ms": {
+  "pass2_steady_window": {
+   "vs_kv_utilisation": {
+    "d_ms": 3.7645760180460686,
+    "e": 15.24481381454286,
+    "f": -2.866329288410254,
+    "x": "kv_utilisation_computed"
+   },
+   "vs_batch": {
+    "d_ms": 3.8007228682169596,
+    "e": 0.02841577386534169,
+    "f": 1.3012286274695623e-05,
+    "x": "concurrency"
+   },
+   "vs_kv_tokens": {
+    "d_ms": 3.7644891920994956,
+    "e": 2.2555524139086486e-05,
+    "f": -6.3060506274442324e-12,
+    "x": "kv_tokens_in_use"
+   },
+   "points": [
+    {
+     "prompt_tokens": 512,
+     "concurrency": 8,
+     "output_tokens": 128,
+     "mean_itl_ms": 3.925,
+     "itl_ms_p90": 3.931,
+     "kv_tokens_in_use": 5120,
+     "kv_utilisation_computed": 0.0076,
+     "ttfc_ms_p50": 118.8
+    },
+    {
+     "prompt_tokens": 512,
+     "concurrency": 32,
+     "output_tokens": 128,
+     "mean_itl_ms": 4.144,
+     "itl_ms_p90": 4.148,
+     "kv_tokens_in_use": 20480,
+     "kv_utilisation_computed": 0.0303,
+     "ttfc_ms_p50": 206.5
+    },
+    {
+     "prompt_tokens": 512,
+     "concurrency": 64,
+     "output_tokens": 128,
+     "mean_itl_ms": 4.665,
+     "itl_ms_p90": 4.675,
+     "kv_tokens_in_use": 40960,
+     "kv_utilisation_computed": 0.0606,
+     "ttfc_ms_p50": 284.8
+    },
+    {
+     "prompt_tokens": 512,
+     "concurrency": 128,
+     "output_tokens": 128,
+     "mean_itl_ms": 5.732,
+     "itl_ms_p90": 5.744,
+     "kv_tokens_in_use": 81920,
+     "kv_utilisation_computed": 0.1212,
+     "ttfc_ms_p50": 441.3
+    },
+    {
+     "prompt_tokens": 2048,
+     "concurrency": 8,
+     "output_tokens": 128,
+     "mean_itl_ms": 4.134,
+     "itl_ms_p90": 4.139,
+     "kv_tokens_in_use": 17408,
+     "kv_utilisation_computed": 0.0257,
+     "ttfc_ms_p50": 10260.7
+    },
+    {
+     "prompt_tokens": 2048,
+     "concurrency": 32,
+     "output_tokens": 128,
+     "mean_itl_ms": 5.3,
+     "itl_ms_p90": 5.306,
+     "kv_tokens_in_use": 69632,
+     "kv_utilisation_computed": 0.103,
+     "ttfc_ms_p50": 530.2
+    },
+    {
+     "prompt_tokens": 2048,
+     "concurrency": 64,
+     "output_tokens": 128,
+     "mean_itl_ms": 6.682,
+     "itl_ms_p90": 6.689,
+     "kv_tokens_in_use": 139264,
+     "kv_utilisation_computed": 0.206,
+     "ttfc_ms_p50": 805.5
+    },
+    {
+     "prompt_tokens": 2048,
+     "concurrency": 128,
+     "output_tokens": 128,
+     "mean_itl_ms": 9.57,
+     "itl_ms_p90": 9.588,
+     "kv_tokens_in_use": 278528,
+     "kv_utilisation_computed": 0.4119,
+     "ttfc_ms_p50": 1439.4
+    }
+   ]
+  },
+  "pass1_whole_stream": {
+   "vs_kv_utilisation": {
+    "d_ms": -0.21008227666546594,
+    "e": 138.67495728162297,
+    "f": -169.99877818757804,
+    "x": "kv_utilisation_computed"
+   },
+   "vs_batch": {
+    "d_ms": 0.4642461240300174,
+    "e": 0.3045331625875248,
+    "f": -0.0013267191309546257,
+    "x": "concurrency"
+   },
+   "vs_kv_tokens": {
+    "d_ms": -0.20896382833518357,
+    "e": 0.0002050740704348076,
+    "f": -3.7178288663852497e-10,
+    "x": "kv_tokens_in_use"
+   },
+   "points": [
+    {
+     "prompt_tokens": 512,
+     "concurrency": 8,
+     "output_tokens": 64,
+     "mean_itl_ms": 3.792,
+     "itl_ms_p90": 3.798,
+     "kv_tokens_in_use": 4608,
+     "kv_utilisation_computed": 0.0068,
+     "ttfc_ms_p50": 114.5
+    },
+    {
+     "prompt_tokens": 512,
+     "concurrency": 32,
+     "output_tokens": 64,
+     "mean_itl_ms": 4.135,
+     "itl_ms_p90": 4.114,
+     "kv_tokens_in_use": 18432,
+     "kv_utilisation_computed": 0.0273,
+     "ttfc_ms_p50": 206.9
+    },
+    {
+     "prompt_tokens": 512,
+     "concurrency": 64,
+     "output_tokens": 64,
+     "mean_itl_ms": 4.672,
+     "itl_ms_p90": 4.636,
+     "kv_tokens_in_use": 36864,
+     "kv_utilisation_computed": 0.0545,
+     "ttfc_ms_p50": 363.8
+    },
+    {
+     "prompt_tokens": 512,
+     "concurrency": 128,
+     "output_tokens": 64,
+     "mean_itl_ms": 7.961,
+     "itl_ms_p90": 10.618,
+     "kv_tokens_in_use": 73728,
+     "kv_utilisation_computed": 0.109,
+     "ttfc_ms_p50": 17148.2
+    },
+    {
+     "prompt_tokens": 2048,
+     "concurrency": 8,
+     "output_tokens": 64,
+     "mean_itl_ms": 4.212,
+     "itl_ms_p90": 4.086,
+     "kv_tokens_in_use": 16896,
+     "kv_utilisation_computed": 0.025,
+     "ttfc_ms_p50": 204.9
+    },
+    {
+     "prompt_tokens": 2048,
+     "concurrency": 32,
+     "output_tokens": 64,
+     "mean_itl_ms": 8.376,
+     "itl_ms_p90": 11.734,
+     "kv_tokens_in_use": 67584,
+     "kv_utilisation_computed": 0.1,
+     "ttfc_ms_p50": 458.8
+    },
+    {
+     "prompt_tokens": 2048,
+     "concurrency": 64,
+     "output_tokens": 64,
+     "mean_itl_ms": 27.705,
+     "itl_ms_p90": 47.597,
+     "kv_tokens_in_use": 135168,
+     "kv_utilisation_computed": 0.1999,
+     "ttfc_ms_p50": 793.2
+    },
+    {
+     "prompt_tokens": 2048,
+     "concurrency": 128,
+     "output_tokens": 64,
+     "mean_itl_ms": 26.935,
+     "itl_ms_p90": 42.41,
+     "kv_tokens_in_use": 270336,
+     "kv_utilisation_computed": 0.3998,
+     "ttfc_ms_p50": 1432.4
+    }
+   ]
+  }
+ },
+ "notes": [
+  "prefill is not a smooth polynomial on this stack: ~75 ms plateau from 512 to 3072 tokens, a step at 4096, then ~13 ms per 1k tokens beyond 8192 (about 77k tokens/s); the quadratic fit has +-20 ms residuals, use the points for a table-driven model",
+  "fixed overhead (1-token prompt) 17-24 ms between passes; absolute prefill numbers moved by ~25 ms between the two passes taken 15 min apart on the same worker",
+  "decode ITL in the steady window (all streams decoding) grows with KV tokens in use: 3.9 ms at 8x(512+128) to 9.6 ms at 128x(2048+128); whole-stream means are higher because simultaneous starts interleave prefill chunks into early decode steps",
+  "one setting per pass showed a one-off multi-second first-token stall (17 s at 128x512 in pass 1, 10 s at 8x2048 in pass 2) while steady ITL was unaffected; likely kernel autotuning on a new shape",
+  "GetLoads on the Rust vLLM servicer reports only max_total_num_tokens and max_running_requests (num_used_tokens/token_usage unset), so utilisation here is computed as tokens in use / capacity"
+ ]
+}
