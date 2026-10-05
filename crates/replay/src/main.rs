@@ -109,6 +109,9 @@ struct ReqResult {
     itl_mean_ms: Option<f64>,
     itl_p99_ms: Option<f64>,
     tokens_seen: u32,
+    /// Output tokens the engine counted but the stream never showed as text
+    /// (an incomplete UTF-8 piece the detokenizer holds back).
+    invisible_tokens: u32,
 }
 
 const WORDS: &[&str] = &[
@@ -448,10 +451,7 @@ async fn run_one(job: Job) -> ReqResult {
     }
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
-    let mut first_token: Option<Instant> = None;
-    let mut last_token: Option<Instant> = None;
-    let mut itls: Vec<f64> = Vec::new();
-    let mut tokens_seen = 0u32;
+    let mut observer = StreamObserver::default();
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
@@ -476,65 +476,115 @@ async fn run_one(job: Job) -> ReqResult {
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
-                if result.request_id.is_empty() {
-                    if let Some(id) = v.get("id").and_then(Value::as_str) {
-                        result.request_id = id.to_string();
-                    }
-                }
-                if result.worker.is_empty() {
-                    if let Some(fp) = v.get("system_fingerprint").and_then(Value::as_str) {
-                        result.worker = fp.to_string();
-                    }
-                }
-                let has_content = v
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|c| c.first())
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty());
-                if has_content {
-                    let now = Instant::now();
-                    tokens_seen += 1;
-                    match last_token {
-                        None => first_token = Some(now),
-                        Some(prev) => itls.push((now - prev).as_secs_f64() * 1000.0),
-                    }
-                    last_token = Some(now);
-                }
-                if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
-                    result.prompt_tokens = usage
-                        .get("prompt_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32;
-                    result.completion_tokens = usage
-                        .get("completion_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32;
-                    result.cached_tokens = usage
-                        .get("prompt_tokens_details")
-                        .and_then(|d| d.get("cached_tokens"))
-                        .or_else(|| usage.get("cached_tokens"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32;
-                }
+                observer.observe(&v, Instant::now());
             }
         }
     }
     result.latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-    result.ttft_ms = first_token.map(|t| (t - started).as_secs_f64() * 1000.0);
-    result.tokens_seen = tokens_seen;
-    if !itls.is_empty() {
-        let mut sorted = itls.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        result.itl_mean_ms = Some(mean(&itls));
-        result.itl_p99_ms = Some(percentile(&sorted, 0.99));
-    }
-    if result.ttft_ms.is_none() && result.status == "ok" {
-        result.status = "no-tokens".to_string();
-    }
+    observer.finish(started, &mut result);
     result
+}
+
+/// What one streamed response reveals, chunk by chunk.
+#[derive(Default)]
+struct StreamObserver {
+    request_id: String,
+    worker: String,
+    /// The first chunk that carried a token or the finish: a one-token
+    /// answer whose token has no visible text still arrives here.
+    first_signal: Option<Instant>,
+    last_token: Option<Instant>,
+    itls: Vec<f64>,
+    tokens_seen: u32,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_tokens: u32,
+    saw_usage: bool,
+}
+
+impl StreamObserver {
+    fn observe(&mut self, v: &Value, now: Instant) {
+        if self.request_id.is_empty() {
+            if let Some(id) = v.get("id").and_then(Value::as_str) {
+                self.request_id = id.to_string();
+            }
+        }
+        if self.worker.is_empty() {
+            if let Some(fp) = v.get("system_fingerprint").and_then(Value::as_str) {
+                self.worker = fp.to_string();
+            }
+        }
+        let choice = v
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first());
+        let has_content = choice
+            .and_then(|c| c.get("delta"))
+            .and_then(|d| d.get("content"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        let finished = choice
+            .and_then(|c| c.get("finish_reason"))
+            .is_some_and(|f| !f.is_null());
+        if has_content {
+            self.tokens_seen += 1;
+            if let Some(prev) = self.last_token {
+                self.itls.push((now - prev).as_secs_f64() * 1000.0);
+            }
+            self.first_signal.get_or_insert(now);
+            self.last_token = Some(now);
+        } else if finished {
+            self.first_signal.get_or_insert(now);
+        }
+        if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
+            self.saw_usage = true;
+            self.prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            self.completion_tokens = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            self.cached_tokens = usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .or_else(|| usage.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+        }
+    }
+
+    /// Fold the observations into the result. A stream that showed no text
+    /// but finished with a counted output token is a served request whose
+    /// token was invisible; one with no token at all is `no-tokens`.
+    fn finish(self, started: Instant, result: &mut ReqResult) {
+        result.request_id = self.request_id;
+        result.worker = self.worker;
+        result.prompt_tokens = self.prompt_tokens;
+        result.completion_tokens = self.completion_tokens;
+        result.cached_tokens = self.cached_tokens;
+        result.tokens_seen = self.tokens_seen;
+        result.ttft_ms = self
+            .first_signal
+            .map(|t| (t - started).as_secs_f64() * 1000.0);
+        if !self.itls.is_empty() {
+            let mut sorted = self.itls.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            result.itl_mean_ms = Some(mean(&self.itls));
+            result.itl_p99_ms = Some(percentile(&sorted, 0.99));
+        }
+        if result.completion_tokens < self.tokens_seen {
+            // No usage arrived: count what was seen.
+            result.completion_tokens = self.tokens_seen;
+        }
+        if self.tokens_seen == 0 && self.completion_tokens > 0 && result.ttft_ms.is_some() {
+            result.invisible_tokens = self.completion_tokens;
+        }
+        if result.status == "ok" && (result.ttft_ms.is_none() || result.completion_tokens == 0) {
+            result.status = "no-tokens".to_string();
+        }
+    }
 }
 
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
@@ -733,6 +783,7 @@ async fn main() -> Result<()> {
         "scored": scored.len(),
         "ok": ok.len(),
         "errors": scored.len() - ok.len(),
+        "invisible_token_requests": ok.iter().filter(|r| r.invisible_tokens > 0).count(),
         "speedup": args.speedup,
         "wall_s": wall_s,
         "req_per_s": ok.len() as f64 / wall_s,
@@ -756,10 +807,10 @@ async fn main() -> Result<()> {
         args.out.join("summary.json"),
         serde_json::to_string_pretty(&summary)?,
     )?;
-    let mut csv = String::from("row,trace_ts_ms,trace_input_length,sent_at_ms,status,request_id,worker,prompt_tokens,completion_tokens,cached_tokens,oracle_tokens,queued_ms,ttft_ms,latency_ms,itl_mean_ms,itl_p99_ms,tokens_seen\n");
+    let mut csv = String::from("row,trace_ts_ms,trace_input_length,sent_at_ms,status,request_id,worker,prompt_tokens,completion_tokens,cached_tokens,oracle_tokens,queued_ms,ttft_ms,latency_ms,itl_mean_ms,itl_p99_ms,tokens_seen,invisible_tokens\n");
     for r in &results {
         csv.push_str(&format!(
-            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.1},{},{},{}\n",
+            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{}\n",
             r.row,
             r.trace_ts_ms,
             r.trace_input_length,
@@ -776,7 +827,8 @@ async fn main() -> Result<()> {
             r.latency_ms,
             r.itl_mean_ms.map(|v| format!("{v:.2}")).unwrap_or_default(),
             r.itl_p99_ms.map(|v| format!("{v:.2}")).unwrap_or_default(),
-            r.tokens_seen
+            r.tokens_seen,
+            r.invisible_tokens
         ));
     }
     fs::write(args.out.join("requests.csv"), csv)?;
@@ -825,6 +877,83 @@ mod tests {
         assert_eq!(percentile(&v, 1.0), 5.0);
         assert_eq!(mean(&v), 3.0);
         assert!(percentile(&[], 0.5).is_nan());
+    }
+
+    #[test]
+    fn a_finish_only_stream_counts_as_served() {
+        // Captured from the gateway: a one-token answer whose token is an
+        // incomplete UTF-8 piece, so no chunk carries text; the finish chunk
+        // and the usage still arrive.
+        let finish: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"grpc:19600","choices":[{"index":0,"delta":{"reasoning_content":null},"logprobs":null,"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        let usage: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"grpc:19600","choices":[],"usage":{"prompt_tokens":34,"completion_tokens":1,"total_tokens":35,"prompt_tokens_details":{"cached_tokens":16}}}"#,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let mut observer = StreamObserver::default();
+        observer.observe(&finish, started + Duration::from_millis(40));
+        observer.observe(&usage, started + Duration::from_millis(41));
+        let mut result = ReqResult {
+            status: "ok".to_string(),
+            ..Default::default()
+        };
+        observer.finish(started, &mut result);
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.request_id, "chatcmpl-x");
+        assert_eq!(result.worker, "grpc:19600");
+        assert_eq!(result.completion_tokens, 1);
+        assert_eq!(result.cached_tokens, 16);
+        assert_eq!(result.tokens_seen, 0);
+        assert_eq!(result.invisible_tokens, 1);
+        assert!((result.ttft_ms.unwrap() - 40.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_stream_with_no_output_at_all_is_no_tokens() {
+        let usage: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-y","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3}}"#,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let mut observer = StreamObserver::default();
+        observer.observe(&usage, started + Duration::from_millis(5));
+        let mut result = ReqResult {
+            status: "ok".to_string(),
+            ..Default::default()
+        };
+        observer.finish(started, &mut result);
+        assert_eq!(result.status, "no-tokens");
+        assert!(result.ttft_ms.is_none());
+    }
+
+    #[test]
+    fn visible_tokens_give_ttft_and_itl() {
+        let tok = |s: &str| -> Value {
+            serde_json::from_str(&format!(
+                r#"{{"id":"chatcmpl-z","choices":[{{"index":0,"delta":{{"content":"{s}"}},"finish_reason":null}}]}}"#
+            ))
+            .unwrap()
+        };
+        let started = Instant::now();
+        let mut observer = StreamObserver::default();
+        observer.observe(&tok("a"), started + Duration::from_millis(100));
+        observer.observe(&tok("b"), started + Duration::from_millis(120));
+        observer.observe(&tok("c"), started + Duration::from_millis(150));
+        let mut result = ReqResult {
+            status: "ok".to_string(),
+            ..Default::default()
+        };
+        observer.finish(started, &mut result);
+        assert_eq!(result.tokens_seen, 3);
+        assert!((result.ttft_ms.unwrap() - 100.0).abs() < 1.0);
+        assert!((result.itl_mean_ms.unwrap() - 25.0).abs() < 1.0);
+        assert_eq!(result.invisible_tokens, 0);
+        // No usage arrived: the stream is still a served one, counted as seen.
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.completion_tokens, 3);
     }
 
     #[test]
