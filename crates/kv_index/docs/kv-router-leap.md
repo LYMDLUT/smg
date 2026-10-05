@@ -41,7 +41,7 @@ The reference competitor is the top of their CRTC stack as of the day of measure
 
 | Track | Goal | Minimum to publish |
 |---|---|---|
-| T1 Indexer throughput | ≥ 10× the competitor's highest sustained block ops/s | ≥ 3× |
+| T1 Indexer throughput | ≥ 10× the competitor's highest sustained block ops/s, at equal backend cores, with the harness's issuers scaled until the indexer, not the generator, is the bottleneck | ≥ 3× |
 | T2 Indexer latency | lookup p99 ≤ competitor's at every offered load both sustain; lookup p50 ≤ 2 µs | p99 ≤ competitor's at 51.8M offered |
 | T3 Index memory | ≤ 1/5 of the competitor's bytes per indexed block at 128 workers; RSS flat over a 24 h replay | ≤ 1/2 |
 | T4 Routing accuracy | achieved hit rate ≥ 0.98 of the oracle; predicted vs actual cached tokens exact at p99 on the kept-up path; convergence after a gap or reconnect ≤ 500 ms | ≥ 0.95, ≤ 1 block, ≤ 1 s |
@@ -185,4 +185,5 @@ GB300 validation, publication.
 |---|---|---|---|---|
 | 2026-10-05 | T1 | Dynamo `main` CRTC (glibc), this host, 59 backend cores, 8 / 32 event workers, overloaded 750 ms, 3 trials each | 49–58 M / 55–60 M block ops/s; their `nested-map` 34–38 M | baseline for their shipped code on this host |
 | 2026-10-05 | T1 | SMG `throughput_bench` on the same trace and factors, SMG's own replay method, 72 cores, bench profile | peak 146 M (synthetic default workload: 176 M) | not comparable until the SMG backend runs inside their harness |
-| 2026-10-05 | T1 | Dynamo top-of-stack (`rupei/crtc-writer-lookup`) with mimalloc, this host | measuring | the real reference on this host |
+| 2026-10-05 | T1/T2 | Dynamo top-of-stack (`rupei/crtc-writer-lookup` @ 50bdb355f8, features `mooncake,router-bench` = mimalloc), this host, 59 backend cores (5–63), 64 event lanes, 128 query lanes | keeps up at 640 M (500 ms window) and 426 M (750 ms); overloaded 858–900 M (300 and 200 ms windows); lookup service p50 3.4 µs / p99 13–14 µs sustained, p50 2.0–2.6 µs / p99 8.5–10.4 µs when overloaded; 8 lanes: 177 M overloaded | **this is the reference on this host**: 640 M sustained, ~0.9 B capacity, p99 14 µs |
+| 2026-10-05 | method | their harness's own ceiling on this host | at windows ≤ 150 ms the generator cannot issue on schedule (4 issuer cores + 1 query issuer offer at most ~2 B block ops/s) | a 10× result (≥ 6–9 B) is not measurable with their issuer layout; the SMG port of the harness must scale issuers (more issuer cores and lanes) and every result must report block ops/s per backend core and the sustained-latency curve alongside the headline |
