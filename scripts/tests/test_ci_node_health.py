@@ -797,7 +797,22 @@ def test_invalid_snapshot_alerts_and_cannot_close_failed_runner_issue(mod, snaps
     assert not any(op.kind == "close" and op.number == 99 for op in ops)
 
 
-def test_main_includes_failed_runner_snapshot_in_issue_operations(mod, monkeypatch, capsys):
+@pytest.mark.parametrize("github_summary", [False, True])
+def test_main_includes_failed_runner_snapshot_in_issue_operations(
+    mod, monkeypatch, capsys, tmp_path, github_summary
+):
+    if github_summary:
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+    else:
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    ops = []
+    apply_ops = mod.apply_ops
+
+    def capture_ops(gh, planned, dry_run):
+        ops.extend(planned)
+        apply_ops(gh, planned, dry_run)
+
+    monkeypatch.setattr(mod, "apply_ops", capture_ops)
     pools = json.loads(_runner_snapshot())["pools"]
     pools[3] = {
         "name": "k8s-runner-cpu",
@@ -817,4 +832,8 @@ def test_main_includes_failed_runner_snapshot_in_issue_operations(mod, monkeypat
     )
     assert mod.main(["--dry-run", "--repo", "x/y"]) == 0
     text = capsys.readouterr().out
-    assert "runner_failed" in text and "cpu-runner-old" in text
+    assert "runner_failed" in text
+    assert [(op.kind, op.key) for op in ops] == [("create", "runner_failed")]
+    assert "k8s-runner-cpu" in ops[0].title
+    assert "cpu-runner-old" in ops[0].body
+    assert "InvalidPod" in ops[0].body and "connection refused" in ops[0].body
