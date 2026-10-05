@@ -1034,8 +1034,12 @@ struct Args {
     jump_size: usize,
     /// Replay window in milliseconds; deadlines are rescaled linearly from the corpus's
     /// reference window when they differ.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "offered_block_ops_per_sec")]
     benchmark_duration_ms: Option<u64>,
+    /// Offered rate in block ops per second: sets the window from the corpus's block-op total
+    /// (window = total / rate), the knob a sustained-throughput threshold search moves.
+    #[arg(long)]
+    offered_block_ops_per_sec: Option<f64>,
     #[arg(long, default_value = "128")]
     query_lanes: usize,
     /// Event lanes (OS threads applying events), Dynamo's `--num-event-workers`.
@@ -1080,9 +1084,14 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let corpus = load_corpus(&args.corpus)?;
-    let window_ns = args
-        .benchmark_duration_ms
-        .map_or(corpus.reference_window_ns, |ms| ms * 1_000_000);
+    let window_ns = match (args.benchmark_duration_ms, args.offered_block_ops_per_sec) {
+        (Some(ms), _) => ms * 1_000_000,
+        (None, Some(rate)) => {
+            anyhow::ensure!(rate > 0.0, "--offered-block-ops-per-sec must be positive");
+            (corpus.totals.block_ops() as f64 / rate * 1e9).round() as u64
+        }
+        (None, None) => corpus.reference_window_ns,
+    };
     match args.backend {
         BackendKind::Positional => run(
             &args,
