@@ -15,6 +15,7 @@ mod common;
 mod event_tree;
 mod path_hash;
 pub mod reference;
+pub mod run_index;
 pub mod salt;
 pub mod snapshot;
 mod string_tree;
@@ -28,6 +29,7 @@ pub use event_tree::{
 };
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
 pub use reference::{request_prefix_hashes, ReferenceIndexer};
+pub use run_index::{BlockRef, RunBlockMap, RunIndex, RunIndexStats};
 // Re-export under names matching old tree.rs API for easier migration
 pub use string_tree::Tree;
 pub use string_tree::{

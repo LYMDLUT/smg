@@ -3825,6 +3825,7 @@ name = "kv-index"
 version = "1.5.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "bincode",
  "blake3",
  "clap",
