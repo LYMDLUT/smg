@@ -32,6 +32,9 @@ pub enum PartialJsonError {
 
 type Parsed<T> = Result<T, PartialJsonError>;
 
+/// The look-ahead for a boolean word: the length of `false`, the longer of the two.
+const BOOLEAN_LENGTH: usize = "false".len();
+
 /// Parses JSON prefixes. Cheap to construct and stateless between calls.
 #[derive(Clone, Copy, Debug)]
 pub struct PartialJson {
@@ -122,9 +125,9 @@ impl Cursor<'_> {
             Some('{') => self.object(depth + 1),
             Some('[') => self.array(depth + 1),
             Some('"') => self.string(),
-            Some('t') => self.literal("true", Value::Bool(true)),
-            Some('f') => self.literal("false", Value::Bool(false)),
-            Some('n') => self.literal("null", Value::Null),
+            Some('t') => self.literal("true", BOOLEAN_LENGTH, Value::Bool(true)),
+            Some('f') => self.literal("false", BOOLEAN_LENGTH, Value::Bool(false)),
+            Some('n') => self.literal("null", "null".len(), Value::Null),
             Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
             _ if self.allow_incomplete => Ok(Value::Null),
             _ => Err(PartialJsonError::Invalid("unexpected character")),
@@ -338,14 +341,37 @@ impl Cursor<'_> {
         }
     }
 
-    /// `true`, `false` or `null`, or in prefix mode a prefix of it; any other word is an error.
-    fn literal(&mut self, expected: &'static str, value: Value) -> Parsed<Value> {
+    /// `true`, `false` or `null` (`expected`), or in prefix mode a prefix of it.
+    ///
+    /// The word is checked before anything is consumed, looking ahead over letters up to `longest`
+    /// bytes, the length of the longest literal of the kind, so a word that is no literal leaves the
+    /// position where it was and the enclosing value closes before it. Only then is the whole run
+    /// of letters consumed and checked again. This is the original's order and character class
+    /// (Unicode letters, byte-counted), kept so that `[1, truex` consumes four bytes and `[1, trué`
+    /// is `[1]`, as before.
+    fn literal(&mut self, expected: &'static str, longest: usize, value: Value) -> Parsed<Value> {
+        let allow_incomplete = self.allow_incomplete;
+        let accepts =
+            |word: &str| word == expected || (allow_incomplete && expected.starts_with(word));
+        let mut ahead = self.chars.clone();
         let mut word = String::new();
-        while let Some(letter) = self.peek().filter(char::is_ascii_alphabetic) {
+        while let Some(&letter) = ahead.peek() {
+            if letter.is_alphabetic() && word.len() < longest {
+                word.push(letter);
+                ahead.next();
+            } else {
+                break;
+            }
+        }
+        if !accepts(&word) {
+            return Err(PartialJsonError::Invalid("invalid literal"));
+        }
+        word.clear();
+        while let Some(letter) = self.peek().filter(|c| c.is_alphabetic()) {
             word.push(letter);
             self.advance();
         }
-        if word == expected || (self.allow_incomplete && expected.starts_with(&word)) {
+        if accepts(&word) {
             Ok(value)
         } else {
             Err(PartialJsonError::Invalid("invalid literal"))
@@ -501,10 +527,19 @@ mod tests {
         assert_eq!(prefix("f").0, json!(false));
         assert_eq!(prefix("nul").0, json!(null));
         assert_eq!(prefix("[true, fals").0, json!([true, false]));
+    }
+
+    #[test]
+    fn a_word_that_is_no_literal_is_left_unconsumed_and_closes_the_enclosing_value() {
+        // Checked against the original parser: the word is validated before it is consumed, over
+        // Unicode letters counted in bytes, so the array closes before the word in both cases.
+        assert_eq!(prefix("[1, truex"), (json!([1]), 4));
+        assert_eq!(prefix("[1, trué"), (json!([1]), 4));
+        assert_eq!(prefix("[1, truex]"), (json!([1]), 4));
         assert_eq!(
-            prefix("[1, truex]").0,
-            json!([1]),
-            "a word that is no prefix stops the array"
+            PartialJson::default().parse("truex", true),
+            Err(PartialJsonError::Invalid("invalid literal")),
+            "at the top level there is no enclosing value to close"
         );
     }
 
