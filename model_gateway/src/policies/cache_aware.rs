@@ -1498,7 +1498,6 @@ impl CacheAwarePolicy {
             (Some(accounting), Some(hashes)) => accounting.predicted_overlaps(hashes),
             _ => Vec::new(),
         };
-        let block_size = request.block_size.max(1) as f64;
         let gather = |idx: usize, raw: f64, effective: f64| {
             let worker = &workers[idx];
             let url = worker.url();
@@ -1509,12 +1508,16 @@ impl CacheAwarePolicy {
                 None if booked > 0 => Some(booked),
                 None => None,
             };
-            let decode_blocks = load
-                .filter(|load| load.has_absolute_token_data())
-                .map(|load| {
-                    load.total_used_tokens().max(0) as f64 / block_size
-                        + accounting.map_or(0.0, |accounting| accounting.output_blocks(url))
-                });
+            // Dynamo prices decode by the blocks its active sequences hold.
+            // The router has no per-request block ledger yet, so every
+            // request in flight on the worker is taken to hold this request's
+            // blocks, plus any output blocks the accounting layer credited.
+            // The backend's KV usage is not that signal: it counts reusable
+            // cached blocks too and lags by a poll interval.
+            let decode_blocks = Some(
+                worker.load() as f64 * request.request_blocks as f64
+                    + accounting.map_or(0.0, |accounting| accounting.output_blocks(url)),
+            );
             let predicted_blocks = predicted
                 .iter()
                 .find(|(predicted_url, _)| &**predicted_url == url)
@@ -1766,15 +1769,24 @@ impl CacheAwarePolicy {
             avg_load,
             info,
         )?;
+        // `overlap_blocks` is the chosen worker's undecayed overlap, so a
+        // per-decision join against the engine's `cached_tokens` compares
+        // blocks and not only the branch.
+        let overlap_blocks = candidates
+            .iter()
+            .find(|candidate| candidate.idx == idx)
+            .map_or(0, |candidate| candidate.raw_score as u64);
         debug!(
             worker = workers[idx].url(),
             branch = if !had_overlap {
                 "event_miss"
-            } else if candidates.iter().any(|candidate| candidate.idx == idx) {
+            } else if overlap_blocks > 0 {
                 "event_hit"
             } else {
                 "event_spill"
             },
+            overlap_blocks,
+            request_blocks = content_hashes.len(),
             policy = self.selection.name(),
             model_id,
             "Event-driven routing"

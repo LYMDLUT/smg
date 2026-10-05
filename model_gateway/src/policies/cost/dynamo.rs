@@ -10,9 +10,10 @@
 //! ```
 //!
 //! Departures from the source, all forced by what SMG's host can supply today:
-//! - `decode_blocks` is the backend's reported KV usage in blocks when the load snapshot has
-//!   absolute token counts; otherwise `active_requests × request_blocks`. Dynamo tracks per-request
-//!   active blocks itself.
+//! - `decode_blocks` is the host's estimate of the blocks held by the worker's in-flight requests
+//!   (each taken to hold this request's blocks, plus credited output blocks); Dynamo tracks every
+//!   active sequence's blocks itself. The backend's KV usage is deliberately not used: it counts
+//!   reusable cached blocks and lags by a poll interval, which routes by cache fill, not load.
 //! - no shared-cache credit term (SMG indexes no shared pool yet).
 //! - ties at temperature zero go to the smallest worker URL unless `tie_break: uniform`; Dynamo
 //!   draws uniformly in production and deterministically only in replay.

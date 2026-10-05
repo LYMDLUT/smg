@@ -45,7 +45,8 @@ pub struct CandidateInputs<'a> {
     /// Tokens the backend reports as waiting to be prefilled (uncached), plus anything the router
     /// has booked optimistically since the last report.
     pub active_prefill_tokens: Option<u64>,
-    /// KV blocks the backend reports in use, when it reports absolute token counts.
+    /// KV blocks the requests in flight on this worker are estimated to hold (the host takes
+    /// each to hold this request's blocks, plus any credited output blocks), when known.
     pub decode_blocks: Option<f64>,
     /// KV cache utilisation in `[0, 1]`, when reported.
     pub kv_usage: Option<f64>,

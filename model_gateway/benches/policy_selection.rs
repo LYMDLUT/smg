@@ -88,7 +88,9 @@ fn gather<'a>(fleet: &'a Fleet, all_workers: bool) -> Vec<CandidateInputs<'a>> {
                 effective_score: f64::from(overlap),
                 active_requests: (running_reqs + waiting_reqs) as usize,
                 active_prefill_tokens: Some(waiting_tokens),
-                decode_blocks: Some(used_tokens as f64 / BLOCK_SIZE as f64),
+                decode_blocks: Some(
+                    (running_reqs + waiting_reqs) as f64 * (PROMPT_TOKENS / BLOCK_SIZE) as f64,
+                ),
                 kv_usage: Some(used_tokens as f64 / 400_000.0),
                 queue_depth: Some(waiting_reqs),
                 running_requests: Some(running_reqs),
