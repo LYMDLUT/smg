@@ -147,12 +147,13 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
         let tok = create_tokenizer(dir_str)
             .unwrap_or_else(|e| panic!("{slug}: the tokenizer at {dir_str} should load: {e}"));
         let fixtures = read_fixtures(&render_dir).unwrap_or_else(|e| panic!("{slug}: {e}"));
-        let recorded_by = fixtures
+        let transformers = fixtures
             .first()
-            .map(|f| f.reference.provenance.to_string())
-            .unwrap_or_default();
+            .and_then(|f| f.reference.provenance.get("transformers"))
+            .and_then(Value::as_str)
+            .unwrap_or("an unrecorded version");
         println!(
-            "{slug}: {} at {} from {dir_str}; {} cases recorded with {recorded_by}",
+            "{slug}: {} at {} from {dir_str}; {} cases recorded with transformers {transformers}",
             manifest.model,
             manifest.revision,
             fixtures.len()
@@ -284,7 +285,7 @@ fn render(tok: &dyn TokenizerTrait, request: &Value) -> Result<Rendered, String>
             .to_vec(),
         PromptEncoding::Deferred(_) => {
             return Err(
-                "the renderer deferred its encode; this test replays flat renderers only"
+                "the renderer deferred its encode; this test replays only renderers that return text to encode"
                     .to_string(),
             );
         }
