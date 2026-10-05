@@ -25,6 +25,12 @@ adapter builds no per-event or per-lookup `Vec`.
 Overheads the adapters charge to SMG (not present for the Dynamo backends): one `Vec<StoredBlock>`
 per stored event, one `Vec<SequenceHash>` per removal, one `Vec<ContentHash>` per lookup, and the
 translation of SMG's interned worker ids back to `WorkerWithDpRank` in each score.
+
+The patch also adds `end_rss_bytes` to the replay's result JSON: the process's `VmRSS` once every
+lane has drained, which is the corpus plus the backend's index. Read a backend's resident bytes
+as its figure minus the `null-indexer` run's at the same settings; peak RSS from `time` is taken
+during corpus generation and says nothing about the index.
+
 `smg-run` takes `--max-workers` (default 256): the run index keeps one coverage bit per worker
 slot per run, so the slot count is fixed up front (at most 1024); slots are reused after a worker
 is removed.
