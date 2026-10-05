@@ -118,11 +118,16 @@ struct Lane<'a> {
     map: RunBlockMap,
     rng: Rng,
     log: Vec<Logged>,
+    steps: u32,
 }
 
 impl Lane<'_> {
     fn record(&mut self, event: Event) {
         let seq = self.clock.fetch_add(1, Ordering::Relaxed);
+        self.record_at(seq, event);
+    }
+
+    fn record_at(&mut self, seq: u64, event: Event) {
         self.log.push(Logged {
             seq,
             worker: self.worker,
@@ -179,6 +184,13 @@ impl Lane<'_> {
 
     fn step(&mut self) {
         let chain = self.pool[self.rng.below(self.pool.len())].clone();
+        // Worker replacement is part of every run, not a rare roll: each lane swaps its worker
+        // every 97 steps (so lanes do it at different times) besides the random 1%.
+        self.steps += 1;
+        if self.steps.is_multiple_of(97) {
+            self.replace_worker();
+            return;
+        }
         match self.rng.below(1000) {
             0..=549 => {
                 let len = if self.rng.below(2) == 0 {
@@ -189,25 +201,31 @@ impl Lane<'_> {
                 self.store(&chain[..len]);
             }
             550..=899 => self.remove_some(&chain),
-            900..=994 => {
+            900..=984 => {
                 // Walk a chain in two turns: a prefix now, the rest right after (decode extension).
                 let cut = self.rng.range(1, chain.len());
                 self.store(&chain[..cut]);
                 self.store(&chain);
             }
-            995..=998 => {
+            985..=989 => {
                 self.index.apply_cleared(self.worker, &mut self.map);
                 self.record(Event::Cleared);
             }
-            _ => {
-                let map = std::mem::take(&mut self.map);
-                self.index.remove_worker(self.worker, map);
-                self.record(Event::WorkerRemoved);
-                self.name_counter += 1;
-                let name = format!("lane-{}-{}", self.lane, self.name_counter);
-                self.worker = self.index.intern_worker(&name).expect("worker slot");
-            }
+            _ => self.replace_worker(),
         }
+    }
+
+    /// Remove this lane's worker and intern a fresh one (its slot may come back reused).
+    fn replace_worker(&mut self) {
+        let map = std::mem::take(&mut self.map);
+        // Sequenced before the removal: another lane may intern the freed slot and store under
+        // the same id before this lane gets to record, and the replay must see the removal first.
+        let seq = self.clock.fetch_add(1, Ordering::Relaxed);
+        self.index.remove_worker(self.worker, map);
+        self.record_at(seq, Event::WorkerRemoved);
+        self.name_counter += 1;
+        let name = format!("lane-{}-{}", self.lane, self.name_counter);
+        self.worker = self.index.intern_worker(&name).expect("worker slot");
     }
 }
 
@@ -252,6 +270,7 @@ fn concurrent_lanes_and_readers_end_in_the_reference_state() {
                     map: RunBlockMap::default(),
                     rng: Rng::new(seed),
                     log: Vec::new(),
+                    steps: 0,
                 };
                 for _ in 0..steps {
                     state.step();
