@@ -379,5 +379,160 @@
   "decode ITL in the steady window (all streams decoding) grows with KV tokens in use: 3.9 ms at 8x(512+128) to 9.6 ms at 128x(2048+128); whole-stream means are higher because simultaneous starts interleave prefill chunks into early decode steps",
   "one setting per pass showed a one-off multi-second first-token stall (17 s at 128x512 in pass 1, 10 s at 8x2048 in pass 2) while steady ITL was unaffected; likely kernel autotuning on a new shape",
   "GetLoads on the Rust vLLM servicer reports only max_total_num_tokens and max_running_requests (num_used_tokens/token_usage unset), so utilisation here is computed as tokens in use / capacity"
- ]
+ ],
+ "batched_prefill_grpc_path": {
+  "points": [
+   {
+    "concurrency": 4,
+    "prompt_tokens": 1024,
+    "total_tokens": 4096,
+    "expected_passes_at_16384": 1,
+    "ttft_first_median_ms": 76.6,
+    "ttft_last_median_ms": 78.3,
+    "pass_time_estimate_ms": 78.3
+   },
+   {
+    "concurrency": 8,
+    "prompt_tokens": 1024,
+    "total_tokens": 8192,
+    "expected_passes_at_16384": 1,
+    "ttft_first_median_ms": 85.7,
+    "ttft_last_median_ms": 114.0,
+    "pass_time_estimate_ms": 114.0
+   },
+   {
+    "concurrency": 8,
+    "prompt_tokens": 4096,
+    "total_tokens": 32768,
+    "expected_passes_at_16384": 2,
+    "ttft_first_median_ms": 103.4,
+    "ttft_last_median_ms": 335.5,
+    "pass_time_estimate_ms": 167.8
+   },
+   {
+    "concurrency": 16,
+    "prompt_tokens": 1024,
+    "total_tokens": 16384,
+    "expected_passes_at_16384": 1,
+    "ttft_first_median_ms": 100.7,
+    "ttft_last_median_ms": 203.9,
+    "pass_time_estimate_ms": 203.9
+   }
+  ],
+  "note": "fleet worker over the Rust servicer gRPC (token ids in): N concurrent fresh prompts are admitted together; 4x1024 (4096 tokens) finish prefill in one pass of ~78 ms, 8x1024 ~113 ms, 16x1024 (= the 16384 budget) ~200 ms, 8x4096 (32768 tokens, two passes) ~335 ms; pass time ~35 ms + ~0.0095 ms per token in the pass"
+ },
+ "batched_prefill_http_reference": {
+  "points": [
+   {
+    "concurrency": 4,
+    "prompt_tokens": 1024,
+    "repeat": 0,
+    "ttft_first_ms": 378.7,
+    "ttft_last_ms": 428.3,
+    "engine_steps": 4.0,
+    "prompt_tokens_counted": 4096.0
+   },
+   {
+    "concurrency": 4,
+    "prompt_tokens": 1024,
+    "repeat": 1,
+    "ttft_first_ms": 627.4,
+    "ttft_last_ms": 653.9,
+    "engine_steps": 4.0,
+    "prompt_tokens_counted": 4096.0
+   },
+   {
+    "concurrency": 4,
+    "prompt_tokens": 1024,
+    "repeat": 2,
+    "ttft_first_ms": 982.4,
+    "ttft_last_ms": 985.0,
+    "engine_steps": 4.0,
+    "prompt_tokens_counted": 4096.0
+   },
+   {
+    "concurrency": 8,
+    "prompt_tokens": 1024,
+    "repeat": 0,
+    "ttft_first_ms": 1446.8,
+    "ttft_last_ms": 1594.1,
+    "engine_steps": 8.0,
+    "prompt_tokens_counted": 8192.0
+   },
+   {
+    "concurrency": 8,
+    "prompt_tokens": 1024,
+    "repeat": 1,
+    "ttft_first_ms": 498.8,
+    "ttft_last_ms": 1445.2,
+    "engine_steps": 8.0,
+    "prompt_tokens_counted": 8192.0
+   },
+   {
+    "concurrency": 8,
+    "prompt_tokens": 1024,
+    "repeat": 2,
+    "ttft_first_ms": 781.3,
+    "ttft_last_ms": 1089.3,
+    "engine_steps": 8.0,
+    "prompt_tokens_counted": 8192.0
+   },
+   {
+    "concurrency": 16,
+    "prompt_tokens": 1024,
+    "repeat": 0,
+    "ttft_first_ms": 984.0,
+    "ttft_last_ms": 2327.5,
+    "engine_steps": 14.0,
+    "prompt_tokens_counted": 16384.0
+   },
+   {
+    "concurrency": 16,
+    "prompt_tokens": 1024,
+    "repeat": 1,
+    "ttft_first_ms": 890.2,
+    "ttft_last_ms": 3211.5,
+    "engine_steps": 16.0,
+    "prompt_tokens_counted": 16384.0
+   },
+   {
+    "concurrency": 16,
+    "prompt_tokens": 1024,
+    "repeat": 2,
+    "ttft_first_ms": 212.8,
+    "ttft_last_ms": 1360.1,
+    "engine_steps": 16.0,
+    "prompt_tokens_counted": 16384.0
+   },
+   {
+    "concurrency": 8,
+    "prompt_tokens": 4096,
+    "repeat": 0,
+    "ttft_first_ms": 658.9,
+    "ttft_last_ms": 783.8,
+    "engine_steps": 7.0,
+    "prompt_tokens_counted": 32768.0
+   },
+   {
+    "concurrency": 8,
+    "prompt_tokens": 4096,
+    "repeat": 1,
+    "ttft_first_ms": 712.8,
+    "ttft_last_ms": 1422.1,
+    "engine_steps": 8.0,
+    "prompt_tokens_counted": 32768.0
+   },
+   {
+    "concurrency": 8,
+    "prompt_tokens": 4096,
+    "repeat": 2,
+    "ttft_first_ms": 295.9,
+    "ttft_last_ms": 1023.9,
+    "engine_steps": 8.0,
+    "prompt_tokens_counted": 32768.0
+   }
+  ],
+  "note": "the plain vLLM HTTP server admitted the same bursts one request per engine step (engine_steps == N, TTFT 0.4-3.2 s): its asyncio front end, not the scheduler, serialises arrivals; do not calibrate batching from the HTTP path"
+ },
+ "scheduler_settings_file": "scheduler-settings.json"
 }

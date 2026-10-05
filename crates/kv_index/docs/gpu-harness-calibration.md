@@ -20,3 +20,15 @@ against worker `8b-w0` (gRPC 20061) warm, token-id prompts of fresh random ids (
 
 Reproduce: `venv/bin/python scripts/calibrate_engine.py --target 127.0.0.1:20061 --kv-tokens 676128 --out out.json`
 (needs `grpcio`, `numpy`, `smg-grpc-proto` in the venv; worker from `scripts/run-vllm-grpc-host.sh`).
+
+## Added on the orchestrator's request: scheduler settings and batched prefill
+
+- `scheduler-settings.json`: effective settings of the fleet workers and the HTTP reference (CLI values, vLLM 0.31 log
+  lines, and the installed SchedulerConfig defaults, because 0.31 does not dump the scheduler config at startup):
+  `max_num_seqs 128`, `max_num_batched_tokens 16384`, chunked prefill on, `long_prefill_token_threshold 0` (default,
+  no derivation beyond the cap in 0.31), `max_model_len 40960`, block 16, `num_gpu_blocks` 42 258 / 29 669 / 12 000.
+- `prefill-batch-sweep.json` and `calibration.json["batched_prefill_grpc_path"]`: 4/8/16 concurrent 1024-token and
+  8 concurrent 4096-token fresh prompts, 3 repeats, first and last first-token time of the batch. Over the gRPC servicer
+  the batch is admitted together: one ~78 ms pass for 4096 tokens, ~113 ms for 8192, ~200 ms for 16384, two passes
+  (~335 ms) for 32768. The HTTP reference admitted one request per engine step (`engine_steps == N` from
+  `vllm:iteration_tokens_total_count`), so its batch TTFTs (0.4-3.2 s) describe the HTTP front end, not the scheduler.

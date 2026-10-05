@@ -1,0 +1,305 @@
+{
+ "configs": [
+  {
+   "concurrency": 4,
+   "prompt_tokens": 1024,
+   "total_tokens": 4096
+  },
+  {
+   "concurrency": 8,
+   "prompt_tokens": 1024,
+   "total_tokens": 8192
+  },
+  {
+   "concurrency": 16,
+   "prompt_tokens": 1024,
+   "total_tokens": 16384
+  },
+  {
+   "concurrency": 8,
+   "prompt_tokens": 4096,
+   "total_tokens": 32768
+  }
+ ],
+ "http": [
+  {
+   "ttft_first_ms": 378.7,
+   "ttft_last_ms": 428.3,
+   "ttft_mean_ms": 403.4,
+   "batch_wall_ms": 430.4,
+   "streams": 4,
+   "concurrency": 4,
+   "prompt_tokens": 1024,
+   "repeat": 0,
+   "engine_steps": 4.0,
+   "prompt_tokens_counted": 4096.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 627.4,
+   "ttft_last_ms": 653.9,
+   "ttft_mean_ms": 635.0,
+   "batch_wall_ms": 658.2,
+   "streams": 4,
+   "concurrency": 4,
+   "prompt_tokens": 1024,
+   "repeat": 1,
+   "engine_steps": 4.0,
+   "prompt_tokens_counted": 4096.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 982.4,
+   "ttft_last_ms": 985.0,
+   "ttft_mean_ms": 983.4,
+   "batch_wall_ms": 987.1,
+   "streams": 4,
+   "concurrency": 4,
+   "prompt_tokens": 1024,
+   "repeat": 2,
+   "engine_steps": 4.0,
+   "prompt_tokens_counted": 4096.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 1446.8,
+   "ttft_last_ms": 1594.1,
+   "ttft_mean_ms": 1529.6,
+   "batch_wall_ms": 1609.6,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 1024,
+   "repeat": 0,
+   "engine_steps": 8.0,
+   "prompt_tokens_counted": 8192.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 498.8,
+   "ttft_last_ms": 1445.2,
+   "ttft_mean_ms": 1190.7,
+   "batch_wall_ms": 1452.8,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 1024,
+   "repeat": 1,
+   "engine_steps": 8.0,
+   "prompt_tokens_counted": 8192.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 781.3,
+   "ttft_last_ms": 1089.3,
+   "ttft_mean_ms": 1033.1,
+   "batch_wall_ms": 1097.5,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 1024,
+   "repeat": 2,
+   "engine_steps": 8.0,
+   "prompt_tokens_counted": 8192.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 984.0,
+   "ttft_last_ms": 2327.5,
+   "ttft_mean_ms": 1781.7,
+   "batch_wall_ms": 2344.5,
+   "streams": 16,
+   "concurrency": 16,
+   "prompt_tokens": 1024,
+   "repeat": 0,
+   "engine_steps": 14.0,
+   "prompt_tokens_counted": 16384.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 890.2,
+   "ttft_last_ms": 3211.5,
+   "ttft_mean_ms": 2366.4,
+   "batch_wall_ms": 3229.2,
+   "streams": 16,
+   "concurrency": 16,
+   "prompt_tokens": 1024,
+   "repeat": 1,
+   "engine_steps": 16.0,
+   "prompt_tokens_counted": 16384.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 212.8,
+   "ttft_last_ms": 1360.1,
+   "ttft_mean_ms": 942.4,
+   "batch_wall_ms": 1377.5,
+   "streams": 16,
+   "concurrency": 16,
+   "prompt_tokens": 1024,
+   "repeat": 2,
+   "engine_steps": 16.0,
+   "prompt_tokens_counted": 16384.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 658.9,
+   "ttft_last_ms": 783.8,
+   "ttft_mean_ms": 706.4,
+   "batch_wall_ms": 798.1,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 4096,
+   "repeat": 0,
+   "engine_steps": 7.0,
+   "prompt_tokens_counted": 32768.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 712.8,
+   "ttft_last_ms": 1422.1,
+   "ttft_mean_ms": 1193.2,
+   "batch_wall_ms": 1434.4,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 4096,
+   "repeat": 1,
+   "engine_steps": 8.0,
+   "prompt_tokens_counted": 32768.0,
+   "preemptions": 0.0
+  },
+  {
+   "ttft_first_ms": 295.9,
+   "ttft_last_ms": 1023.9,
+   "ttft_mean_ms": 847.5,
+   "batch_wall_ms": 1036.0,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 4096,
+   "repeat": 2,
+   "engine_steps": 8.0,
+   "prompt_tokens_counted": 32768.0,
+   "preemptions": 0.0
+  }
+ ],
+ "grpc": [
+  {
+   "ttft_first_ms": 76.4,
+   "ttft_last_ms": 78.2,
+   "ttft_mean_ms": 77.4,
+   "batch_wall_ms": 79.6,
+   "streams": 4,
+   "concurrency": 4,
+   "prompt_tokens": 1024,
+   "repeat": 0
+  },
+  {
+   "ttft_first_ms": 76.6,
+   "ttft_last_ms": 78.3,
+   "ttft_mean_ms": 77.5,
+   "batch_wall_ms": 79.7,
+   "streams": 4,
+   "concurrency": 4,
+   "prompt_tokens": 1024,
+   "repeat": 1
+  },
+  {
+   "ttft_first_ms": 77.8,
+   "ttft_last_ms": 79.6,
+   "ttft_mean_ms": 78.7,
+   "batch_wall_ms": 80.8,
+   "streams": 4,
+   "concurrency": 4,
+   "prompt_tokens": 1024,
+   "repeat": 2
+  },
+  {
+   "ttft_first_ms": 83.5,
+   "ttft_last_ms": 112.9,
+   "ttft_mean_ms": 107.6,
+   "batch_wall_ms": 114.8,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 1024,
+   "repeat": 0
+  },
+  {
+   "ttft_first_ms": 85.7,
+   "ttft_last_ms": 114.0,
+   "ttft_mean_ms": 109.0,
+   "batch_wall_ms": 116.2,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 1024,
+   "repeat": 1
+  },
+  {
+   "ttft_first_ms": 96.3,
+   "ttft_last_ms": 119.7,
+   "ttft_mean_ms": 115.2,
+   "batch_wall_ms": 121.8,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 1024,
+   "repeat": 2
+  },
+  {
+   "ttft_first_ms": 110.7,
+   "ttft_last_ms": 208.9,
+   "ttft_mean_ms": 197.9,
+   "batch_wall_ms": 210.4,
+   "streams": 16,
+   "concurrency": 16,
+   "prompt_tokens": 1024,
+   "repeat": 0
+  },
+  {
+   "ttft_first_ms": 100.7,
+   "ttft_last_ms": 203.9,
+   "ttft_mean_ms": 193.5,
+   "batch_wall_ms": 205.9,
+   "streams": 16,
+   "concurrency": 16,
+   "prompt_tokens": 1024,
+   "repeat": 1
+  },
+  {
+   "ttft_first_ms": 93.3,
+   "ttft_last_ms": 197.9,
+   "ttft_mean_ms": 187.2,
+   "batch_wall_ms": 200.0,
+   "streams": 16,
+   "concurrency": 16,
+   "prompt_tokens": 1024,
+   "repeat": 2
+  },
+  {
+   "ttft_first_ms": 107.8,
+   "ttft_last_ms": 338.3,
+   "ttft_mean_ms": 268.4,
+   "batch_wall_ms": 346.6,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 4096,
+   "repeat": 0
+  },
+  {
+   "ttft_first_ms": 103.4,
+   "ttft_last_ms": 335.5,
+   "ttft_mean_ms": 246.3,
+   "batch_wall_ms": 343.9,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 4096,
+   "repeat": 1
+  },
+  {
+   "ttft_first_ms": 101.8,
+   "ttft_last_ms": 332.5,
+   "ttft_mean_ms": 260.1,
+   "batch_wall_ms": 342.7,
+   "streams": 8,
+   "concurrency": 8,
+   "prompt_tokens": 4096,
+   "repeat": 2
+  }
+ ],
+ "max_num_batched_tokens": 16384
+}

@@ -1,0 +1,53 @@
+{
+ "source": "launcher CLI values + vLLM 0.31.0 startup log lines + SchedulerConfig dataclass defaults of the installed vLLM 0.31.0 (its startup log does not dump the scheduler config)",
+ "scheduler_config_defaults_vllm_0_31": {
+  "max_num_seqs": "annotation=NoneType required=False default=128 metadata=[Ge(ge=1)]",
+  "max_num_batched_tokens": "annotation=NoneType required=False default=2048 metadata=[Ge(ge=1)]",
+  "max_model_len": "<not a field>",
+  "enable_chunked_prefill": true,
+  "long_prefill_token_threshold": "annotation=NoneType required=False default=0 metadata=[Ge(ge=0)]",
+  "max_num_partial_prefills": "<not a field>",
+  "max_long_partial_prefills": "<not a field>",
+  "policy": "fcfs",
+  "async_scheduling": null,
+  "scheduler_cls": null,
+  "disable_chunked_mm_input": false,
+  "cuda_graph_sizes": "<not a field>"
+ },
+ "long_prefill_token_threshold_rule_from_source": [
+  "if self.long_prefill_token_threshold > max_model_len:"
+ ],
+ "fleet_worker": {
+  "max_model_len": 40960,
+  "max_num_seqs": 128,
+  "max_num_batched_tokens": 16384,
+  "enable_chunked_prefill": true,
+  "block_size": 16,
+  "gpu_memory_utilization": "0.4 (0.3 on GPU 3)",
+  "num_gpu_blocks": {
+   "full_pool_0.4": 42258,
+   "full_pool_0.3": 29669,
+   "restricted_override": 12000
+  },
+  "kv_tokens": {
+   "full_pool_0.4": 676128,
+   "full_pool_0.3": 474704,
+   "restricted": 192000
+  },
+  "prefix_caching": "on, sha256_cbor",
+  "attention_backend": "FLASHINFER, TRTLLM prefill attention auto-detected",
+  "cuda_graphs": "PIECEWISE 35 sizes, FULL 19 (+2)",
+  "long_prefill_token_threshold": "default 0 -> derived per the rule above (0.04 * max_model_len = 1638 tokens if that rule applies)",
+  "max_num_partial_prefills / max_long_partial_prefills": "defaults (see scheduler_config_defaults)"
+ },
+ "http_reference": {
+  "max_model_len": 8192,
+  "max_num_seqs": 64,
+  "max_num_batched_tokens": 16384,
+  "enable_chunked_prefill": true,
+  "block_size": 16,
+  "gpu_memory_utilization": 0.3,
+  "num_gpu_blocks": 28796,
+  "kv_tokens": 460736
+ }
+}
