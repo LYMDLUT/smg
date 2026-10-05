@@ -579,6 +579,7 @@ mod prepared_json_tests {
             ZmqBuilders {
                 vllm: VllmEngineClient::build_generate_request_from_chat,
                 tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_chat,
+                sglang: SglangSchedulerClient::build_generate_request_from_chat_parts,
             },
         )
         .unwrap();
