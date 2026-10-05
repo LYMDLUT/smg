@@ -1,6 +1,7 @@
 //! `sglang.grpc.scheduler.SglangScheduler` over the shared state: each RPC
 //! delegates to its handler module. What the Python servicer does not serve
-//! either (LoRA loading, the KV-event relay) answers UNIMPLEMENTED here.
+//! either (LoRA loading) answers UNIMPLEMENTED here; the scheduler's KV-event
+//! publisher is relayed as for the other engines.
 
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{admin, embed, generate, info, State};
-use crate::{tokenizer_bundle, BoxStream};
+use crate::{kv_events, tokenizer_bundle, BoxStream};
 
 /// What neither servicer serves: the msgpack wire has no adapter-loading
 /// message, and the Python servicer does not implement these RPCs either.
@@ -141,12 +142,17 @@ impl SglangScheduler for SglangService {
 
     async fn subscribe_kv_events(
         &self,
-        _request: Request<common::SubscribeKvEventsRequest>,
+        request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented(
-            "SubscribeKvEvents is not available through the Rust SGLang servicer yet: the \
-             scheduler's KV-event publisher is not relayed on this path",
-        ))
+        let model = &self.state.model;
+        if model.kv_events_endpoint.is_empty() {
+            return Err(Status::unimplemented(kv_events::SGLANG_DISABLED_MESSAGE));
+        }
+        Ok(Response::new(kv_events::subscribe(
+            &model.kv_events_endpoint,
+            model.kv_events_topic.clone(),
+            request.into_inner(),
+        )))
     }
 
     async fn load_lo_ra_adapter(

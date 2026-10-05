@@ -32,6 +32,10 @@ use crate::{
 pub(crate) const VLLM_DISABLED_MESSAGE: &str = "KV cache events not enabled. Start vLLM with \
      --kv-events-config '{\"enable_kv_cache_events\": true, \"publisher\": \"zmq\"}'";
 
+/// The Python SGLang servicer's refusal when SGLang runs without a ZMQ publisher.
+pub(crate) const SGLANG_DISABLED_MESSAGE: &str = "KV cache events not enabled. Start SGLang \
+     with --kv-events-config '{\"publisher\": \"zmq\"}'";
+
 /// The Python TokenSpeed servicer's refusal without a publisher.
 pub(crate) const TOKENSPEED_DISABLED_MESSAGE: &str = "KV cache events not enabled. Start \
      TokenSpeed with --kv-events-config '{\"enable_kv_cache_events\": true, \"publisher\": \

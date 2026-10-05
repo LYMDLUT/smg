@@ -83,6 +83,12 @@ pub struct SglangModelInfo {
     /// The data-parallel size the launcher configured; the handshake's figure
     /// wins once the engines are up.
     pub data_parallel_size: i32,
+    /// SGLang's `--kv-events-config` ZMQ publisher endpoint as configured
+    /// (`tcp://*:5557` style, rank 0's port), or empty when events are off;
+    /// `SubscribeKvEvents` relays it through [`crate::kv_wire`]'s rules.
+    pub kv_events_endpoint: String,
+    /// The publisher's topic prefix (empty by default).
+    pub kv_events_topic: String,
 }
 
 /// How to bind, where the engines dial in, and what to advertise.

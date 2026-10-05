@@ -10,6 +10,10 @@
 //! — it launches the headless engine and drives the server through the PyO3
 //! binding — which is why the server runs on its own thread and reports back
 //! through plain flags instead of a Python-visible runtime.
+//!
+//! The engines' ZMQ KV-cache event publishers are relayed by [`kv_events`]
+//! after [`kv_wire`] normalizes them; that module documents the per-engine
+//! hash folding rule and the one-for-one forwarding of stores and removals.
 
 mod engine_link;
 mod error;

@@ -952,6 +952,8 @@ impl PySglangGrpcServer {
         sglang_version = String::new(),
         max_running_requests = 0,
         data_parallel_size = 1,
+        kv_events_endpoint = String::new(),
+        kv_events_topic = String::new(),
         engine_startup_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -985,6 +987,8 @@ impl PySglangGrpcServer {
         sglang_version: String,
         max_running_requests: i32,
         data_parallel_size: i32,
+        kv_events_endpoint: String,
+        kv_events_topic: String,
         engine_startup_timeout_secs: Option<f64>,
     ) -> PyResult<Self> {
         let model = SglangModelInfo {
@@ -1011,6 +1015,8 @@ impl PySglangGrpcServer {
             sglang_version,
             max_running_requests,
             data_parallel_size,
+            kv_events_endpoint,
+            kv_events_topic,
         };
         let config = SglangServicerConfig {
             bind_address,

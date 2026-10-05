@@ -918,6 +918,70 @@ async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// With a publisher configured, `SubscribeKvEvents` relays it: the call
+/// resolves before any event, batches arrive under the publisher's sequence
+/// numbers, and dropping the stream closes the subscription.
+#[tokio::test]
+async fn subscribe_kv_events_relays_a_configured_publisher() {
+    use zeromq::{prelude::*, PubSocket, SocketEvent};
+
+    use crate::kv_events::golden;
+
+    let port = pick_unused_port().expect("a free publisher port");
+    let mut publisher = PubSocket::new();
+    let mut monitor = publisher.monitor();
+    publisher
+        .bind(&format!("tcp://127.0.0.1:{port}"))
+        .await
+        .expect("publisher binds");
+    let mut model = model_info();
+    // A bind wildcard, as SGLang's config spells it; the relay resolves it.
+    model.kv_events_endpoint = format!("tcp://*:{port}");
+    model.kv_events_topic = "kv".to_string();
+    let mut h = harness(model).await;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.client
+            .subscribe_kv_events(common::SubscribeKvEventsRequest::default()),
+    )
+    .await
+    .expect("the call resolves before any event is published")
+    .expect("subscribe")
+    .into_inner();
+
+    // The subscription reaches the publisher a moment after the connect;
+    // probe with sequence 0 until a batch comes through.
+    let batch1 = golden::bytes(golden::BATCH1);
+    let mut first = None;
+    for _ in 0..200 {
+        publisher
+            .send(golden::frame(b"kv", 0, &batch1))
+            .await
+            .expect("publish");
+        if let Ok(item) = tokio::time::timeout(Duration::from_millis(50), stream.message()).await {
+            first = Some(item.expect("stream open").expect("a batch"));
+            break;
+        }
+    }
+    let first = first.expect("the subscription went live");
+    assert_eq!(first.sequence_number, 0);
+    assert_eq!(first.events.len(), 4);
+
+    drop(stream);
+    let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = monitor.next().await {
+            if matches!(event, SocketEvent::Disconnected(_)) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("the publisher notices the dropped stream in time");
+    assert!(disconnected);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// What neither servicer serves is reported, not emulated.
 #[tokio::test]
 async fn unserved_rpcs_report_the_gap() {
