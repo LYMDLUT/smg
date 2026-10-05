@@ -308,8 +308,8 @@ pub(crate) fn moriio_write_target_error(
 /// Check the prefill engine's MoRI-IO handoff before the decode leg goes
 /// out, or before a concurrent decode leg's response is forwarded. A MoRI-IO
 /// decode engine without it computes over KV that never arrives (READ) or
-/// waits for a push that never comes (WRITE), so a missing or foreign
-/// handoff must fail the request instead.
+/// waits for a push that never comes (WRITE), so a missing, foreign or
+/// malformed handoff must fail the request instead.
 pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> Result<(), String> {
     let params: Value = serde_json::from_str(handoff.get())
         .map_err(|e| format!("unparsable kv_transfer_params: {e}"))?;
@@ -336,7 +336,77 @@ pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> 
             return Err(format!("handoff is missing {key}"));
         }
     }
+    // The decode engine's connector parses these in its scheduler step, where
+    // a value of the wrong shape raises instead of failing one request.
+    let malformed = |key: &str| format!("handoff {key} is malformed: {}", params[key]);
+    if !params["remote_engine_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty())
+    {
+        return Err(malformed("remote_engine_id"));
+    }
+    if !is_block_id_list(&params["remote_block_ids"]) {
+        return Err(malformed("remote_block_ids"));
+    }
+    if !params["remote_host"]
+        .as_str()
+        .is_some_and(|host| !host.is_empty() && !host.contains(char::is_whitespace))
+    {
+        return Err(malformed("remote_host"));
+    }
+    for key in ["remote_handshake_port", "remote_notify_port"] {
+        if handoff_port(&params[key]).is_none() {
+            return Err(malformed(key));
+        }
+    }
+    for key in [
+        "remote_dp_size",
+        "remote_dp_size_local",
+        "remote_dp_rank",
+        "tp_size",
+        "remote_tp_size",
+    ] {
+        if params
+            .get(key)
+            .is_some_and(|value| !value.is_null() && handoff_count(value).is_none())
+        {
+            return Err(malformed(key));
+        }
+    }
     Ok(())
+}
+
+/// A rank or parallel size in a handoff, as a number or a decimal string.
+fn handoff_count(value: &Value) -> Option<u64> {
+    match value {
+        Value::String(count) => count.trim().parse().ok(),
+        Value::Number(count) => count.as_u64(),
+        _ => None,
+    }
+}
+
+/// Block ids as a MoRI-IO producer reports them: one list per KV cache group,
+/// or a single flat list.
+fn is_block_id_list(value: &Value) -> bool {
+    let block_ids = |items: &[Value]| items.iter().all(|id| id.as_u64().is_some());
+    match value.as_array() {
+        Some(items) if items.iter().all(Value::is_array) => items
+            .iter()
+            .all(|group| group.as_array().is_some_and(|ids| block_ids(ids))),
+        Some(items) => block_ids(items),
+        None => false,
+    }
+}
+
+/// A side-channel port in a handoff: the engine reports its configured port
+/// as a string or a number.
+fn handoff_port(value: &Value) -> Option<u16> {
+    let port = match value {
+        Value::String(port) => port.trim().parse::<u16>().ok(),
+        Value::Number(port) => port.as_u64().and_then(|port| u16::try_from(port).ok()),
+        _ => None,
+    };
+    port.filter(|port| *port != 0)
 }
 
 /// Why a valid handoff from `prefill` does not match the side channel a
@@ -348,11 +418,7 @@ pub(crate) fn moriio_side_channel_error(
     prefill: &MoriIoEndpoint,
 ) -> Option<String> {
     let params: Value = serde_json::from_str(handoff.get()).ok()?;
-    let port = |key: &str| match params.get(key) {
-        Some(Value::String(port)) => port.trim().parse::<u16>().ok(),
-        Some(Value::Number(port)) => port.as_u64().and_then(|port| u16::try_from(port).ok()),
-        _ => None,
-    };
+    let port = |key: &str| params.get(key).and_then(handoff_port);
     let reported = (port("remote_handshake_port"), port("remote_notify_port"));
     if reported == (Some(prefill.handshake_port), Some(prefill.notify_port)) {
         return None;
@@ -796,6 +862,70 @@ mod tests {
             .unwrap()
             .remove("remote_notify_port");
         assert!(validate_moriio_handoff(&raw(&no_port), "tx-abc").is_err());
+    }
+
+    #[test]
+    fn moriio_handoff_fields_must_have_the_shape_the_decode_engine_parses() {
+        let valid = serde_json::json!({
+            "do_remote_prefill": true, "do_remote_decode": false,
+            "remote_block_ids": [[484, 485]], "remote_engine_id": "10.24.112.125:6301",
+            "remote_host": "10.24.112.125", "remote_handshake_port": "6301",
+            "remote_notify_port": "61005", "transfer_id": "tx-abc",
+        });
+        let check = |key: &str, value: &Value| {
+            let mut handoff = valid.clone();
+            handoff[key] = value.clone();
+            validate_moriio_handoff(
+                &RawValue::from_string(handoff.to_string()).unwrap(),
+                "tx-abc",
+            )
+        };
+        for (key, value) in [
+            ("remote_engine_id", serde_json::json!(42)),
+            ("remote_engine_id", serde_json::json!("")),
+            (
+                "remote_engine_id",
+                serde_json::json!(["10.24.112.125:6301"]),
+            ),
+            ("remote_block_ids", serde_json::json!("484,485")),
+            ("remote_block_ids", serde_json::json!({"0": [484]})),
+            ("remote_block_ids", serde_json::json!([["484"]])),
+            ("remote_block_ids", serde_json::json!([[-1]])),
+            ("remote_block_ids", serde_json::json!([[1.5]])),
+            ("remote_block_ids", serde_json::json!([484, [485]])),
+            ("remote_host", serde_json::json!("")),
+            ("remote_host", serde_json::json!(42)),
+            ("remote_host", serde_json::json!("10.24.112.125 ")),
+            ("remote_handshake_port", serde_json::json!("abc")),
+            ("remote_handshake_port", serde_json::json!(0)),
+            ("remote_notify_port", serde_json::json!(70000)),
+            ("remote_notify_port", serde_json::json!(true)),
+            ("remote_dp_size", serde_json::json!("abc")),
+            ("remote_dp_size_local", serde_json::json!(-1)),
+            ("remote_dp_rank", serde_json::json!([0])),
+            ("tp_size", serde_json::json!("two")),
+            ("remote_tp_size", serde_json::json!(1.5)),
+        ] {
+            assert!(check(key, &value).is_err(), "{key}={value} must be refused");
+        }
+        // Also valid: a flat or empty block list, numeric ports, and any host
+        // the decode engine may dial. The host is not compared with the
+        // labels: it can be a name, or an address on another interface.
+        for (key, value) in [
+            ("remote_block_ids", serde_json::json!([484, 485])),
+            ("remote_block_ids", serde_json::json!([])),
+            ("remote_block_ids", serde_json::json!([[484], []])),
+            ("remote_handshake_port", serde_json::json!(6301)),
+            ("remote_host", serde_json::json!("prefill-0.pd.svc")),
+            ("remote_host", serde_json::json!("10.101.31.101")),
+            ("remote_dp_size", serde_json::json!(1)),
+            ("remote_dp_size_local", serde_json::json!(0)),
+            ("remote_dp_rank", serde_json::json!("0")),
+            ("tp_size", serde_json::json!(8)),
+            ("remote_tp_size", Value::Null),
+        ] {
+            assert_eq!(check(key, &value), Ok(()), "{key}={value} must be accepted");
+        }
     }
 
     #[test]

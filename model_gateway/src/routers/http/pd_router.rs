@@ -3844,6 +3844,11 @@ mod tests {
         Missing,
         /// The minted handoff, naming a notify port the prefill is not labeled with.
         OtherNotifyPort,
+        /// The minted handoff with its block ids as a string.
+        MalformedBlockIds,
+        /// The minted handoff naming another address of the prefill engine
+        /// than its label, with the labeled ports.
+        OtherHost,
     }
 
     fn stub_handoff(transfer_id: &Value) -> Value {
@@ -3881,6 +3886,17 @@ mod tests {
                     StubHandoff::OtherNotifyPort => {
                         let mut params = stub_handoff(&minted);
                         params["remote_notify_port"] = json!("61006");
+                        json!({"kv_transfer_params": params})
+                    }
+                    StubHandoff::MalformedBlockIds => {
+                        let mut params = stub_handoff(&minted);
+                        params["remote_block_ids"] = json!("7,8");
+                        json!({"kv_transfer_params": params})
+                    }
+                    StubHandoff::OtherHost => {
+                        let mut params = stub_handoff(&minted);
+                        params["remote_host"] = json!("10.9.9.9");
+                        params["remote_engine_id"] = json!("10.9.9.9:6301");
                         json!({"kv_transfer_params": params})
                     }
                 };
@@ -4092,12 +4108,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vllm_pd_moriio_takes_a_handoff_host_other_than_the_label() {
+        for decode_labels in [&[][..], &[CONCURRENT_WRITE][..]] {
+            let (prefill_url, _) = spawn_moriio_prefill_stub(StubHandoff::OtherHost).await;
+            let (decode_url, decode_seen) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+            let router = create_test_pd_router();
+            register_moriio_pair_with(
+                &router,
+                (prefill_url, Some("write")),
+                (decode_url, "write"),
+                decode_labels,
+            );
+
+            let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+            assert_eq!(response.status(), StatusCode::OK, "{decode_labels:?}");
+            let decode = taken(&decode_seen);
+            let host = decode[0].1.pointer("/kv_transfer_params/remote_host");
+            // Sequentially the decode dials the address the prefill engine
+            // reports; a concurrent decode leg was already told the label.
+            let expected = if decode_labels.is_empty() {
+                "10.9.9.9"
+            } else {
+                "10.0.0.1"
+            };
+            assert_eq!(host, Some(&json!(expected)), "{decode_labels:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn vllm_pd_moriio_without_a_usable_handoff_never_reaches_decode() {
         for (mode, handoff) in [
             ("read", StubHandoff::Missing),
             ("read", StubHandoff::Foreign),
+            ("read", StubHandoff::MalformedBlockIds),
             ("write", StubHandoff::Missing),
             ("write", StubHandoff::Foreign),
+            ("write", StubHandoff::MalformedBlockIds),
         ] {
             let (prefill_url, prefill_seen) = spawn_moriio_prefill_stub(handoff).await;
             let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
