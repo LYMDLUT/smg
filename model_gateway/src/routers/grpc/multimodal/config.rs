@@ -15,6 +15,7 @@ use llm_multimodal::{
     VisionProcessorRegistry,
 };
 use openai_protocol::worker::MmProcessingMode;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, warn};
 
 use super::{
@@ -50,6 +51,49 @@ pub struct MultimodalConfigRegistry {
     failed_loads: DashMap<String, (Instant, Arc<str>)>,
     /// How long a failed load is held before it is tried again.
     failure_ttl: Duration,
+    /// One load at a time per tokenizer: a burst of requests arriving before
+    /// the first load finishes queues on this lock and then reuses that
+    /// load's result, success or recorded failure, instead of each probing
+    /// the directory or asking HuggingFace. Entries are dropped by the last
+    /// holder (see `LoadSlot`).
+    loading: DashMap<String, Arc<Mutex<()>>>,
+}
+
+/// A caller's hold on the per-tokenizer load lock. On drop, the lock entry
+/// is removed from the map when nobody else holds it: a waiter still holding
+/// the `Arc` keeps the entry, so every concurrent caller serializes on the
+/// same lock, and a later burst creates a fresh one.
+struct LoadSlot<'a> {
+    locks: &'a DashMap<String, Arc<Mutex<()>>>,
+    key: &'a str,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl<'a> LoadSlot<'a> {
+    async fn acquire(locks: &'a DashMap<String, Arc<Mutex<()>>>, key: &'a str) -> Self {
+        let lock = locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let guard = lock.lock_owned().await;
+        Self {
+            locks,
+            key,
+            guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for LoadSlot<'_> {
+    fn drop(&mut self) {
+        // Release our hold (and its reference) first; then the map's own
+        // reference is the only one left exactly when no other caller is
+        // queued on this lock. `remove_if` runs under the shard lock, so a
+        // newcomer's `entry()` either joins the entry or runs after the removal.
+        drop(self.guard.take());
+        self.locks
+            .remove_if(self.key, |_, lock| Arc::strong_count(lock) == 1);
+    }
 }
 
 /// How long `get_or_load` reports a failed load instead of retrying it: long
@@ -67,6 +111,7 @@ impl MultimodalConfigRegistry {
             configs: DashMap::new(),
             failed_loads: DashMap::new(),
             failure_ttl,
+            loading: DashMap::new(),
         }
     }
 
@@ -92,7 +137,8 @@ impl MultimodalConfigRegistry {
     /// `tokenizer_id`, and return it.
     ///
     /// A load that fails is not retried for [`LOAD_FAILURE_TTL`]; until then
-    /// this returns an error carrying the earlier failure's cause.
+    /// this returns an error carrying the earlier failure's cause. Concurrent
+    /// callers for the same tokenizer wait for one load and share its result.
     pub(crate) async fn get_or_load(
         &self,
         tokenizer_id: &str,
@@ -102,22 +148,17 @@ impl MultimodalConfigRegistry {
             debug!(%tokenizer_id, "multimodal config cache hit");
             return Ok(cached);
         }
+        self.held_failure(tokenizer_id)?;
 
-        if let Some((failed_at, cause)) = self
-            .failed_loads
-            .get(tokenizer_id)
-            .map(|entry| entry.value().clone())
-        {
-            let since = failed_at.elapsed();
-            if since < self.failure_ttl {
-                debug!(%tokenizer_id, ?since, %cause, "multimodal config load failed recently; not retried");
-                anyhow::bail!(
-                    "multimodal config for tokenizer '{tokenizer_id}' failed to load {since:?} ago: \
-                     {cause}; not retried for {:?}",
-                    self.failure_ttl
-                );
-            }
+        let _loading = LoadSlot::acquire(&self.loading, tokenizer_id).await;
+
+        // Whoever held the lock before us may have loaded, or failed and
+        // recorded it, in the meantime.
+        if let Some(cached) = self.get(tokenizer_id) {
+            debug!(%tokenizer_id, "multimodal config loaded by a concurrent request");
+            return Ok(cached);
         }
+        self.held_failure(tokenizer_id)?;
 
         debug!(
             %tokenizer_id,
@@ -149,6 +190,27 @@ impl MultimodalConfigRegistry {
 
         debug!(%tokenizer_id, "multimodal config loaded and cached");
         Ok(model_config)
+    }
+
+    /// The error for a failure still within its hold, if any.
+    fn held_failure(&self, tokenizer_id: &str) -> Result<()> {
+        let Some((failed_at, cause)) = self
+            .failed_loads
+            .get(tokenizer_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return Ok(());
+        };
+        let since = failed_at.elapsed();
+        if since < self.failure_ttl {
+            debug!(%tokenizer_id, ?since, %cause, "multimodal config load failed recently; not retried");
+            anyhow::bail!(
+                "multimodal config for tokenizer '{tokenizer_id}' failed to load {since:?} ago: \
+                 {cause}; not retried for {:?}",
+                self.failure_ttl
+            );
+        }
+        Ok(())
     }
 }
 
@@ -463,6 +525,64 @@ mod tests {
             held_text.contains("not retried") && held_text.contains(&first.to_string()),
             "held failure must carry the original cause, got: {held_text}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_share_one_failed_load() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("config.json"), "{not json").unwrap();
+        let source = tmp.path().to_string_lossy().into_owned();
+        let reg = Arc::new(MultimodalConfigRegistry::new());
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let reg = Arc::clone(&reg);
+            let source = source.clone();
+            tasks.spawn(async move { reg.get_or_load("tok-burst", &source).await });
+        }
+        let mut raw = 0;
+        let mut held = 0;
+        while let Some(result) = tasks.join_next().await {
+            let error = result.unwrap().unwrap_err().to_string();
+            // A caller that ran the load gets the load error itself; one that
+            // waited on it gets the hold, which quotes that same error.
+            assert!(error.contains("Failed to parse config.json"), "{error}");
+            if error.contains("not retried") {
+                held += 1;
+            } else {
+                raw += 1;
+            }
+        }
+        assert_eq!((raw, held), (1, 15), "exactly one caller must have loaded");
+        assert!(
+            reg.loading.is_empty(),
+            "the load lock is released once the burst is over"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_share_one_loaded_config() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("config.json"), r#"{"model_type":"phi3_v"}"#).unwrap();
+        let source = tmp.path().to_string_lossy().into_owned();
+        let reg = Arc::new(MultimodalConfigRegistry::new());
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let reg = Arc::clone(&reg);
+            let source = source.clone();
+            tasks.spawn(async move { reg.get_or_load("tok-shared", &source).await });
+        }
+        let mut configs = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            configs.push(result.unwrap().unwrap());
+        }
+        assert_eq!(configs.len(), 16);
+        // One load: every caller holds the very allocation that load cached.
+        let cached = reg.get("tok-shared").unwrap();
+        assert!(configs.iter().all(|config| Arc::ptr_eq(config, &cached)));
+        assert_eq!(cached.config["model_type"].as_str(), Some("phi3_v"));
+        assert!(reg.loading.is_empty());
     }
 
     #[tokio::test]
