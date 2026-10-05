@@ -2865,6 +2865,50 @@ mod tests {
         assert_eq!(index.debug_blocks(), reference.blocks());
     }
 
+    /// A lock-free reader may still hold a table id whose words were recycled and rewritten by
+    /// the time it reads them; the version check discards the read, so the read itself must only
+    /// return garbage, never panic. Rewrites the headers a recycled slot could carry: a child
+    /// table that became a forwards table of another size, and a partial table whose used count
+    /// outgrew its slots.
+    #[test]
+    fn stale_table_headers_are_read_without_panicking() {
+        let arena = WordArena::new();
+        let child_table = arena.alloc_table(MIN_TABLE_SLOTS);
+        arena.table_put(child_table, 0xabcd, 7, 1);
+        let partial_table = arena.alloc_partials(MIN_TABLE_SLOTS);
+        arena.partial_put(partial_table, 3, 5);
+        let forwards_table = arena.alloc_forwards(MIN_TABLE_SLOTS);
+        arena.forwards_push(forwards_table, 4, 9, 2);
+        // Garbage of every shape a recycled header might show: zero, not a power of two, huge.
+        for garbage in [
+            0u64,
+            3,
+            u64::MAX,
+            (u64::MAX << 32) | 5,
+            (7u64 << 32) | (1 << 31),
+        ] {
+            for table in [child_table, partial_table, forwards_table] {
+                arena.word(table).store(garbage, Ordering::Relaxed);
+                let _ = arena.table_find(table, 0xabcd);
+                let _ = arena.forwards_find(table, 4);
+                let _ = arena.partial_find(table, 3);
+                let _ = arena.partial_max(table);
+                let (_, used) = arena.partials_shape(table);
+                let _ = arena.words(table + 2, used).len();
+            }
+        }
+        // A whole walk over an index keeps working after the headers it reads are rewritten.
+        let index = RunIndex::with_max_workers(8);
+        let w = index.intern_worker("w").expect("id");
+        let mut map = RunBlockMap::default();
+        let held: Vec<ContentHash> = (0..12).map(|p| content(1, p)).collect();
+        let blocks = blocks_of(&held);
+        index
+            .apply_stored(w, &blocks, None, &mut map)
+            .expect("store");
+        assert_eq!(scores(&index, &held), vec![(w, 12)]);
+    }
+
     #[test]
     fn parent_errors_match_the_positional_indexer() {
         let index = RunIndex::with_max_workers(8);
