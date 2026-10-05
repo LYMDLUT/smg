@@ -332,6 +332,36 @@ pub(crate) fn init_metrics() {
         "KV event subscription task failures by worker and reason \
          (panic, join_error, intern_failed)"
     );
+    describe_counter!(
+        "smg_kv_event_batches_total",
+        "KV event batches by worker and disposition (applied, stale, tail_overflow)"
+    );
+    describe_counter!(
+        "smg_kv_event_gaps_total",
+        "KV event sequence gaps by worker and outcome (replay_requested, \
+         unrecovered_kept, unrecovered_cleared)"
+    );
+    describe_counter!(
+        "smg_kv_event_missed_batches_total",
+        "KV event batches the publisher skipped and could not replay, by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_resyncs_total",
+        "KV event rank resyncs by worker and reason (out_of_range, data_loss, \
+         publisher_restart, gap_cleared)"
+    );
+    describe_histogram!(
+        "smg_kv_event_lag_seconds",
+        "Age of a KV event batch when applied: now minus the publisher timestamp, by worker"
+    );
+    describe_gauge!(
+        "smg_kv_event_degraded_ranks",
+        "KV event ranks whose index may be stale after an unreplayed gap, by worker"
+    );
+    describe_gauge!(
+        "smg_kv_event_tail_depth",
+        "Live KV event batches held while a snapshot resync is in flight, by worker"
+    );
     describe_gauge!(
         "smg_workers_overloaded",
         "Workers currently flagged overloaded and excluded from routing, by model"
@@ -1497,6 +1527,58 @@ impl Metrics {
             "reason" => reason
         )
         .increment(1);
+    }
+
+    /// Count a KV event batch by what the subscriber did with it.
+    pub fn record_kv_event_batch(worker_url: &str, disposition: &'static str) {
+        counter!(
+            "smg_kv_event_batches_total",
+            "worker" => intern_string(worker_url),
+            "disposition" => disposition
+        )
+        .increment(1);
+    }
+
+    /// Count a sequence gap and the batches it skipped.
+    pub fn record_kv_event_gap(worker_url: &str, outcome: &'static str, missed: u64) {
+        let worker_interned = intern_string(worker_url);
+        counter!(
+            "smg_kv_event_gaps_total",
+            "worker" => Arc::clone(&worker_interned),
+            "outcome" => outcome
+        )
+        .increment(1);
+        if missed > 0 {
+            counter!("smg_kv_event_missed_batches_total", "worker" => worker_interned)
+                .increment(missed);
+        }
+    }
+
+    /// Count a rank resync (its index state dropped) by reason.
+    pub fn record_kv_event_resync(worker_url: &str, reason: &'static str) {
+        counter!(
+            "smg_kv_event_resyncs_total",
+            "worker" => intern_string(worker_url),
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Observe how old a batch was when it was applied.
+    pub fn record_kv_event_lag(worker_url: &str, seconds: f64) {
+        histogram!("smg_kv_event_lag_seconds", "worker" => intern_string(worker_url))
+            .record(seconds);
+    }
+
+    /// Ranks of this worker whose index may be stale.
+    pub fn set_kv_event_degraded_ranks(worker_url: &str, count: usize) {
+        gauge!("smg_kv_event_degraded_ranks", "worker" => intern_string(worker_url))
+            .set(count as f64);
+    }
+
+    /// Live batches held for a worker while a snapshot resync is in flight.
+    pub fn set_kv_event_tail_depth(worker_url: &str, depth: usize) {
+        gauge!("smg_kv_event_tail_depth", "worker" => intern_string(worker_url)).set(depth as f64);
     }
 
     // ========================================================================
