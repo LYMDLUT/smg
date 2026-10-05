@@ -3,7 +3,7 @@
 8B fleet with 12 000-block pools (192 k tokens per worker, 7 % of the rows 0-1999 working set), 2d37b25a gateway and servicer
 wheel, Mooncake rows 0-1999 at speedup 3, fresh gateway before every run, warm engines, gateway and client on cores 64-71,
 `--log-level warn --reasoning-parser passthrough`, health probe 30 s / 20 s / 5. Rows are named as in the mock matrix.
-`shed` is `smg_worker_overload_shed_total` scraped from the gateway right after each run (before its restart). The gateway's
+`shed` is `smg_worker_overload_shed_total` scraped from the gateway right after each run (before its restart); it counts requests rejected because every worker was over the threshold, and the replay counts those as errors (ca+prot run 1: 627 errors = 50 over-length + 577 shed; ca+prot-tu0.8 run 1: 64 = 50 + 14), which is why goodput drops with the shed count. Exclusions that merely re-route a request do not increment it. The gateway's
 load monitor polls `GetLoads` on each servicer; the 2d37b25a vLLM servicer fills `token_usage`, `num_running_reqs` and
 `num_waiting_reqs`, so every row had its signal. Table: `protection-table.md` (per run and mean of 3).
 
