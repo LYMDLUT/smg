@@ -73,6 +73,8 @@ fn zmq_fixture() -> ZmqFixture {
 )]
 fn start_mock_zmq_engines(handshake: &str, count: u16) {
     let cfg = Arc::new(mock_worker::config::Config {
+        admin_port: None,
+        context_length: 32768,
         host: "127.0.0.1".to_string(),
         http_base_port: 0,
         http_count: 0,

@@ -299,6 +299,8 @@ mod tests {
             http_count: 0,
             grpc_base_port: 0,
             grpc_count: 0,
+            admin_port: None,
+            context_length: 32768,
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,

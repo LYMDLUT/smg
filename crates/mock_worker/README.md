@@ -44,35 +44,83 @@ Each worker is one port. Register them against an IGW gateway with
 ## Realistic engine
 
 `--engine realistic` backs each worker with a continuous-batching simulator
-([`src/engine.rs`](src/engine.rs)) that reproduces the behaviors driving routing:
+([`src/engine.rs`](src/engine.rs)) built the way vLLM schedules, so routing
+experiments against it transfer to engines (and compare with Dynamo's offline
+replay, which models the same loop):
 
-- **prefill latency scales with input length** — TTFT grows with the *uncached*
-  prompt size, chunked across scheduler steps;
-- **inter-token latency grows with batch size** — `ITL = base + slope · batch`,
-  so a busy replica is slower per token;
-- **finite KV capacity + queueing** — when KV is full, requests wait, producing
-  the `num_waiting_uncached_tokens` signal `least_load` consumes;
-- **prefix caching** — a request sharing a prefix with cached blocks pays less
-  prefill, reports `cached_tokens`, and the worker emits the KV-cache events
-  (`SubscribeKvEvents`) that drive event-driven `cache_aware` routing.
-
-The cost model is parametric (defaults approximate one mid-size replica):
+- **pass loop** — every pass has a token budget (`--max-batched-tokens`, 8192)
+  and a sequence cap (`--max-running`, 256). Running requests go first, each
+  taking one decode token or a prefill chunk; then the queue is admitted FCFS
+  while budget and KV room remain. With `--prefill-first true` (SGLang) a pass
+  that contains prefill runs prefill only.
+- **block-level KV pool** — `--kv-blocks`/`--kv-tokens` physical blocks of
+  `--block-size` tokens, keyed by content hash with reference counts; idle
+  cached blocks sit in an LRU and are evicted head-first when an allocation
+  needs room; a running request that still cannot get a block preempts the most
+  recently admitted request (LIFO), which recomputes later. A fully cached
+  prompt recomputes its last block; a prefix hit on an idle block references it
+  again.
+- **KV events** (`SubscribeKvEvents`) — per request within a pass, `Removed`
+  for the blocks evicted by its allocation, then one `Stored` per contiguous
+  run of blocks it completed (parent-chained, with token ids). `Removed` fires
+  only when the last copy of a hash leaves the pool, `Stored` only when a hash
+  first appears; completion and preemption emit nothing. Every event of a pass
+  becomes visible at the pass end, so a request arriving mid-pass cannot see
+  that pass's blocks. A reset (`POST /admin/reset`) publishes
+  `AllBlocksCleared`.
+- **timing** — `--timing polynomial` (default) uses AISimulate's baseline:
+  prefill `16.50142 + 1.518344e-2·T + 4.209989e-7·T²` ms over the uncached
+  tokens `T` of the pass, decode `max(1, 5.74 + 54.01·u − 25.74·u²)` ms over
+  the KV utilisation `u` of the decoding requests; a pass lasts prefill plus
+  decode, and the first token of a prefill adds no decode time.
+  `--timing linear` keeps the older `prefill_tps` / `base + slope·batch` model.
+- **cached tokens** — a request sharing a prefix with cached blocks pays less
+  prefill and reports `cached_tokens` (gRPC chunks, HTTP
+  `usage.prompt_tokens_details.cached_tokens`).
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--prefill-tps` | 8000 | prefill throughput (tokens/s) |
-| `--decode-base-ms` | 6.0 | fixed decode-step latency (ms) |
-| `--decode-per-req-ms` | 0.35 | added decode latency per running request |
-| `--prefill-chunk` | 2048 | max prompt tokens prefilled per step |
-| `--max-running` | 256 | continuous-batching width |
-| `--kv-tokens` | 524288 | KV cache capacity (tokens) |
-| `--block-size` | 16 | cache block/page size (tokens) |
-| `--prefix-cache` | true | enable prefix caching + KV events |
+| `--timing` | polynomial | `polynomial` or `linear` pass-duration model |
+| `--prefill-poly a,b,c` | AISimulate | prefill ms = a + b·T + c·T² |
+| `--decode-poly a,b,c` | AISimulate | decode ms = max(1, a + b·u + c·u²) |
+| `--prefill-tps` | 8000 | linear model: prefill tokens/s (selects `linear`) |
+| `--decode-base-ms` | 6.0 | linear model: fixed decode-pass ms |
+| `--decode-per-req-ms` | 0.35 | linear model: decode ms per running request |
+| `--max-batched-tokens` | 8192 | token budget per pass (`--prefill-chunk` is an alias) |
+| `--max-running` | 256 | sequences per pass |
+| `--kv-tokens` / `--kv-blocks` | 524288 tokens | KV pool capacity |
+| `--block-size` | 16 | cache block/page size (tokens); must match the worker's `kv_block_size` |
+| `--prefix-cache` | true | prefix caching + KV events |
+| `--prefill-first` | false | SGLang-style prefill-only passes |
+| `--context-length` | 32768 | advertised context length |
+| `--admin-port` | off | process-wide admin API (below) |
 
 ```bash
 cargo run --release -p mock-worker -- \
-  --engine realistic --grpc-base-port 19000 --grpc-count 8 --model mock-model
+  --engine realistic --grpc-base-port 19000 --grpc-count 8 --model mock-model --admin-port 19100
 ```
+
+Agreement with hardware is the caller's problem: AISimulate's published
+agreement for these polynomials (mean absolute percentage error 48.5% on TTFT,
+28.9% on TPOT) was measured with prefix caching disabled, so cache-hit and
+routing effects have no published validation. Treat the simulator as a relative
+A/B harness for policies and validate absolute numbers on GPUs.
+
+### Admin API
+
+`--admin-port` serves the ground truth a routing benchmark needs and real
+engines do not expose:
+
+- `GET /admin/fleet` — every engine (`grpc:<port>` / `http:<port>`) with cache
+  size, load, cached blocks and preemptions;
+- `GET /admin/requests?since=<seq>&limit=<n>` — admitted requests with the
+  serving worker, prompt/cached tokens, queue wait and the **arrival-time
+  oracle**: the most cached tokens any worker of the process held when the
+  request arrived (the best a router could have obtained). Join on the
+  gateway's response `id`;
+- `GET /admin/cache/{worker}` — the worker's cached block keys;
+- `POST /admin/reset[/{worker}]` — clear caches and publish `AllBlocksCleared`
+  (an engine restart, to the index).
 
 **Tokenizer note (gRPC):** the gateway tokenizes prompts before routing, so it
 needs a real tokenizer for the model. Register each worker with a tokenizer

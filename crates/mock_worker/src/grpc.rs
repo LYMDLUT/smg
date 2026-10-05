@@ -45,8 +45,12 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
 /// port 0 and read it back instead of picking one and binding it later.
 pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
     let addr = listener.local_addr().ok();
-    // One simulated engine per listener (i.e. per virtual worker).
-    let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
+    // One simulated engine per listener (i.e. per virtual worker), registered
+    // in the process fleet under `grpc:<port>` for the oracle and admin API.
+    let name = format!("grpc:{}", addr.map(|a| a.port()).unwrap_or(0));
+    let engine = cfg
+        .realistic
+        .then(|| Engine::spawn_named(cfg.engine.clone(), name, true));
     let service = MockScheduler { cfg, engine };
     if let Err(e) = Server::builder()
         .add_service(TokenSpeedSchedulerServer::new(service))
@@ -175,8 +179,8 @@ impl TokenSpeedScheduler for MockScheduler {
             served_model_name: self.cfg.model_id.clone(),
             model_type: "mock".to_string(),
             architectures: vec!["MockForCausalLM".to_string()],
-            max_context_length: 32768,
-            max_req_input_len: 32768,
+            max_context_length: self.cfg.context_length.min(i32::MAX as u32) as i32,
+            max_req_input_len: self.cfg.context_length.min(i32::MAX as u32) as i32,
             vocab_size: 32000,
             eos_token_ids: vec![2],
             pad_token_id: 0,

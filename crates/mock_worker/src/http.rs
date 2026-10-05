@@ -63,8 +63,11 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
             return;
         }
     };
-    // One simulated engine per listener (i.e. per virtual worker).
-    let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
+    // One simulated engine per listener (i.e. per virtual worker), registered
+    // in the process fleet under `http:<port>` for the oracle and admin API.
+    let engine = cfg
+        .realistic
+        .then(|| Engine::spawn_named(cfg.engine.clone(), format!("http:{port}"), true));
     let state = Arc::new(AppState { cfg, engine });
     // TCP_NODELAY: without it Nagle holds each small SSE frame until the
     // gateway's delayed ACK (~40ms) arrives, which stalls every streamed
@@ -92,7 +95,7 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
             "created": 0,
             "owned_by": "sglang",
             "root": state.cfg.model_id,
-            "max_model_len": 32768,
+            "max_model_len": state.cfg.context_length,
         }],
     }))
     .into_response()
@@ -264,6 +267,7 @@ async fn realistic_completion(
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
         "cached_tokens": cached_tokens,
+        "prompt_tokens_details": { "cached_tokens": cached_tokens },
     });
     Json(match endpoint {
         Endpoint::Chat => json!({

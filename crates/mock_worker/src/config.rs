@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::engine::EngineParams;
+use crate::engine::{EngineParams, TimingModel};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -38,6 +38,63 @@ pub struct Config {
     pub realistic: bool,
     /// Engine-simulator parameters (only used when `realistic`).
     pub engine: EngineParams,
+    /// Port of the process-wide admin API (fleet, request records, cache
+    /// dumps, resets); off when `None`.
+    pub admin_port: Option<u16>,
+    /// Context length advertised to the gateway (`max_context_length`,
+    /// `max_req_input_len`, `max_model_len`).
+    pub context_length: u32,
+}
+
+/// Timing flags collected while parsing; resolved into one [`TimingModel`]
+/// at the end so flag order does not matter.
+#[derive(Default)]
+struct TimingFlags {
+    kind: Option<String>,
+    prefill_poly: Option<[f64; 3]>,
+    decode_poly: Option<[f64; 3]>,
+    prefill_tps: Option<f64>,
+    decode_base_ms: Option<f64>,
+    decode_per_req_ms: Option<f64>,
+}
+
+impl TimingFlags {
+    fn resolve(self) -> Result<TimingModel, String> {
+        let linear_override = self.prefill_tps.is_some()
+            || self.decode_base_ms.is_some()
+            || self.decode_per_req_ms.is_some();
+        let kind = match self.kind.as_deref() {
+            Some("polynomial") => "polynomial",
+            Some("linear") => "linear",
+            Some(other) => return Err(format!("--timing must be polynomial|linear, got {other}")),
+            None if linear_override => "linear",
+            None => "polynomial",
+        };
+        Ok(if kind == "linear" {
+            TimingModel::Linear {
+                prefill_tps: self.prefill_tps.unwrap_or(8000.0),
+                decode_base_ms: self.decode_base_ms.unwrap_or(6.0),
+                decode_per_req_ms: self.decode_per_req_ms.unwrap_or(0.35),
+            }
+        } else {
+            TimingModel::Polynomial {
+                prefill: self.prefill_poly.unwrap_or(TimingModel::POLY_PREFILL),
+                decode: self.decode_poly.unwrap_or(TimingModel::POLY_DECODE),
+            }
+        })
+    }
+}
+
+fn parse_poly(raw: String, flag: &str) -> Result<[f64; 3], String> {
+    let parts: Vec<f64> = raw
+        .split(',')
+        .map(|v| v.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("invalid value for {flag}: {raw} (want a,b,c)"))?;
+    match parts.as_slice() {
+        [a, b, c] => Ok([*a, *b, *c]),
+        _ => Err(format!("invalid value for {flag}: {raw} (want a,b,c)")),
+    }
 }
 
 impl Config {
@@ -58,7 +115,11 @@ impl Config {
             output_tokens: 8,
             realistic: false,
             engine: EngineParams::default(),
+            admin_port: None,
+            context_length: 32768,
         };
+        let mut timing = TimingFlags::default();
+        let mut kv_blocks: Option<u64> = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
@@ -88,21 +149,38 @@ impl Config {
                         }
                     }
                 }
-                "--prefill-tps" => cfg.engine.prefill_tps = parse(value(&mut args, &flag)?, &flag)?,
+                "--timing" => timing.kind = Some(value(&mut args, &flag)?),
+                "--prefill-poly" => {
+                    timing.prefill_poly = Some(parse_poly(value(&mut args, &flag)?, &flag)?);
+                }
+                "--decode-poly" => {
+                    timing.decode_poly = Some(parse_poly(value(&mut args, &flag)?, &flag)?);
+                }
+                "--prefill-tps" => {
+                    timing.prefill_tps = Some(parse(value(&mut args, &flag)?, &flag)?)
+                }
                 "--decode-base-ms" => {
-                    cfg.engine.decode_base_ms = parse(value(&mut args, &flag)?, &flag)?;
+                    timing.decode_base_ms = Some(parse(value(&mut args, &flag)?, &flag)?);
                 }
                 "--decode-per-req-ms" => {
-                    cfg.engine.decode_per_req_ms = parse(value(&mut args, &flag)?, &flag)?;
+                    timing.decode_per_req_ms = Some(parse(value(&mut args, &flag)?, &flag)?);
                 }
-                "--prefill-chunk" => {
-                    cfg.engine.prefill_chunk_tokens = parse(value(&mut args, &flag)?, &flag)?;
+                "--max-batched-tokens" | "--prefill-chunk" => {
+                    cfg.engine.max_batched_tokens = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--max-running" => cfg.engine.max_running = parse(value(&mut args, &flag)?, &flag)?,
                 "--kv-tokens" => {
                     cfg.engine.kv_capacity_tokens = parse(value(&mut args, &flag)?, &flag)?;
                 }
+                "--kv-blocks" => kv_blocks = Some(parse(value(&mut args, &flag)?, &flag)?),
+                "--prefill-first" => {
+                    cfg.engine.prefill_first = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--context-length" => {
+                    cfg.context_length = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--block-size" => cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?,
+                "--admin-port" => cfg.admin_port = Some(parse(value(&mut args, &flag)?, &flag)?),
                 "--prefix-cache" => {
                     cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
                 }
@@ -113,6 +191,10 @@ impl Config {
 
         if cfg.tokenizer_path.is_empty() {
             cfg.tokenizer_path = cfg.model_id.clone();
+        }
+        cfg.engine.timing = timing.resolve()?;
+        if let Some(blocks) = kv_blocks {
+            cfg.engine.kv_capacity_tokens = blocks * u64::from(cfg.engine.block_size);
         }
         // `--output-tokens` doubles as the realistic engine's default output
         // length when a request omits `max_tokens`.
@@ -159,15 +241,25 @@ fn usage() -> String {
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
      \n\
-     Realistic engine simulator (continuous batching; opt-in):\n\
+     Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\
-       --prefill-tps <f>        prefill throughput, tokens/sec (default 8000)\n\
-       --decode-base-ms <f>     fixed decode-step latency, ms (default 6.0)\n\
-       --decode-per-req-ms <f>  added decode-step latency per running req (default 0.35)\n\
-       --prefill-chunk <n>      max prompt tokens prefilled per step (default 2048)\n\
-       --max-running <n>        max concurrent running requests (default 256)\n\
+       --timing <polynomial|linear>  pass duration model (default polynomial)\n\
+       --prefill-poly <a,b,c>   prefill ms = a + b*T + c*T^2 over uncached tokens T in the pass\n\
+                                (default 16.50142,1.518344e-2,4.209989e-7)\n\
+       --decode-poly <a,b,c>    decode ms = max(1, a + b*u + c*u^2) over KV utilisation u\n\
+                                (default 5.74,54.01,-25.74)\n\
+       --prefill-tps <f>        linear model: prefill tokens/sec (default 8000; selects linear)\n\
+       --decode-base-ms <f>     linear model: fixed decode-step ms (default 6.0)\n\
+       --decode-per-req-ms <f>  linear model: decode ms per running request (default 0.35)\n\
+       --max-batched-tokens <n> token budget per pass (default 8192; --prefill-chunk is an alias)\n\
+       --max-running <n>        max sequences per pass (default 256)\n\
        --kv-tokens <n>          KV cache capacity in tokens (default 524288)\n\
+       --kv-blocks <n>          KV cache capacity in blocks (overrides --kv-tokens)\n\
        --block-size <n>         cache block/page size in tokens (default 16)\n\
-       --prefix-cache <bool>    enable prefix caching + KV events (default true)"
+       --prefix-cache <bool>    enable prefix caching + KV events (default true)\n\
+       --prefill-first <bool>   SGLang-style: a pass with prefill runs prefill only (default false)\n\
+       --context-length <n>     advertised context length (default 32768)\n\
+       --admin-port <port>      process-wide admin API: fleet, request records with the\n\
+                                arrival-time oracle, cache dumps, resets (default off)"
         .to_string()
 }
