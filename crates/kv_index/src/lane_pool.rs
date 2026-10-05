@@ -152,7 +152,8 @@ pub struct PoolMetrics {
     pub queued: usize,
     /// Deepest queue one worker reached.
     pub max_depth: usize,
-    /// Most events waiting at once across all workers.
+    /// Most events waiting at once across all workers (sampled every few hundred batches per
+    /// lane).
     pub max_queued: usize,
     /// Time lanes spent inside the apply closure.
     pub busy_ns: u64,
@@ -193,10 +194,18 @@ struct Lane {
     max_queued: AtomicUsize,
 }
 
+/// Batches between two samples of the pool-wide queue depth by one lane (a sum over every
+/// lane's counters, so not something to take per event).
+const SAMPLE_EVERY: u64 = 256;
+
 pub struct LanePool<W, E> {
     config: LanePoolConfig,
     workers: Box<[CachePadded<WorkerSlot<W, E>>]>,
     lanes: Box<[CachePadded<Lane>]>,
+    /// One bit per lane: set while the lane is serving a worker and has more on its list, which
+    /// is exactly where a thief can take from. A hint: a stale bit costs the thief one empty
+    /// look, a missed one delays a steal by a batch.
+    stealable: Box<[CachePadded<AtomicU64>]>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -229,6 +238,9 @@ impl<W: Send, E: Send> LanePool<W, E> {
                         held: Mutex::new(None),
                     })
                 })
+                .collect(),
+            stealable: (0..config.lanes.div_ceil(64))
+                .map(|_| CachePadded::new(AtomicU64::new(0)))
                 .collect(),
             lanes: (0..config.lanes)
                 .map(|_| {
@@ -338,6 +350,9 @@ impl<W: Send, E: Send> LanePool<W, E> {
     fn make_ready(&self, lane: usize, worker: u32) {
         let target = &self.lanes[lane];
         lock(&target.ready).push_back(worker);
+        if target.serving.load(Ordering::Relaxed) {
+            self.mark_stealable(lane, true);
+        }
         if target.parked.swap(false, Ordering::SeqCst) {
             Self::unpark(target);
         } else {
@@ -390,7 +405,6 @@ impl<W: Send, E: Send> LanePool<W, E> {
                 continue;
             };
             self.serve(lane, worker, hooks);
-            me.max_queued.fetch_max(self.queued(), Ordering::Relaxed);
         }
         *lock(&me.thread) = None;
     }
@@ -409,6 +423,27 @@ impl<W: Send, E: Send> LanePool<W, E> {
         me.parked.store(false, Ordering::SeqCst);
     }
 
+    /// Whether some lane is serving with more workers on its list: the only reason for an idle
+    /// lane to wake before its own ingress does. One word per 64 lanes.
+    #[must_use]
+    pub fn has_stealable(&self) -> bool {
+        self.stealable
+            .iter()
+            .any(|word| word.load(Ordering::Relaxed) != 0)
+    }
+
+    fn mark_stealable(&self, lane: usize, on: bool) {
+        let word = &self.stealable[lane / 64];
+        let bit = 1u64 << (lane % 64);
+        if on {
+            word.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            word.fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+
+    /// Take the oldest ready worker of a lane whose bit says it is serving with more on its
+    /// list; one word read when there is none.
     fn steal(&self, lane: usize, seed: &mut u64) -> Option<u32> {
         if self.lanes.len() == 1 {
             return None;
@@ -416,19 +451,29 @@ impl<W: Send, E: Send> LanePool<W, E> {
         *seed ^= *seed << 13;
         *seed ^= *seed >> 7;
         *seed ^= *seed << 17;
-        let start = (*seed % self.lanes.len() as u64) as usize;
-        for step in 0..self.lanes.len() {
-            let victim = (start + step) % self.lanes.len();
-            if victim == lane || !self.lanes[victim].serving.load(Ordering::Relaxed) {
-                continue;
+        let start = (*seed % self.stealable.len() as u64) as usize;
+        for step in 0..self.stealable.len() {
+            let index = (start + step) % self.stealable.len();
+            let mut word = self.stealable[index].load(Ordering::Relaxed);
+            if index == lane / 64 {
+                word &= !(1u64 << (lane % 64));
             }
-            let Ok(mut ready) = self.lanes[victim].ready.try_lock() else {
-                continue;
-            };
-            if let Some(worker) = ready.pop_front() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                let victim = index * 64 + bit;
+                let Ok(mut ready) = self.lanes[victim].ready.try_lock() else {
+                    continue;
+                };
+                let taken = ready.pop_front();
+                if ready.is_empty() {
+                    self.mark_stealable(victim, false);
+                }
                 drop(ready);
-                self.lanes[lane].steals.fetch_add(1, Ordering::Relaxed);
-                return Some(worker);
+                if let Some(worker) = taken {
+                    self.lanes[lane].steals.fetch_add(1, Ordering::Relaxed);
+                    return Some(worker);
+                }
             }
         }
         None
@@ -443,6 +488,9 @@ impl<W: Send, E: Send> LanePool<W, E> {
         debug_assert!(claimed, "a ready worker is claimed by exactly one lane");
         let me = &self.lanes[lane];
         me.serving.store(true, Ordering::Relaxed);
+        if !lock(&me.ready).is_empty() {
+            self.mark_stealable(lane, true);
+        }
         let started = Instant::now();
         let mut applied = 0;
         {
@@ -472,8 +520,12 @@ impl<W: Send, E: Send> LanePool<W, E> {
         }
         me.busy_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        me.applied.fetch_add(applied as u64, Ordering::Relaxed);
+        let total = me.applied.fetch_add(applied as u64, Ordering::Relaxed) + applied as u64;
         me.serving.store(false, Ordering::Relaxed);
+        self.mark_stealable(lane, false);
+        if total / SAMPLE_EVERY != (total - applied as u64) / SAMPLE_EVERY {
+            me.max_queued.fetch_max(self.queued(), Ordering::Relaxed);
+        }
         slot.state.store(IDLE, Ordering::Release);
         // Whoever observes the queue non-empty after this point schedules the worker once: an
         // enqueue that saw RUNNING left scheduling to us, one that comes later wins the exchange.
