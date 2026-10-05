@@ -3217,6 +3217,69 @@ mod tests {
         assert_eq!(scores(&index, &held), vec![(w, 12)]);
     }
 
+    /// The race the release harness caught: a split of the parent between a store walk's plan
+    /// and its lock-free claim must make the insert give up, not link the child after the new
+    /// end. Replayed deterministically: plan (take the version), split, then try the insert.
+    #[test]
+    fn a_child_insert_planned_before_a_split_gives_up() {
+        let index = RunIndex::with_max_workers(8);
+        let w = index.intern_worker("w").expect("id");
+        let v = index.intern_worker("v").expect("id");
+        let (mut mw, mut mv) = (RunBlockMap::default(), RunBlockMap::default());
+        let held: Vec<ContentHash> = (0..10).map(|p| content(1, p)).collect();
+        let blocks = blocks_of(&held);
+        index.apply_stored(w, &blocks, None, &mut mw).expect("w");
+        let parent = mw.get(blocks[9].seq_hash).expect("mapped").run;
+        let (_, planned) = index.slab.run(parent).snapshot();
+        // Another lane diverges inside the run: it is split at 5, its end moves.
+        let mut fork: Vec<ContentHash> = held[..5].to_vec();
+        fork.extend((0..3).map(|p| content(2, p)));
+        index
+            .apply_stored(v, &blocks_of(&fork), None, &mut mv)
+            .expect("v");
+        assert_eq!(index.slab.run(parent).len(), 5);
+        // The child prepared for blocks after the old end must not be linked after the new one.
+        let contents = [content(3, 0).0, content(3, 1).0];
+        let block = index.arena.alloc_array(&contents, capacity_for(2));
+        let child = index.slab.alloc(
+            0,
+            parent,
+            Window {
+                block,
+                base: 0,
+                len: 2,
+                children: NONE,
+                partials: NONE,
+                forwards: NONE,
+            },
+        );
+        set(index.slab.coverage(child), w);
+        assert!(matches!(
+            index.insert_child(parent, child, contents[0], planned),
+            Claim::Changed
+        ));
+        let mut freed = Vec::new();
+        index.discard_run(child, w, &mut freed);
+        index.recycle(&mut freed);
+        // The real path restarts from the parent block and lands the blocks after block 9.
+        let mut longer = held.clone();
+        longer.extend([content(3, 0), content(3, 1)]);
+        let longer_blocks = blocks_of(&longer);
+        index
+            .apply_stored(w, &longer_blocks[10..], Some(blocks[9].seq_hash), &mut mw)
+            .expect("extend");
+        let mut reference = ReferenceIndexer::new();
+        reference.apply_stored(w, &blocks, None).expect("ref w");
+        reference
+            .apply_stored(v, &blocks_of(&fork), None)
+            .expect("ref v");
+        reference
+            .apply_stored(w, &longer_blocks[10..], Some(blocks[9].seq_hash))
+            .expect("ref extend");
+        assert_eq!(index.debug_blocks(), reference.blocks());
+        assert_eq!(scores(&index, &longer), vec![(w, 12), (v, 5)]);
+    }
+
     #[test]
     fn parent_errors_match_the_positional_indexer() {
         let index = RunIndex::with_max_workers(8);
