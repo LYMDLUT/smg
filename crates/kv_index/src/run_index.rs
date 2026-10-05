@@ -1166,6 +1166,8 @@ enum Claim {
     Exists(u32, u32),
     /// No free slot (or no table): grow under the lock.
     Full,
+    /// The run changed since the plan was made (a split moved its end): plan again.
+    Changed,
 }
 
 /// What [`RunIndex::store_in_run`] found.
@@ -1475,7 +1477,7 @@ impl RunIndex {
             match self.arena.table_claim(table, head, child, generation) {
                 Claim::Inserted => return None,
                 Claim::Exists(other, other_generation) => return Some((other, other_generation)),
-                Claim::Full => {}
+                Claim::Full | Claim::Changed => {}
             }
             run.begin_update();
             run.wait_inflight();
@@ -1512,9 +1514,11 @@ impl RunIndex {
     }
 
     /// A lock-free attempt to link `child` (prepared, unpublished) under `run` for the blocks
-    /// after its last one: holds `inflight` across the claim so a split or table growth cannot
-    /// move the table under the insert. `Claim::Full` means the locked path must do it.
-    fn insert_child(&self, run_id: u32, child: u32, head: u64) -> Claim {
+    /// after its last one, as seen in the snapshot with `planned` version: holds `inflight`
+    /// across the claim so a split or table growth cannot move the table under the insert, and
+    /// gives up with `Claim::Changed` if the run moved on since the plan (its end is elsewhere
+    /// now). `Claim::Full` means the locked path must do it.
+    fn insert_child(&self, run_id: u32, child: u32, head: u64, planned: u64) -> Claim {
         let run = self.slab.run(run_id);
         loop {
             run.inflight.fetch_add(1, Ordering::SeqCst);
@@ -1523,6 +1527,10 @@ impl RunIndex {
                 run.inflight.fetch_sub(1, Ordering::SeqCst);
                 std::hint::spin_loop();
                 continue;
+            }
+            if version != planned {
+                run.inflight.fetch_sub(1, Ordering::SeqCst);
+                return Claim::Changed;
             }
             let table = run.children.load(Ordering::Acquire);
             let len = run.len();
@@ -2038,7 +2046,7 @@ impl RunIndex {
                         },
                     );
                     set(self.slab.coverage(new_id), worker);
-                    match self.insert_child(run_id, new_id, head) {
+                    match self.insert_child(run_id, new_id, head, version) {
                         Claim::Inserted => {
                             #[cfg(feature = "lane-stats")]
                             self.counters.inserts.fetch_add(1, Ordering::Relaxed);
@@ -2065,6 +2073,12 @@ impl RunIndex {
                             self.discard_run(new_id, worker, &mut freed);
                             self.recycle(&mut freed);
                             force_lock = true;
+                        }
+                        Claim::Changed => {
+                            let mut freed = Vec::new();
+                            self.discard_run(new_id, worker, &mut freed);
+                            self.recycle(&mut freed);
+                            return self.restart();
                         }
                     }
                 }
