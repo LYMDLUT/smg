@@ -6,6 +6,9 @@
 | `mooncake_replay.rs` | Open-loop replay of a Mooncake indexer corpus by Dynamo's method, against this crate's indexers (`cargo bench -p kv-index --bench mooncake_replay -- --help`). |
 | `corpus_export.patch` | The `--export-corpus` option for Dynamo's `lib/bench/kv_router/mooncake_bench` (against ai-dynamo/dynamo `50bdb355f8`), which writes the corpus the replay consumes. |
 | `dynamo-adapter/` | `PositionalIndexer` behind Dynamo's `SyncIndexer`, so Dynamo's own binary can measure it (its README explains the wiring). |
+| `protocol/bisect_sustained.py` | Threshold search for sustained throughput: brackets the highest offered rate at which trials keep up (3 fresh-process trials per point, geometric bisection to within 10%), for either harness. |
+| `protocol/publish_protocol.py` | Guardrail 5 runner: N fresh-process trials with an interleaved same-binary control pair, the lock held per trial, a foreign-load check on the measurement cores before and after each trial, medians with bootstrap 95% confidence intervals, markdown output. |
+| `protocol/hostload.py` | The foreign-load sampler the two scripts share (per-process CPU on a core set over a short interval). |
 
 ## Why a corpus and a replay
 
@@ -128,7 +131,54 @@ numactl --interleave=all target/release/deps/mooncake_replay-<hash> mooncake-w12
   --query-issuer-threads 4 --query-issuer-cpus 16-19 --backend-cpus 24-63 --result-json-output ceiling.json
 ```
 
-One process per trial, as Dynamo's method requires.
+`--offered-block-ops-per-sec <rate>` sets the window from the corpus's block-op total instead of
+`--benchmark-duration-ms`, which is what a threshold search moves. One process per trial, as
+Dynamo's method requires.
+
+## Sustained throughput: the threshold search
+
+The contract defines sustained throughput as the highest offered rate at which a trial keeps up
+(generator valid, achieved at least 99% of offered). A window-driven replay only says "keeps up
+at this window", so the threshold has to be bracketed:
+
+```
+python3 benches/protocol/bisect_sustained.py --lock /tmp/measure.lock --out out/bisect \
+  --lo 107e6 --hi 427e6 --trials 3 --tolerance 0.10 \
+  --command "numactl --interleave=all <mooncake_replay> <corpus> --backend positional ... \
+             --offered-block-ops-per-sec {rate} --result-json-output {json}"
+```
+
+`--lo` must keep up and `--hi` must fail (`--verify-ends` checks both first); each point runs
+three fresh processes and passes only if all three keep up; the search moves the geometric
+midpoint until the bracket is within the tolerance and writes `bracket.json` and `bracket.md`.
+For Dynamo's binary use `{window_ms}` in the template with `--total-block-ops` (the corpus
+total, 320,105,993 for the standard corpus), and the script derives the window per point.
+
+## Publication protocol (guardrail 5)
+
+```
+python3 benches/protocol/publish_protocol.py --name "<system, harness>" --trials 20 \
+  --lock /tmp/measure.lock --cores 0-63 --allow '<background daemon regex>' --out out/protocol/<tag> \
+  --command "<one trial, with {json} for the result path>"
+```
+
+Each subject trial is followed by a control trial of the same command (or `--control-command`),
+so the pair shows the noise floor an A/A comparison would show before any difference under 5% is
+called. Every trial holds the lock, and the measurement cores are sampled for one second before
+and after it: a process above 5% CPU that is neither the trial nor allow-listed marks the trial
+discarded (kept and listed with the offender); allow-listed daemons are recorded as background.
+The summary gives medians with percentile-bootstrap 95% intervals (10,000 resamples) of achieved
+block ops/s and lookup p50/p99 per series, the subject-minus-control difference with its own
+interval, the discarded trials and why, and the background processes seen. Finished trials are
+skipped on re-run, so an interrupted run resumes.
+
+## Plugging in a new index
+
+`ReplayBackend` is four slice-based methods plus a per-lane state type. The run-compressed index
+(`RunIndex`: `intern_worker`, `apply_stored(worker, &[StoredBlock], parent, &mut RunBlockMap)`,
+`apply_removed`, `apply_cleared`, `find_matches(&[ContentHash], early_exit)`) maps onto it exactly
+as `Positional` does, with `RunBlockMap` as the per-worker map held in the lane; add a
+`BackendKind` variant and a `run()` arm in `main`.
 
 ## Parity
 
