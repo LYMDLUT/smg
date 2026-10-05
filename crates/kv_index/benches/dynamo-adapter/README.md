@@ -53,6 +53,16 @@ The report's `pool:` line gives events enqueued, applied and refused by the cap,
 steals, the deepest worker queue and the most events queued at once; `lanes:` gives apply time and
 wait time summed over lanes.
 
+## Lane-map slots: 8 bytes and the engine-hash invariant
+
+A lane-map slot is the block's place in the run index, `(run, offset)`, plus a 16-bit word of
+fingerprint and Robin Hood displacement; the engine hash itself lives once per distinct block in
+the index, beside the content hash, and every lookup checks a candidate slot against it. The
+invariant is that every engine names a block by the same hash (true of the replay, whose events
+derive both hashes from the trace, and of a fleet of one engine build and hashing seed). A worker
+whose engine disagrees is still exact: the index counts the block under `engine-hash conflicts`
+and keeps that worker's key in the map's side table at a hash-map entry's cost.
+
 ## Memory rows: `memory_accounting.patch`
 
 Whole-process RSS says nothing about an indexer inside this harness (the generator's simulated

@@ -633,7 +633,11 @@ impl LaneHooks<LaneWorker, LaneEvent> for Lane<'_> {
                 let resident = claimed
                     .state
                     .as_ref()
-                    .is_some_and(|entry| entry.blocks.contains_key(SequenceHash(block_hash.0)));
+                    .is_some_and(|entry| {
+                        self.run
+                            .inner
+                            .is_held(&entry.blocks, SequenceHash(block_hash.0))
+                    });
                 let _ = resp.send(resident);
             }
             LaneEvent::Barrier { barrier, step } => {
@@ -786,6 +790,7 @@ impl SyncIndexer for SmgRun {
              lane map slots = {map_slots} bytes = {map_bytes} ({:.1} B per membership)\n  \
              total {:.1} B per membership\n  \
              allocated: arena chunks {} (free-listed {}) slab {} maps {map_bytes} = {} ({:.1} B per membership)\n  \
+             engine-hash conflicts = {} (keys in the lane maps' side tables)\n  \
              lookups = {} runs walked per lookup = {:.2}\n  \
              lanes: busy {:.3} s idle {:.3} s\n  \
              pool: enqueued {} applied {} refused {} steals {} max depth {} (cap {}) max queued {} lane backlog max {}\n  \
@@ -806,6 +811,7 @@ impl SyncIndexer for SmgRun {
             stats.slab_bytes,
             allocated_bytes,
             per_membership(allocated_bytes),
+            stats.engine_conflicts,
             self.lookups.load(Ordering::Relaxed),
             self.runs_walked.load(Ordering::Relaxed) as f64
                 / self.lookups.load(Ordering::Relaxed).max(1) as f64,

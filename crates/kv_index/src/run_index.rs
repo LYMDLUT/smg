@@ -41,11 +41,18 @@
 //!
 //! Engine hashes: the index trusts the engine's parent pointers and block identities, as the
 //! positional indexer does. Nothing is shared between workers through the maps, so one engine
-//! reusing a hash cannot corrupt another worker's view.
+//! reusing a hash cannot corrupt another worker's view. The index carries one engine hash per
+//! distinct block, the one its first holder stored, in an array parallel to the content hashes;
+//! the lane maps' slots hold a place only and are checked against that hash
+//! (`engine_hash_at`), which is what lets a slot be 8 bytes. The invariant behind it is that
+//! every engine names a block by the same hash; a worker whose engine does not (`engine_conflicts`
+//! in the stats) keeps those keys in its lane map's exact side table and loses nothing but the
+//! smaller slot.
 //!
-//! Memory: 8 bytes per distinct block on a chain (its content hash, shared by every worker that
-//! holds it, with about 12% slack for growth) plus a 64-byte run header, the coverage words and a
-//! child table per branching run, against the per-worker map entry each lane keeps for removals.
+//! Memory: 16 bytes per distinct block on a chain (its content hash and its engine hash, shared
+//! by every worker that holds it, with about 12% slack for growth) plus a 64-byte run header, the
+//! coverage words and a child table per branching run, against the 10-byte lane-map slot each
+//! lane keeps per held block for removals.
 
 use std::{
     collections::BTreeSet,
@@ -94,7 +101,7 @@ const MAX_WORDS: usize = 16;
 const MAX_PARTIAL: usize = MAX_WORDS * 64;
 
 /// Where one of a worker's blocks lives: the run and the offset of the block within it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockRef {
     pub run: u32,
     pub offset: u32,
@@ -740,6 +747,8 @@ struct Window {
     block: u32,
     /// Offset of the run's first hash within the array.
     base: u32,
+    /// Data start of the engine-hash array, or `NONE`.
+    engine: u32,
     len: u32,
     /// Child table, or `NONE`.
     children: u32,
@@ -761,6 +770,9 @@ struct Run {
     version: AtomicU64,
     block: AtomicU32,
     base: AtomicU32,
+    /// Data start of the engine-hash array, parallel to `block` (same base, same length, shared
+    /// and released with it), or `NONE`. One engine hash per distinct block, the first holder's.
+    engine: AtomicU32,
     len: AtomicU32,
     children: AtomicU32,
     /// Workers holding only a prefix of the run, with how much: `(worker, cutoff)` entries in the
@@ -781,6 +793,7 @@ impl Run {
             version: AtomicU64::new(0),
             block: AtomicU32::new(NONE),
             base: AtomicU32::new(0),
+            engine: AtomicU32::new(NONE),
             len: AtomicU32::new(0),
             children: AtomicU32::new(NONE),
             partials: AtomicU32::new(NONE),
@@ -819,6 +832,7 @@ impl Run {
             let window = Window {
                 block: self.block.load(Ordering::Relaxed),
                 base: self.base.load(Ordering::Relaxed),
+                engine: self.engine.load(Ordering::Relaxed),
                 len: self.len.load(Ordering::Acquire),
                 children: self.children.load(Ordering::Relaxed),
                 partials: self.partials.load(Ordering::Relaxed),
@@ -863,6 +877,7 @@ impl Run {
         self.parent.store(parent, Ordering::Relaxed);
         self.block.store(window.block, Ordering::Relaxed);
         self.base.store(window.base, Ordering::Relaxed);
+        self.engine.store(window.engine, Ordering::Relaxed);
         self.len.store(window.len, Ordering::Relaxed);
         self.children.store(window.children, Ordering::Relaxed);
         self.partials.store(window.partials, Ordering::Relaxed);
@@ -941,6 +956,7 @@ impl RunSlab {
         run.parent.store(parent, Ordering::Relaxed);
         run.block.store(window.block, Ordering::Relaxed);
         run.base.store(window.base, Ordering::Relaxed);
+        run.engine.store(window.engine, Ordering::Relaxed);
         run.len.store(window.len, Ordering::Relaxed);
         run.children.store(window.children, Ordering::Relaxed);
         run.partials.store(window.partials, Ordering::Relaxed);
@@ -1034,6 +1050,9 @@ pub struct RunIndexStats {
     /// Bytes the run slab holds from the process allocator: whole chunks of headers and coverage
     /// words, used or not.
     pub slab_bytes: usize,
+    /// Stored blocks whose engine hash differed from the one the index carries for the block
+    /// (an engine fleet that does not agree on hashes); they live in the lane maps' side tables.
+    pub engine_conflicts: usize,
 }
 
 /// Where a writer waited: the root, a leaf only this worker holds, or a run others hold too.
@@ -1147,6 +1166,9 @@ pub struct RunIndex {
     worker_blocks: Box<[CachePadded<AtomicUsize>]>,
     /// Per-worker signed contributions to the distinct-block count, summed on demand.
     distinct_blocks: Box<[CachePadded<AtomicIsize>]>,
+    /// Stored blocks whose engine hash was not the one the index carries (kept in the lane
+    /// maps' exact side tables).
+    engine_conflicts: AtomicUsize,
     #[cfg(feature = "lane-stats")]
     counters: LaneCounters,
 }
@@ -1176,8 +1198,10 @@ enum Walk {
 
 /// What the lock-free look at a run during a store walk decided.
 enum Plan {
-    /// Nothing changes here: `matched` blocks are already held; carry on after them.
-    Skip(usize),
+    /// Nothing changes here: `matched` blocks are already held; carry on after them. With them,
+    /// the blocks (indices into the matched range) whose engine hash is not the one the index
+    /// carries.
+    Skip(usize, Vec<usize>),
     /// Continue in the child `(id, generation)` from its first block.
     Descend(u32, u32),
     /// Open a new child for the blocks in hand, without the run's lock if the table has room.
@@ -1214,6 +1238,21 @@ struct Placed {
     offset: u32,
     start: usize,
     count: usize,
+    /// Blocks of the range (indices from 0) whose engine hash differs from the one the index
+    /// carries for the block: they go to the lane map's exact side table.
+    conflicts: Vec<usize>,
+}
+
+/// Indices of the stored blocks whose engine hash is not the one the index carries (`engines`
+/// runs parallel to `stored`). Empty, and allocation-free, in a fleet whose engines agree.
+fn engine_conflicts(stored: &[StoredBlock], engines: &[AtomicU64]) -> Vec<usize> {
+    let mut conflicts = Vec::new();
+    for (index, (block, slot)) in stored.iter().zip(engines).enumerate() {
+        if block.seq_hash.0 != slot.load(Ordering::Relaxed) {
+            conflicts.push(index);
+        }
+    }
+    conflicts
 }
 
 /// A batch of a worker's offsets in one run, with the generation the run must still have.
@@ -1242,6 +1281,7 @@ impl RunIndex {
             Window {
                 block: NONE,
                 base: 0,
+                engine: NONE,
                 len: 0,
                 children: NONE,
                 partials: NONE,
@@ -1262,6 +1302,7 @@ impl RunIndex {
             distinct_blocks: (0..max_workers)
                 .map(|_| CachePadded::new(AtomicIsize::new(0)))
                 .collect(),
+            engine_conflicts: AtomicUsize::new(0),
             #[cfg(feature = "lane-stats")]
             counters: LaneCounters::default(),
         }
@@ -1497,6 +1538,65 @@ impl RunIndex {
         }
     }
 
+    /// The engine hash of the block a lane-map entry points at, read where the block lives now
+    /// (forwarding records followed), or `None` when nobody holds it any more. This is how a
+    /// key-less lane map slot is checked against its key. Lock-free unless the entry points past
+    /// a run's end while its split is still in flight (the forward record arrives before the
+    /// splitter's lock is released), when the run's lock settles it. Never called with a run lock
+    /// held.
+    fn engine_hash_at(&self, mut at: BlockRef) -> Option<u64> {
+        loop {
+            let (place, generation) = self.resolve(at)?;
+            let run = self.slab.run(place.run);
+            let mut settled = None;
+            for _ in 0..8 {
+                let (window, version) = run.snapshot();
+                if (version >> 32) as u32 != generation {
+                    return None;
+                }
+                if window.engine == NONE || place.offset >= window.len {
+                    break;
+                }
+                let hash = self
+                    .arena
+                    .word(window.engine + window.base + place.offset)
+                    .load(Ordering::Relaxed);
+                if run.confirm(version) {
+                    settled = Some(hash);
+                    break;
+                }
+            }
+            if let Some(hash) = settled {
+                return Some(hash);
+            }
+            let meta = run.meta.lock();
+            if meta.dead || run.generation() != generation {
+                return None;
+            }
+            let forwards = run.forwards.load(Ordering::Relaxed);
+            match self.arena.forwards_find(forwards, place.offset) {
+                Some((next, _)) => {
+                    drop(meta);
+                    at = next;
+                }
+                None => {
+                    if (place.offset as usize) >= run.len() {
+                        return None;
+                    }
+                    let data = run.engine.load(Ordering::Relaxed)
+                        + run.base.load(Ordering::Relaxed)
+                        + place.offset;
+                    return Some(self.arena.word(data).load(Ordering::Relaxed));
+                }
+            }
+        }
+    }
+
+    /// Whether `worker`'s lane map holds the block with engine hash `key`.
+    pub fn is_held(&self, map: &RunBlockMap, key: SequenceHash) -> bool {
+        map.contains_key(key, |at| self.engine_hash_at(at) == Some(key.0))
+    }
+
     /// Add `child` to the run's table (the run is locked): claims a slot like a lock-free
     /// inserter, growing the table under a version step that first drains inserters in flight.
     /// `Some` when another writer linked a child with this head meanwhile: the caller descends
@@ -1595,17 +1695,20 @@ impl RunIndex {
     fn kill(&self, run_id: u32, meta: &mut RunMeta, freed: &mut Vec<u32>) {
         let run = self.slab.run(run_id);
         let block = run.block.load(Ordering::Relaxed);
+        let engine = run.engine.load(Ordering::Relaxed);
         let partials = run.partials.load(Ordering::Relaxed);
         let forwards = run.forwards.load(Ordering::Relaxed);
         run.begin_update();
         run.block.store(NONE, Ordering::Relaxed);
         run.base.store(0, Ordering::Relaxed);
+        run.engine.store(NONE, Ordering::Relaxed);
         run.len.store(0, Ordering::Relaxed);
         run.children.store(NONE, Ordering::Relaxed);
         run.partials.store(NONE, Ordering::Relaxed);
         run.forwards.store(NONE, Ordering::Relaxed);
         run.end_update();
         self.arena.array_release(block);
+        self.arena.array_release(engine);
         self.arena.free_partials(partials);
         self.arena.free_table(forwards);
         meta.dead = true;
@@ -1768,6 +1871,7 @@ impl RunIndex {
         let len = run.len();
         debug_assert!(at > 0 && at < len, "split inside the run: 0 < {at} < {len}");
         let block = run.block.load(Ordering::Relaxed);
+        let engine = run.engine.load(Ordering::Relaxed);
         let base = run.base.load(Ordering::Relaxed);
         let children = run.children.load(Ordering::Relaxed);
         let partials = self
@@ -1786,6 +1890,7 @@ impl RunIndex {
             GONE
         } else {
             self.arena.array_retain(block);
+            self.arena.array_retain(engine);
             let suffix_partials = self.arena.partials_from(&beyond);
             let suffix_id = self.slab.alloc(
                 run.start() + at,
@@ -1793,6 +1898,7 @@ impl RunIndex {
                 Window {
                     block,
                     base: base + at as u32,
+                    engine,
                     len: (len - at) as u32,
                     children,
                     partials: suffix_partials,
@@ -1909,7 +2015,7 @@ impl RunIndex {
                 if map.is_empty() {
                     return Err(ApplyError::WorkerNotTracked);
                 }
-                match map.get(hash) {
+                match map.get(hash, |at| self.engine_hash_at(at) == Some(hash.0)) {
                     Some(at) => Some((hash, at)),
                     None => return Err(ApplyError::ParentBlockNotFound),
                 }
@@ -1940,15 +2046,40 @@ impl RunIndex {
         lap(self.counter_slot(1), walk);
         let writes = tick();
         for placed in pending {
-            map.insert_run(
-                blocks[placed.start..placed.start + placed.count]
-                    .iter()
-                    .map(|stored| stored.seq_hash),
-                BlockRef {
-                    run: placed.run,
-                    offset: placed.offset,
-                },
-            );
+            let first = BlockRef {
+                run: placed.run,
+                offset: placed.offset,
+            };
+            let range = &blocks[placed.start..placed.start + placed.count];
+            if placed.conflicts.is_empty() {
+                map.insert_run(
+                    range.iter().map(|stored| stored.seq_hash),
+                    first,
+                    |at, key| self.engine_hash_at(at) == Some(key.0),
+                    |at| self.engine_hash_at(at),
+                );
+                continue;
+            }
+            // An engine that names a block by another hash than the index carries: those keys
+            // go to the exact side table, the rest in one by one.
+            self.engine_conflicts
+                .fetch_add(placed.conflicts.len(), Ordering::Relaxed);
+            for (index, stored) in range.iter().enumerate() {
+                let at = BlockRef {
+                    run: first.run,
+                    offset: first.offset + index as u32,
+                };
+                if placed.conflicts.contains(&index) {
+                    map.insert_overflow(stored.seq_hash, at);
+                } else {
+                    map.insert_run(
+                        std::iter::once(stored.seq_hash),
+                        at,
+                        |at, key| self.engine_hash_at(at) == Some(key.0),
+                        |at| self.engine_hash_at(at),
+                    );
+                }
+            }
         }
         lap(self.counter_slot(2), writes);
         outcome
@@ -1986,10 +2117,15 @@ impl RunIndex {
             None => (ROOT, 0usize, self.slab.run(ROOT).generation()),
             Some((hash, at)) => {
                 let Some((at, generation)) = self.resolve(at) else {
-                    map.remove(hash);
+                    map.remove(hash, |at| self.engine_hash_at(at) == Some(hash.0));
                     return Walk::NoParent;
                 };
-                map.insert(hash, at);
+                map.insert(
+                    hash,
+                    at,
+                    |at| self.engine_hash_at(at) == Some(hash.0),
+                    |at| self.engine_hash_at(at),
+                );
                 (at.run, at.offset as usize + 1, generation)
             }
         };
@@ -2032,7 +2168,10 @@ impl RunIndex {
                         .count();
                     let diverge = matched < len - offset && matched < remaining.len();
                     if !diverge && offset + matched <= held {
-                        Plan::Skip(matched)
+                        let engines = self
+                            .arena
+                            .words(window.engine + window.base + offset as u32, matched);
+                        Plan::Skip(matched, engine_conflicts(&remaining[..matched], engines))
                     } else {
                         Plan::Lock
                     }
@@ -2059,15 +2198,21 @@ impl RunIndex {
                         .iter()
                         .map(|stored| stored.content_hash.0)
                         .collect();
+                    let engines: Vec<u64> =
+                        remaining.iter().map(|stored| stored.seq_hash.0).collect();
                     let block = self
                         .arena
                         .alloc_array(&contents, capacity_for(contents.len()));
+                    let engine = self
+                        .arena
+                        .alloc_array(&engines, capacity_for(engines.len()));
                     let new_id = self.slab.alloc(
                         0,
                         run_id,
                         Window {
                             block,
                             base: 0,
+                            engine,
                             len: contents.len() as u32,
                             children: NONE,
                             partials: NONE,
@@ -2084,6 +2229,7 @@ impl RunIndex {
                                 offset: 0,
                                 start: block_start,
                                 count: remaining.len(),
+                                conflicts: Vec::new(),
                             });
                             self.credit(worker, contents.len());
                             self.distinct_add(worker, contents.len());
@@ -2111,12 +2257,13 @@ impl RunIndex {
                         }
                     }
                 }
-                Plan::Skip(matched) => {
+                Plan::Skip(matched, conflicts) => {
                     pending.push(Placed {
                         run: run_id,
                         offset: offset as u32,
                         start: block_start,
                         count: matched,
+                        conflicts,
                     });
                     if matched == remaining.len() {
                         return Walk::Done;
@@ -2219,13 +2366,18 @@ impl RunIndex {
             let suffix = self.split_locked(run_id, meta, offset);
             return InRun::MoveTo(suffix, self.slab.run(suffix).generation());
         }
-        let data = run.block.load(Ordering::Relaxed) + run.base.load(Ordering::Relaxed);
-        let hashes = self.arena.words(data + offset as u32, len - offset);
+        let base = run.base.load(Ordering::Relaxed) + offset as u32;
+        let data = run.block.load(Ordering::Relaxed) + base;
+        let hashes = self.arena.words(data, len - offset);
         let matched = remaining
             .iter()
             .zip(hashes)
             .take_while(|(stored, slot)| stored.content_hash.0 == slot.load(Ordering::Relaxed))
             .count();
+        let engines = self
+            .arena
+            .words(run.engine.load(Ordering::Relaxed) + base, matched);
+        let conflicts = engine_conflicts(&remaining[..matched], engines);
         let available = len - offset;
         let reach = offset + matched;
         if matched < available && matched < remaining.len() {
@@ -2244,6 +2396,7 @@ impl RunIndex {
             offset: offset as u32,
             start: block_start,
             count: matched,
+            conflicts,
         });
         if matched == remaining.len() {
             return InRun::Done;
@@ -2275,23 +2428,28 @@ impl RunIndex {
             .iter()
             .map(|stored| stored.content_hash.0)
             .collect();
+        let engines: Vec<u64> = remaining.iter().map(|stored| stored.seq_hash.0).collect();
         let own_leaf = run_id != ROOT
             && children == NONE
             && run.forwards.load(Ordering::Relaxed) == NONE
             && covered_only_by(coverage, worker);
         let (target, first) = if own_leaf {
-            self.append(run, &contents);
+            self.append(run, &contents, &engines);
             (run_id, len)
         } else {
             let block = self
                 .arena
                 .alloc_array(&contents, capacity_for(contents.len()));
+            let engine = self
+                .arena
+                .alloc_array(&engines, capacity_for(engines.len()));
             let new_id = self.slab.alloc(
                 run.start() + len,
                 run_id,
                 Window {
                     block,
                     base: 0,
+                    engine,
                     len: contents.len() as u32,
                     children: NONE,
                     partials: NONE,
@@ -2312,6 +2470,7 @@ impl RunIndex {
             offset: first as u32,
             start: block_start,
             count: remaining.len(),
+            conflicts: Vec::new(),
         });
         self.credit(worker, contents.len());
         self.distinct_add(worker, contents.len());
@@ -2320,8 +2479,9 @@ impl RunIndex {
 
     /// Extend a leaf in place when its window ends the hash array and the array has room;
     /// otherwise move it to a larger array.
-    fn append(&self, run: &Run, contents: &[u64]) {
+    fn append(&self, run: &Run, contents: &[u64], engines: &[u64]) {
         let block = run.block.load(Ordering::Relaxed);
+        let engine = run.engine.load(Ordering::Relaxed);
         let base = run.base.load(Ordering::Relaxed) as usize;
         let len = run.len();
         let header = self.arena.array_header(block);
@@ -2342,6 +2502,10 @@ impl RunIndex {
             for (slot, &hash) in slots.iter().zip(contents) {
                 slot.store(hash, Ordering::Relaxed);
             }
+            let slots = self.arena.words(engine + end as u32, engines.len());
+            for (slot, &hash) in slots.iter().zip(engines) {
+                slot.store(hash, Ordering::Relaxed);
+            }
             run.len
                 .store((len + contents.len()) as u32, Ordering::Release);
             return;
@@ -2353,13 +2517,25 @@ impl RunIndex {
             .map(|slot| slot.load(Ordering::Relaxed))
             .collect();
         grown.extend_from_slice(contents);
+        let mut grown_engines: Vec<u64> = self
+            .arena
+            .words(engine + base as u32, len)
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .collect();
+        grown_engines.extend_from_slice(engines);
         let new_block = self.arena.alloc_array(&grown, capacity_for(grown.len()));
+        let new_engine = self
+            .arena
+            .alloc_array(&grown_engines, capacity_for(grown_engines.len()));
         run.begin_update();
         run.block.store(new_block, Ordering::Relaxed);
         run.base.store(0, Ordering::Relaxed);
+        run.engine.store(new_engine, Ordering::Relaxed);
         run.len.store(grown.len() as u32, Ordering::Release);
         run.end_update();
         self.arena.array_release(block);
+        self.arena.array_release(engine);
     }
 
     /// Forget the named blocks of `worker`; unknown hashes are ignored.
@@ -2373,7 +2549,11 @@ impl RunIndex {
         }
         let unmapping = tick();
         let mut refs: Vec<BlockRef> = Vec::with_capacity(hashes.len());
-        map.remove_all(hashes, |at| refs.push(at));
+        map.remove_all(
+            hashes,
+            |at, key| self.engine_hash_at(at) == Some(key.0),
+            |at| refs.push(at),
+        );
         lap(self.counter_slot(3), unmapping);
         let grouping = tick();
         refs.sort_unstable_by_key(|at| at.run);
@@ -2487,7 +2667,7 @@ impl RunIndex {
         // shadow the live run that reused the id.
         let mut seen: FxHashSet<(u32, Option<u32>)> = FxHashSet::default();
         let mut work: Vec<(u32, Option<u32>)> = Vec::new();
-        for (_, at) in map {
+        for at in map {
             if seen.insert((at.run, None)) {
                 work.push((at.run, None));
             }
@@ -2721,6 +2901,7 @@ impl RunIndex {
             arena_chunk_bytes: self.arena.chunk_bytes(),
             header_bytes: allocated * (size_of::<Run>() + self.words * size_of::<AtomicU64>()),
             slab_bytes: self.slab.chunk_bytes(),
+            engine_conflicts: self.engine_conflicts.load(Ordering::Relaxed),
             ..RunIndexStats::default()
         };
         for id in 1..allocated as u32 {
@@ -3258,7 +3439,12 @@ mod tests {
         let held: Vec<ContentHash> = (0..10).map(|p| content(1, p)).collect();
         let blocks = blocks_of(&held);
         index.apply_stored(w, &blocks, None, &mut mw).expect("w");
-        let parent = mw.get(blocks[9].seq_hash).expect("mapped").run;
+        let parent = mw
+            .get(blocks[9].seq_hash, |at| {
+                index.engine_hash_at(at) == Some(blocks[9].seq_hash.0)
+            })
+            .expect("mapped")
+            .run;
         let (_, planned) = index.slab.run(parent).snapshot();
         // Another lane diverges inside the run: it is split at 5, its end moves.
         let mut fork: Vec<ContentHash> = held[..5].to_vec();
@@ -3270,12 +3456,14 @@ mod tests {
         // The child prepared for blocks after the old end must not be linked after the new one.
         let contents = [content(3, 0).0, content(3, 1).0];
         let block = index.arena.alloc_array(&contents, capacity_for(2));
+        let engine = index.arena.alloc_array(&[30, 31], capacity_for(2));
         let child = index.slab.alloc(
             0,
             parent,
             Window {
                 block,
                 base: 0,
+                engine,
                 len: 2,
                 children: NONE,
                 partials: NONE,
