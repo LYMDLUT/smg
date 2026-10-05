@@ -10,6 +10,7 @@ pub mod expected_wait;
 pub mod hash_ring;
 pub mod http_client;
 pub mod kv_event_monitor;
+mod kv_event_recovery;
 pub(crate) mod load_state;
 pub mod manager;
 pub mod metrics_aggregator;
