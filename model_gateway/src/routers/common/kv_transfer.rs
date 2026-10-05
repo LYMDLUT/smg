@@ -359,6 +359,9 @@ pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> 
             return Err(malformed(key));
         }
     }
+    // The connector uses some of these without converting them (a string
+    // `remote_dp_rank` never equals the engine's own rank), and the producer
+    // reports them as integers.
     for key in [
         "remote_dp_size",
         "remote_dp_size_local",
@@ -368,7 +371,7 @@ pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> 
     ] {
         if params
             .get(key)
-            .is_some_and(|value| !value.is_null() && handoff_count(value).is_none())
+            .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
         {
             return Err(malformed(key));
         }
@@ -376,26 +379,23 @@ pub(crate) fn validate_moriio_handoff(handoff: &RawValue, transfer_id: &str) -> 
     Ok(())
 }
 
-/// A rank or parallel size in a handoff, as a number or a decimal string.
-fn handoff_count(value: &Value) -> Option<u64> {
-    match value {
-        Value::String(count) => count.trim().parse().ok(),
-        Value::Number(count) => count.as_u64(),
-        _ => None,
-    }
-}
-
 /// Block ids as a MoRI-IO producer reports them: one list per KV cache group,
-/// or a single flat list.
+/// which the decode engine pairs with its own groups, and at least one block.
 fn is_block_id_list(value: &Value) -> bool {
-    let block_ids = |items: &[Value]| items.iter().all(|id| id.as_u64().is_some());
-    match value.as_array() {
-        Some(items) if items.iter().all(Value::is_array) => items
-            .iter()
-            .all(|group| group.as_array().is_some_and(|ids| block_ids(ids))),
-        Some(items) => block_ids(items),
-        None => false,
+    let Some(groups) = value.as_array() else {
+        return false;
+    };
+    let mut blocks = 0;
+    for group in groups {
+        let Some(ids) = group.as_array() else {
+            return false;
+        };
+        if !ids.iter().all(|id| id.as_u64().is_some()) {
+            return false;
+        }
+        blocks += ids.len();
     }
+    blocks > 0
 }
 
 /// A side-channel port in a handoff: the engine reports its configured port
@@ -893,6 +893,10 @@ mod tests {
             ("remote_block_ids", serde_json::json!([[-1]])),
             ("remote_block_ids", serde_json::json!([[1.5]])),
             ("remote_block_ids", serde_json::json!([484, [485]])),
+            // vLLM pairs the groups with its own: a flat list raises there.
+            ("remote_block_ids", serde_json::json!([484, 485])),
+            ("remote_block_ids", serde_json::json!([])),
+            ("remote_block_ids", serde_json::json!([[]])),
             ("remote_host", serde_json::json!("")),
             ("remote_host", serde_json::json!(42)),
             ("remote_host", serde_json::json!("10.24.112.125 ")),
@@ -903,24 +907,27 @@ mod tests {
             ("remote_dp_size", serde_json::json!("abc")),
             ("remote_dp_size_local", serde_json::json!(-1)),
             ("remote_dp_rank", serde_json::json!([0])),
+            // A string rank never equals the decode engine's own rank.
+            ("remote_dp_rank", serde_json::json!("0")),
+            ("remote_dp_size", serde_json::json!("1")),
             ("tp_size", serde_json::json!("two")),
+            ("tp_size", serde_json::json!("8")),
             ("remote_tp_size", serde_json::json!(1.5)),
         ] {
             assert!(check(key, &value).is_err(), "{key}={value} must be refused");
         }
-        // Also valid: a flat or empty block list, numeric ports, and any host
-        // the decode engine may dial. The host is not compared with the
-        // labels: it can be a name, or an address on another interface.
+        // Also valid: a group without blocks next to one with blocks, numeric
+        // ports, and any host the decode engine may dial. The host is not
+        // compared with the labels: it can be a name, or an address on
+        // another interface.
         for (key, value) in [
-            ("remote_block_ids", serde_json::json!([484, 485])),
-            ("remote_block_ids", serde_json::json!([])),
             ("remote_block_ids", serde_json::json!([[484], []])),
             ("remote_handshake_port", serde_json::json!(6301)),
             ("remote_host", serde_json::json!("prefill-0.pd.svc")),
             ("remote_host", serde_json::json!("10.101.31.101")),
             ("remote_dp_size", serde_json::json!(1)),
             ("remote_dp_size_local", serde_json::json!(0)),
-            ("remote_dp_rank", serde_json::json!("0")),
+            ("remote_dp_rank", serde_json::json!(0)),
             ("tp_size", serde_json::json!(8)),
             ("remote_tp_size", Value::Null),
         ] {
