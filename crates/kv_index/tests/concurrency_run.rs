@@ -10,10 +10,14 @@
 //! request, early-exit scores are 1, and nothing panics.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex,
+    },
+    thread,
+};
 
 use kv_index::{
     request_prefix_hashes, ContentHash, ReferenceIndexer, RunBlockMap, RunIndex, SequenceHash,
@@ -166,7 +170,8 @@ impl Lane<'_> {
             0 => held.len(),
             _ => (from + self.rng.range(1, 3)).min(held.len()),
         };
-        let hashes: Vec<SequenceHash> = held[from..to].iter().map(|&i| blocks[i].seq_hash).collect();
+        let hashes: Vec<SequenceHash> =
+            held[from..to].iter().map(|&i| blocks[i].seq_hash).collect();
         self.index
             .apply_removed(self.worker, &hashes, &mut self.map);
         self.record(Event::Removed(hashes));

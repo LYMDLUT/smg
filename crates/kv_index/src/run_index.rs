@@ -7,8 +7,8 @@
 //! the request's chain. It is fed by the same engine events (stored / removed / cleared, keyed by
 //! the engine's block hashes) and keeps the same per-worker block map the gateway's event monitor
 //! owns, so it drops into the same call sites. Its results are checked against
-//! [`ReferenceIndexer`](crate::ReferenceIndexer) by `tests/exactness_run.rs`, including evictions
-//! that leave holes in a chain.
+//! [`ReferenceIndexer`](crate::ReferenceIndexer) by `tests/exactness_run.rs` (including evictions
+//! that leave holes in a chain) and under concurrent lanes by `tests/concurrency_run.rs`.
 //!
 //! Shape:
 //! - A **run** is a maximal stretch of consecutive positions on one chain whose set of holding
@@ -22,34 +22,35 @@
 //! - A **lookup** walks from the root, comparing the request's content hashes against each run on
 //!   the path (one compare loop per run, not one probe per block) and ANDing the alive set with
 //!   the run's coverage; a worker that drops out scores the position where it dropped. Readers
-//!   take no locks, allocate nothing but the result map and touch no shared cache line in write
-//!   mode: every pointer they follow is an [`ArcSwap`] load (a store into a thread-local debt
-//!   slot), coverage words are plain atomic loads, and a run's hashes, length and children are
-//!   published together as one body that only grows in place, so a split is atomic to a reader.
+//!   take no locks, allocate nothing but the result map and write to no memory at all: every run
+//!   header, hash array and child table lives in append-only arenas addressed by integer ids, a
+//!   run's window `(hash array, base, length, children)` is read under a seqlock version so a
+//!   split is atomic to a reader, and coverage words are plain atomic loads.
 //! - **Writers** (the event lanes, one per engine worker) lock one run at a time, plus its parent
 //!   for the moment it takes to unlink an empty run. A decode extension of the worker's own leaf
-//!   appends in place: one lock, no allocation. The lane's own map takes an engine hash to
-//!   `(run, offset)`; a split leaves a forwarding record on the prefix run so entries written
-//!   before the split still resolve, which keeps other lanes' maps untouched.
+//!   appends in place: one lock, no allocation. A split shares the hash array between prefix and
+//!   suffix (no copy) and leaves a forwarding record so map entries written before it still
+//!   resolve, which keeps other lanes' maps untouched. The lane's own map takes an engine hash to
+//!   `(run, offset)`.
 //!
 //! Engine hashes: the index trusts the engine's parent pointers and block identities, as the
 //! positional indexer does. Nothing is shared between workers through the maps, so one engine
 //! reusing a hash cannot corrupt another worker's view.
 //!
 //! Memory: 8 bytes per distinct block on a chain (its content hash, shared by every worker that
-//! holds it) plus a run header, against the per-worker map entry each lane keeps for removals.
-//! Runs are allocated from an append-only slab and are not recycled yet; a split or an emptied run
-//! leaves its header in place (see [`RunIndex::stats`]).
+//! holds it, with up to 2x slack for growth) plus a 64-byte run header and the coverage words,
+//! against the per-worker map entry each lane keeps for removals. Arenas never shrink: a split or
+//! an emptied run leaves its header in place and a replaced child table leaves its words behind
+//! (see [`RunIndex::stats`]).
 
 use std::{
     collections::BTreeSet,
     sync::{
-        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        Arc, OnceLock,
     },
 };
 
-use arc_swap::{ArcSwap, Guard};
 use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -61,12 +62,22 @@ use crate::event_tree::{
 
 /// The virtual root: position 0's parent, holds no blocks.
 const ROOT: u32 = 0;
-/// Runs per slab chunk.
-const CHUNK_RUNS: usize = 1024;
+/// "No table" / "no array": word 0 of the arena is never handed out.
+const NONE: u32 = 0;
+/// Runs per slab chunk (1024) and chunks in the directory (64 Mi runs in all).
+const RUN_CHUNK_BITS: u32 = 10;
+const RUN_CHUNK: usize = 1 << RUN_CHUNK_BITS;
+const RUN_DIR: usize = 1 << 16;
+/// Words per arena chunk (1 Mi, 8 MiB) and chunks in the directory (4 Gi words in all).
+const WORD_CHUNK_BITS: u32 = 20;
+const WORD_CHUNK: usize = 1 << WORD_CHUNK_BITS;
+const WORD_DIR: usize = 1 << 12;
 /// Smallest hash array a run allocates.
 const MIN_HASH_CAP: usize = 8;
 /// Coverage words per run at most: 1024 workers.
 const MAX_WORDS: usize = 16;
+/// Child tables up to this size are scanned, larger ones are binary-searched.
+const SCAN_CHILDREN: usize = 8;
 
 /// Where one of a worker's blocks lives: the run and the offset of the block within it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,142 +91,174 @@ pub struct BlockRef {
 /// forwards them on use.
 pub type RunBlockMap = FxHashMap<SequenceHash, BlockRef>;
 
-/// Backing store for content hashes, shared by the runs a split produces: each run reads its own
-/// window `[base, base + len)`; only the run whose window ends at `used` may append in place.
-struct HashBlock {
-    data: Box<[AtomicU64]>,
-    used: AtomicU32,
+/// Append-only storage of 64-bit words in fixed chunks: hash arrays (a header word holding
+/// `used | capacity << 32`, then the hashes) and child tables (a length word, then
+/// `(head hash, run id)` pairs). An allocation never crosses a chunk, so any array is one slice.
+struct WordArena {
+    dir: Box<[OnceLock<Box<[AtomicU64]>>]>,
+    next: AtomicU64,
 }
 
-impl HashBlock {
-    fn new(contents: &[u64], capacity: usize) -> Arc<Self> {
+impl WordArena {
+    fn new() -> Self {
+        Self {
+            dir: (0..WORD_DIR).map(|_| OnceLock::new()).collect(),
+            next: AtomicU64::new(1),
+        }
+    }
+
+    #[inline]
+    fn chunk(&self, index: usize) -> &[AtomicU64] {
+        self.dir[index].get_or_init(|| (0..WORD_CHUNK).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    /// `count` consecutive words starting at `start` (all within one chunk, as allocated).
+    #[inline]
+    fn words(&self, start: u32, count: usize) -> &[AtomicU64] {
+        let start = start as usize;
+        let offset = start & (WORD_CHUNK - 1);
+        &self.chunk(start >> WORD_CHUNK_BITS)[offset..offset + count]
+    }
+
+    #[inline]
+    fn word(&self, at: u32) -> &AtomicU64 {
+        &self.words(at, 1)[0]
+    }
+
+    /// Allocate `count` zeroed words inside one chunk.
+    fn alloc(&self, count: usize) -> u32 {
+        debug_assert!(0 < count && count <= WORD_CHUNK);
+        loop {
+            let current = self.next.load(Ordering::Relaxed);
+            let mut start = current as usize;
+            if start >> WORD_CHUNK_BITS != (start + count - 1) >> WORD_CHUNK_BITS {
+                start = ((start >> WORD_CHUNK_BITS) + 1) << WORD_CHUNK_BITS;
+            }
+            let end = start + count;
+            assert!(
+                end <= WORD_DIR * WORD_CHUNK,
+                "run index arena exhausted: more than 2^32 hash words"
+            );
+            if self
+                .next
+                .compare_exchange_weak(current, end as u64, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.chunk(start >> WORD_CHUNK_BITS);
+                return start as u32;
+            }
+        }
+    }
+
+    fn used(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
+    }
+
+    /// A hash array holding `contents` with room for `capacity`; returns the data start (the
+    /// header sits one word before it).
+    fn alloc_hashes(&self, contents: &[u64], capacity: usize) -> u32 {
         let capacity = capacity.max(contents.len()).max(MIN_HASH_CAP);
-        let data: Box<[AtomicU64]> = (0..capacity).map(|_| AtomicU64::new(0)).collect();
+        let header = self.alloc(capacity + 1);
+        let data = self.words(header + 1, contents.len());
         for (slot, &hash) in data.iter().zip(contents) {
             slot.store(hash, Ordering::Relaxed);
         }
-        Arc::new(Self {
-            data,
-            used: AtomicU32::new(contents.len() as u32),
-        })
+        self.word(header).store(
+            pack(contents.len() as u32, capacity as u32),
+            Ordering::Release,
+        );
+        header + 1
     }
 
-    #[inline]
-    fn get(&self, index: usize) -> u64 {
-        self.data[index].load(Ordering::Relaxed)
-    }
-
-    fn capacity(&self) -> usize {
-        self.data.len()
-    }
-}
-
-/// A run's children, sorted by the content hash of their first block. Replaced wholesale on
-/// change (children are few, inserts are rare next to lookups).
-struct ChildTable {
-    entries: Box<[(u64, u32)]>,
-}
-
-impl ChildTable {
-    fn one(head: u64, run: u32) -> Arc<Self> {
-        Arc::new(Self {
-            entries: vec![(head, run)].into_boxed_slice(),
-        })
-    }
-
-    #[inline]
-    fn find(&self, head: u64) -> Option<u32> {
-        if self.entries.len() <= 4 {
-            return self
-                .entries
-                .iter()
-                .find(|entry| entry.0 == head)
-                .map(|entry| entry.1);
+    fn table_len(&self, table: u32) -> usize {
+        if table == NONE {
+            0
+        } else {
+            self.word(table).load(Ordering::Relaxed) as usize
         }
-        self.entries
-            .binary_search_by_key(&head, |entry| entry.0)
-            .ok()
-            .map(|index| self.entries[index].1)
     }
 
-    fn with(&self, head: u64, run: u32) -> Arc<Self> {
-        let mut entries: Vec<(u64, u32)> = self.entries.to_vec();
+    /// The `(head hash, run)` pairs of a table, in head order.
+    fn table_entries(&self, table: u32) -> Vec<(u64, u32)> {
+        let len = self.table_len(table);
+        let words = self.words(table + 1, 2 * len);
+        (0..len)
+            .map(|index| {
+                (
+                    words[2 * index].load(Ordering::Relaxed),
+                    words[2 * index + 1].load(Ordering::Relaxed) as u32,
+                )
+            })
+            .collect()
+    }
+
+    #[inline]
+    fn table_find(&self, table: u32, head: u64) -> Option<u32> {
+        let len = self.table_len(table);
+        if len == 0 {
+            return None;
+        }
+        let words = self.words(table + 1, 2 * len);
+        if len <= SCAN_CHILDREN {
+            return (0..len)
+                .find(|&index| words[2 * index].load(Ordering::Relaxed) == head)
+                .map(|index| words[2 * index + 1].load(Ordering::Relaxed) as u32);
+        }
+        let (mut low, mut high) = (0usize, len);
+        while low < high {
+            let middle = (low + high) / 2;
+            let candidate = words[2 * middle].load(Ordering::Relaxed);
+            if candidate == head {
+                return Some(words[2 * middle + 1].load(Ordering::Relaxed) as u32);
+            } else if candidate < head {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        None
+    }
+
+    /// A new table with these entries (sorted by head); `NONE` for no entries.
+    fn table_from(&self, entries: &[(u64, u32)]) -> u32 {
+        if entries.is_empty() {
+            return NONE;
+        }
+        let table = self.alloc(1 + 2 * entries.len());
+        let words = self.words(table + 1, 2 * entries.len());
+        for (index, &(head, run)) in entries.iter().enumerate() {
+            words[2 * index].store(head, Ordering::Relaxed);
+            words[2 * index + 1].store(u64::from(run), Ordering::Relaxed);
+        }
+        self.word(table)
+            .store(entries.len() as u64, Ordering::Release);
+        table
+    }
+
+    fn table_with(&self, table: u32, head: u64, run: u32) -> u32 {
+        let mut entries = self.table_entries(table);
         match entries.binary_search_by_key(&head, |entry| entry.0) {
             Ok(index) => entries[index] = (head, run),
             Err(index) => entries.insert(index, (head, run)),
         }
-        Arc::new(Self {
-            entries: entries.into_boxed_slice(),
-        })
+        self.table_from(&entries)
     }
 
-    fn without(&self, run: u32) -> Option<Arc<Self>> {
-        let entries: Box<[(u64, u32)]> = self
-            .entries
-            .iter()
-            .copied()
-            .filter(|entry| entry.1 != run)
-            .collect();
-        if entries.is_empty() {
-            None
-        } else {
-            Some(Arc::new(Self { entries }))
-        }
+    fn table_without(&self, table: u32, run: u32) -> u32 {
+        let mut entries = self.table_entries(table);
+        entries.retain(|entry| entry.1 != run);
+        self.table_from(&entries)
     }
 }
 
-/// What a reader needs of a run, replaced as one unit so a reader never sees a half-applied
-/// split. `len` grows in place on append (published with a release store after the hashes);
-/// everything else is immutable once published.
-struct RunBody {
-    block: Arc<HashBlock>,
-    base: u32,
-    len: AtomicU32,
-    children: Option<Arc<ChildTable>>,
+#[inline]
+fn pack(used: u32, capacity: u32) -> u64 {
+    (u64::from(capacity) << 32) | u64::from(used)
 }
 
-impl RunBody {
-    fn new(
-        block: Arc<HashBlock>,
-        base: usize,
-        len: usize,
-        children: Option<Arc<ChildTable>>,
-    ) -> Self {
-        Self {
-            block,
-            base: base as u32,
-            len: AtomicU32::new(len as u32),
-            children,
-        }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.len.load(Ordering::Acquire) as usize
-    }
-
-    #[inline]
-    fn hash(&self, offset: usize) -> u64 {
-        self.block.get(self.base as usize + offset)
-    }
-
-    fn contents(&self, from: usize, to: usize) -> Vec<u64> {
-        (from..to).map(|offset| self.hash(offset)).collect()
-    }
-
-    #[inline]
-    fn child(&self, head: u64) -> Option<u32> {
-        self.children.as_ref().and_then(|table| table.find(head))
-    }
-
-    fn is_leaf(&self) -> bool {
-        self.children.is_none()
-    }
-
-    /// The same window with other children.
-    fn with_children(&self, children: Option<Arc<ChildTable>>) -> Self {
-        Self::new(self.block.clone(), self.base as usize, self.len(), children)
-    }
+#[inline]
+fn unpack(header: u64) -> (u32, u32) {
+    (header as u32, (header >> 32) as u32)
 }
 
 /// Writer-side bookkeeping of a run, under its lock.
@@ -230,24 +273,42 @@ struct RunMeta {
     dead: bool,
 }
 
+/// A reader's consistent view of a run's window.
+#[derive(Clone, Copy)]
+struct Window {
+    /// Data start of the hash array (header one word before).
+    block: u32,
+    /// Offset of the run's first hash within the array.
+    base: u32,
+    len: u32,
+    /// Child table, or `NONE`.
+    children: u32,
+}
+
 struct Run {
     /// Absolute position of the run's first block.
     start: AtomicU32,
     /// Run id of the parent (the root's parent is itself).
     parent: AtomicU32,
-    body: ArcSwap<RunBody>,
-    /// One bit per interned worker.
-    coverage: Box<[AtomicU64]>,
+    /// Seqlock over the window fields: odd while a multi-word update is in progress.
+    version: AtomicU32,
+    block: AtomicU32,
+    base: AtomicU32,
+    len: AtomicU32,
+    children: AtomicU32,
     meta: Mutex<RunMeta>,
 }
 
 impl Run {
-    fn blank(words: usize, empty: &Arc<HashBlock>) -> Self {
+    fn blank() -> Self {
         Self {
             start: AtomicU32::new(0),
             parent: AtomicU32::new(ROOT),
-            body: ArcSwap::from_pointee(RunBody::new(empty.clone(), 0, 0, None)),
-            coverage: (0..words).map(|_| AtomicU64::new(0)).collect(),
+            version: AtomicU32::new(0),
+            block: AtomicU32::new(NONE),
+            base: AtomicU32::new(0),
+            len: AtomicU32::new(0),
+            children: AtomicU32::new(NONE),
             meta: Mutex::new(RunMeta::default()),
         }
     }
@@ -258,113 +319,104 @@ impl Run {
     }
 
     #[inline]
-    fn has(&self, worker: u32) -> bool {
-        self.coverage[(worker / 64) as usize].load(Ordering::Relaxed) & (1u64 << (worker % 64)) != 0
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire) as usize
     }
 
-    fn set(&self, worker: u32) {
-        self.coverage[(worker / 64) as usize].fetch_or(1u64 << (worker % 64), Ordering::Relaxed);
-    }
-
-    fn clear(&self, worker: u32) {
-        self.coverage[(worker / 64) as usize]
-            .fetch_and(!(1u64 << (worker % 64)), Ordering::Relaxed);
-    }
-
-    fn coverage_is_empty(&self) -> bool {
-        self.coverage
-            .iter()
-            .all(|word| word.load(Ordering::Relaxed) == 0)
-    }
-
-    /// Exactly `worker` and nobody else.
-    fn covered_only_by(&self, worker: u32) -> bool {
-        let word = (worker / 64) as usize;
-        let bit = 1u64 << (worker % 64);
-        self.coverage.iter().enumerate().all(|(index, slot)| {
-            let value = slot.load(Ordering::Relaxed);
-            if index == word {
-                value == bit
-            } else {
-                value == 0
+    /// The window as a reader sees it: retried while a writer is between `begin_update` and
+    /// `end_update`, so hashes, length and children always belong together. An in-place append
+    /// only grows `len`, published with a release store after its hashes, and needs no version.
+    #[inline]
+    fn snapshot(&self) -> Window {
+        loop {
+            let before = self.version.load(Ordering::Acquire);
+            if before & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
             }
-        })
+            let window = Window {
+                block: self.block.load(Ordering::Relaxed),
+                base: self.base.load(Ordering::Relaxed),
+                len: self.len.load(Ordering::Acquire),
+                children: self.children.load(Ordering::Relaxed),
+            };
+            fence(Ordering::Acquire);
+            if self.version.load(Ordering::Relaxed) == before {
+                return window;
+            }
+        }
     }
 
-    fn workers(&self) -> Vec<u32> {
-        self.coverage
-            .iter()
-            .enumerate()
-            .flat_map(|(index, word)| {
-                let value = word.load(Ordering::Relaxed);
-                (0..64)
-                    .filter(move |bit| value & (1u64 << bit) != 0)
-                    .map(move |bit| (index * 64 + bit) as u32)
-            })
-            .collect()
+    fn begin_update(&self) {
+        self.version.fetch_add(1, Ordering::Acquire);
+    }
+
+    fn end_update(&self) {
+        self.version.fetch_add(1, Ordering::Release);
     }
 }
 
 struct RunChunk {
     runs: Box<[Run]>,
+    /// `words` coverage words per run, run-major.
+    coverage: Box<[AtomicU64]>,
 }
 
-type Chunks = Guard<Arc<Vec<Arc<RunChunk>>>>;
-
-/// Append-only run storage: a vector of fixed-size chunks, replaced copy-on-write when a chunk is
-/// added (rare), each chunk's runs addressed in place. Run ids are never reused.
+/// Append-only run storage: a directory of fixed-size chunks created on first use. Run ids are
+/// never reused.
 struct RunSlab {
-    chunks: ArcSwap<Vec<Arc<RunChunk>>>,
+    dir: Box<[OnceLock<RunChunk>]>,
     next: AtomicU32,
-    grow: Mutex<()>,
     words: usize,
-    empty: Arc<HashBlock>,
 }
 
 impl RunSlab {
     fn new(words: usize) -> Self {
-        let empty = HashBlock::new(&[], MIN_HASH_CAP);
-        // Nobody may append into the shared empty block.
-        empty.used.store(MIN_HASH_CAP as u32, Ordering::Relaxed);
-        let slab = Self {
-            chunks: ArcSwap::from_pointee(Vec::new()),
+        Self {
+            dir: (0..RUN_DIR).map(|_| OnceLock::new()).collect(),
             next: AtomicU32::new(0),
-            grow: Mutex::new(()),
             words,
-            empty,
-        };
-        slab.ensure_chunk(0);
-        slab
+        }
     }
 
-    fn ensure_chunk(&self, chunk: usize) {
-        if self.chunks.load().len() > chunk {
-            return;
-        }
-        let _grow = self.grow.lock();
-        let current = self.chunks.load_full();
-        if current.len() > chunk {
-            return;
-        }
-        let mut next: Vec<Arc<RunChunk>> = (*current).clone();
-        while next.len() <= chunk {
-            let runs: Box<[Run]> = (0..CHUNK_RUNS)
-                .map(|_| Run::blank(self.words, &self.empty))
-                .collect();
-            next.push(Arc::new(RunChunk { runs }));
-        }
-        self.chunks.store(Arc::new(next));
+    #[inline]
+    fn chunk(&self, index: usize) -> &RunChunk {
+        self.dir[index].get_or_init(|| RunChunk {
+            runs: (0..RUN_CHUNK).map(|_| Run::blank()).collect(),
+            coverage: (0..RUN_CHUNK * self.words)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        })
+    }
+
+    #[inline]
+    fn run(&self, id: u32) -> &Run {
+        let id = id as usize;
+        &self.chunk(id >> RUN_CHUNK_BITS).runs[id & (RUN_CHUNK - 1)]
+    }
+
+    #[inline]
+    fn coverage(&self, id: u32) -> &[AtomicU64] {
+        let id = id as usize;
+        let chunk = self.chunk(id >> RUN_CHUNK_BITS);
+        let first = (id & (RUN_CHUNK - 1)) * self.words;
+        &chunk.coverage[first..first + self.words]
     }
 
     /// A fresh run, not yet reachable from the tree.
-    fn alloc(&self, start: usize, parent: u32, body: RunBody) -> u32 {
+    fn alloc(&self, start: usize, parent: u32, window: Window) -> u32 {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.ensure_chunk(id as usize / CHUNK_RUNS);
-        let chunks = self.chunks.load();
-        let run = slab_run(&chunks, id);
+        assert!(
+            (id as usize) < RUN_DIR * RUN_CHUNK,
+            "run index slab exhausted: more than 2^26 runs"
+        );
+        let run = self.run(id);
         run.start.store(start as u32, Ordering::Relaxed);
         run.parent.store(parent, Ordering::Relaxed);
-        run.body.store(Arc::new(body));
+        run.block.store(window.block, Ordering::Relaxed);
+        run.base.store(window.base, Ordering::Relaxed);
+        run.len.store(window.len, Ordering::Relaxed);
+        run.children.store(window.children, Ordering::Relaxed);
         id
     }
 
@@ -374,35 +426,49 @@ impl RunSlab {
 }
 
 #[inline]
-fn slab_run(chunks: &Chunks, id: u32) -> &Run {
-    let id = id as usize;
-    &chunks[id / CHUNK_RUNS].runs[id % CHUNK_RUNS]
+fn has(coverage: &[AtomicU64], worker: u32) -> bool {
+    coverage[(worker / 64) as usize].load(Ordering::Relaxed) & (1u64 << (worker % 64)) != 0
 }
 
-/// Reload the chunk vector if `id` was allocated after it was loaded.
-#[inline]
-fn ensure(slab: &RunSlab, chunks: &mut Chunks, id: u32) {
-    if id as usize / CHUNK_RUNS >= chunks.len() {
-        *chunks = slab.chunks.load();
-    }
+fn set(coverage: &[AtomicU64], worker: u32) {
+    coverage[(worker / 64) as usize].fetch_or(1u64 << (worker % 64), Ordering::Relaxed);
 }
 
-/// Like [`RunIndex::resolve`], returning with the final run locked so nothing can move the block
-/// before the caller uses it. `None` when a run lies outside `chunks`.
-fn resolve_locked(
-    chunks: &Chunks,
-    mut at: BlockRef,
-) -> Option<(BlockRef, MutexGuard<'_, RunMeta>)> {
-    loop {
-        if at.run as usize / CHUNK_RUNS >= chunks.len() {
-            return None;
+fn clear(coverage: &[AtomicU64], worker: u32) {
+    coverage[(worker / 64) as usize].fetch_and(!(1u64 << (worker % 64)), Ordering::Relaxed);
+}
+
+fn coverage_is_empty(coverage: &[AtomicU64]) -> bool {
+    coverage
+        .iter()
+        .all(|word| word.load(Ordering::Relaxed) == 0)
+}
+
+/// Exactly `worker` and nobody else.
+fn covered_only_by(coverage: &[AtomicU64], worker: u32) -> bool {
+    let word = (worker / 64) as usize;
+    let bit = 1u64 << (worker % 64);
+    coverage.iter().enumerate().all(|(index, slot)| {
+        let value = slot.load(Ordering::Relaxed);
+        if index == word {
+            value == bit
+        } else {
+            value == 0
         }
-        let meta = slab_run(chunks, at.run).meta.lock();
-        match forward(&meta.splits, at) {
-            Some(next) => at = next,
-            None => return Some((at, meta)),
-        }
-    }
+    })
+}
+
+fn workers(coverage: &[AtomicU64]) -> Vec<u32> {
+    coverage
+        .iter()
+        .enumerate()
+        .flat_map(|(index, word)| {
+            let value = word.load(Ordering::Relaxed);
+            (0..64)
+                .filter(move |bit| value & (1u64 << bit) != 0)
+                .map(move |bit| (index * 64 + bit) as u32)
+        })
+        .collect()
 }
 
 /// Where a block that sat at `at` before this run's splits lives now, one hop.
@@ -425,15 +491,25 @@ pub struct RunIndexStats {
     pub runs_live: usize,
     /// Content hashes held by live runs.
     pub blocks_live: usize,
-    /// Bytes of hash arrays referenced by live runs (capacity, counted once per shared array).
-    pub hash_bytes: usize,
+    /// Bytes of the word arena handed out so far (hash arrays with their slack, child tables,
+    /// replaced tables included).
+    pub arena_bytes: usize,
     /// Bytes of run headers, coverage words included (all allocated runs).
     pub header_bytes: usize,
+}
+
+/// Worker slots: a slot is in use from `intern_worker` until `remove_worker`, after which it is
+/// handed out again (every coverage bit of a removed worker is clear by then).
+#[derive(Default)]
+struct WorkerRegistry {
+    names: Vec<Option<Arc<str>>>,
+    free: Vec<u32>,
 }
 
 /// The run-compressed index. Worker ids are interned `u32`s, as in the positional indexer.
 pub struct RunIndex {
     slab: RunSlab,
+    arena: WordArena,
     words: usize,
     max_workers: usize,
     worker_to_id: DashMap<Arc<str>, u32, FxBuildHasher>,
@@ -447,14 +523,6 @@ impl Default for RunIndex {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Worker slots: a slot is in use from `intern_worker` until `remove_worker`, after which it is
-/// handed out again (every coverage bit of a removed worker is clear by then).
-#[derive(Default)]
-struct WorkerRegistry {
-    names: Vec<Option<Arc<str>>>,
-    free: Vec<u32>,
 }
 
 /// Outcome of one attempt to walk a store into the tree.
@@ -487,10 +555,20 @@ impl RunIndex {
         let words = max_workers.div_ceil(64);
         let slab = RunSlab::new(words);
         // The root is run 0: position 0's parent, no blocks, no coverage.
-        let root = slab.alloc(0, ROOT, RunBody::new(slab.empty.clone(), 0, 0, None));
+        let root = slab.alloc(
+            0,
+            ROOT,
+            Window {
+                block: NONE,
+                base: 0,
+                len: 0,
+                children: NONE,
+            },
+        );
         debug_assert_eq!(root, ROOT);
         Self {
             slab,
+            arena: WordArena::new(),
             words,
             max_workers,
             worker_to_id: DashMap::with_hasher(FxBuildHasher),
@@ -576,14 +654,23 @@ impl RunIndex {
         self.total_blocks.fetch_sub(blocks, Ordering::Relaxed);
     }
 
-    /// Follow split forwarding records to where a block lives now, without keeping any lock.
-    fn resolve(&self, chunks: &mut Chunks, mut at: BlockRef) -> BlockRef {
+    /// The hash at `offset` of a run, from the writer's side (the run is locked).
+    #[inline]
+    fn hash_at(&self, run: &Run, offset: usize) -> u64 {
+        let data = run.block.load(Ordering::Relaxed) + run.base.load(Ordering::Relaxed);
+        self.arena
+            .word(data + offset as u32)
+            .load(Ordering::Relaxed)
+    }
+
+    /// Follow split forwarding records to where a block lives now, returning with the final run
+    /// locked so nothing can move the block before the caller uses it.
+    fn resolve_locked(&self, mut at: BlockRef) -> (BlockRef, MutexGuard<'_, RunMeta>) {
         loop {
-            ensure(&self.slab, chunks, at.run);
-            let meta = slab_run(chunks, at.run).meta.lock();
+            let meta = self.slab.run(at.run).meta.lock();
             match forward(&meta.splits, at) {
                 Some(next) => at = next,
-                None => return at,
+                None => return (at, meta),
             }
         }
     }
@@ -600,54 +687,54 @@ impl RunIndex {
         at: usize,
         exclude: Option<u32>,
     ) -> u32 {
-        let chunks = self.slab.chunks.load();
-        let run = slab_run(&chunks, run_id);
-        let body = run.body.load_full();
-        let len = body.len();
+        let run = self.slab.run(run_id);
+        let coverage = self.slab.coverage(run_id);
+        let len = run.len();
         debug_assert!(at > 0 && at < len, "split inside the run: 0 < {at} < {len}");
-        let suffix_body = RunBody::new(
-            body.block.clone(),
-            body.base as usize + at,
-            len - at,
-            body.children.clone(),
+        let block = run.block.load(Ordering::Relaxed);
+        let base = run.base.load(Ordering::Relaxed);
+        let children = run.children.load(Ordering::Relaxed);
+        let suffix_id = self.slab.alloc(
+            run.start() + at,
+            run_id,
+            Window {
+                block,
+                base: base + at as u32,
+                len: (len - at) as u32,
+                children,
+            },
         );
-        let suffix_id = self.slab.alloc(run.start() + at, run_id, suffix_body);
-        let chunks = self.slab.chunks.load();
-        let run = slab_run(&chunks, run_id);
-        let suffix = slab_run(&chunks, suffix_id);
-        for (index, word) in run.coverage.iter().enumerate() {
+        let suffix_coverage = self.slab.coverage(suffix_id);
+        for (index, word) in coverage.iter().enumerate() {
             let mut value = word.load(Ordering::Relaxed);
             if let Some(worker) = exclude {
                 if (worker / 64) as usize == index {
                     value &= !(1u64 << (worker % 64));
                 }
             }
-            suffix.coverage[index].store(value, Ordering::Relaxed);
+            suffix_coverage[index].store(value, Ordering::Relaxed);
         }
-        if let Some(children) = &body.children {
-            for &(_, child) in &children.entries {
-                slab_run(&chunks, child)
-                    .parent
-                    .store(suffix_id, Ordering::Release);
-            }
+        for (_, child) in self.arena.table_entries(children) {
+            self.slab
+                .run(child)
+                .parent
+                .store(suffix_id, Ordering::Release);
         }
-        let uncovered = suffix.coverage_is_empty();
-        if uncovered && !run.coverage_is_empty() {
+        let uncovered = coverage_is_empty(suffix_coverage);
+        if uncovered && !coverage_is_empty(coverage) {
             // The excluded worker was the last holder of these blocks.
             self.distinct_blocks.fetch_sub(len - at, Ordering::Relaxed);
         }
-        let children = if !uncovered || body.children.is_some() {
-            Some(ChildTable::one(body.hash(at), suffix_id))
+        let new_children = if !uncovered || children != NONE {
+            self.arena.table_from(&[(self.hash_at(run, at), suffix_id)])
         } else {
-            suffix.meta.lock().dead = true;
-            None
+            self.slab.run(suffix_id).meta.lock().dead = true;
+            NONE
         };
-        run.body.store(Arc::new(RunBody::new(
-            body.block.clone(),
-            body.base as usize,
-            at,
-            children,
-        )));
+        run.begin_update();
+        run.len.store(at as u32, Ordering::Relaxed);
+        run.children.store(new_children, Ordering::Relaxed);
+        run.end_update();
         meta.splits.push((at as u32, suffix_id));
         suffix_id
     }
@@ -658,13 +745,10 @@ impl RunIndex {
         if run_id == ROOT || meta.dead {
             return;
         }
-        let chunks = self.slab.chunks.load();
-        let run = slab_run(&chunks, run_id);
+        let run = self.slab.run(run_id);
         loop {
             let parent_id = run.parent.load(Ordering::Acquire);
-            // The parent may be a split suffix allocated after `chunks` was loaded.
-            let parent_chunks = self.slab.chunks.load();
-            let parent = slab_run(&parent_chunks, parent_id);
+            let parent = self.slab.run(parent_id);
             // Child-then-parent is the only order in which two run locks are ever held. A split
             // of the parent may have re-parented this run while we waited; check and retry.
             let mut parent_meta = parent.meta.lock();
@@ -672,14 +756,14 @@ impl RunIndex {
                 continue;
             }
             meta.dead = true;
-            let body = parent.body.load_full();
-            let children = body
-                .children
-                .as_ref()
-                .and_then(|table| table.without(run_id));
-            let parent_is_leaf = children.is_none();
-            parent.body.store(Arc::new(body.with_children(children)));
-            if parent_id != ROOT && parent_is_leaf && parent.coverage_is_empty() {
+            let table = self
+                .arena
+                .table_without(parent.children.load(Ordering::Relaxed), run_id);
+            parent.children.store(table, Ordering::Release);
+            if parent_id != ROOT
+                && table == NONE
+                && coverage_is_empty(self.slab.coverage(parent_id))
+            {
                 self.unlink_locked(parent_id, &mut parent_meta);
             }
             return;
@@ -724,17 +808,10 @@ impl RunIndex {
         origin: Option<(SequenceHash, BlockRef)>,
         map: &mut RunBlockMap,
     ) -> Walk {
-        let mut chunks = self.slab.chunks.load();
         let (mut run_id, mut offset, mut meta) = match origin {
-            None => (ROOT, 0usize, slab_run(&chunks, ROOT).meta.lock()),
+            None => (ROOT, 0usize, self.slab.run(ROOT).meta.lock()),
             Some((hash, at)) => {
-                let (at, meta) = loop {
-                    // A statement, so the `None` temporary is gone before the reload below.
-                    if let Some(found) = resolve_locked(&chunks, at) {
-                        break found;
-                    }
-                    chunks = self.slab.chunks.load();
-                };
+                let (at, meta) = self.resolve_locked(at);
                 map.insert(hash, at);
                 (at.run, at.offset as usize + 1, meta)
             }
@@ -744,71 +821,67 @@ impl RunIndex {
             if meta.dead {
                 return Walk::Restart;
             }
-            let run = slab_run(&chunks, run_id);
-            let next =
-                match self.store_in_run(worker, run_id, run, &mut meta, offset, remaining, map) {
-                    InRun::Done => return Walk::Done,
-                    InRun::Continue(rest) => {
-                        remaining = rest;
-                        self.store_at_end(worker, run_id, run, &meta, remaining, map)
-                    }
-                    InRun::MoveTo(child) => Some(child),
-                };
+            let next = match self.store_in_run(worker, run_id, &mut meta, offset, remaining, map) {
+                InRun::Done => return Walk::Done,
+                InRun::Continue(rest) => {
+                    remaining = rest;
+                    self.store_at_end(worker, run_id, &meta, remaining, map)
+                }
+                InRun::MoveTo(child) => Some(child),
+            };
             let Some(child) = next else {
                 return Walk::Done;
             };
             drop(meta);
             run_id = child;
             offset = 0;
-            ensure(&self.slab, &mut chunks, run_id);
-            meta = slab_run(&chunks, run_id).meta.lock();
+            meta = self.slab.run(run_id).meta.lock();
         }
     }
 
     /// Match `remaining` against the run from `offset`: join or split the run as needed, record
     /// the matched blocks, and say how to go on.
-    #[expect(clippy::too_many_arguments)]
     fn store_in_run<'b>(
         &self,
         worker: u32,
         run_id: u32,
-        run: &Run,
         meta: &mut RunMeta,
         offset: usize,
         remaining: &'b [StoredBlock],
         map: &mut RunBlockMap,
     ) -> InRun<'b> {
-        let mut body = run.body.load_full();
-        let len = body.len();
+        let run = self.slab.run(run_id);
+        let coverage = self.slab.coverage(run_id);
+        let len = run.len();
         if offset >= len {
             return InRun::Continue(remaining);
         }
-        let covered = run.has(worker);
+        let covered = has(coverage, worker);
         if !covered && offset > 0 {
             // The parent entry pointed into a run this worker does not cover (it cannot, unless
             // the engine re-stored under a stale parent). Cut here and join the suffix instead.
             let suffix = self.split_locked(run_id, meta, offset, None);
             return InRun::MoveTo(suffix);
         }
-        let available = len - offset;
+        let data = run.block.load(Ordering::Relaxed) + run.base.load(Ordering::Relaxed);
+        let hashes = self.arena.words(data + offset as u32, len - offset);
         let matched = remaining
             .iter()
-            .zip(offset..len)
-            .take_while(|(stored, index)| stored.content_hash.0 == body.hash(*index))
+            .zip(hashes)
+            .take_while(|(stored, slot)| stored.content_hash.0 == slot.load(Ordering::Relaxed))
             .count();
+        let available = len - offset;
         if matched < available && (matched < remaining.len() || !covered) {
             // A divergence inside the run (both branches stay held), or a worker that holds only
             // a prefix of it: either way the run ends here.
             self.split_locked(run_id, meta, offset + matched, None);
-            body = run.body.load_full();
         }
         if !covered {
-            if run.coverage_is_empty() {
-                self.distinct_blocks
-                    .fetch_add(body.len(), Ordering::Relaxed);
+            if coverage_is_empty(coverage) {
+                self.distinct_blocks.fetch_add(run.len(), Ordering::Relaxed);
             }
-            run.set(worker);
-            self.credit(worker, body.len());
+            set(coverage, worker);
+            self.credit(worker, run.len());
         }
         for (index, stored) in remaining[..matched].iter().enumerate() {
             map.insert(
@@ -831,40 +904,48 @@ impl RunIndex {
         &self,
         worker: u32,
         run_id: u32,
-        run: &Run,
         meta: &RunMeta,
         remaining: &[StoredBlock],
         map: &mut RunBlockMap,
     ) -> Option<u32> {
-        let body = run.body.load_full();
+        let run = self.slab.run(run_id);
+        let coverage = self.slab.coverage(run_id);
         let head = remaining[0].content_hash.0;
-        if let Some(child) = body.child(head) {
+        let children = run.children.load(Ordering::Relaxed);
+        if let Some(child) = self.arena.table_find(children, head) {
             return Some(child);
         }
-        let len = body.len();
+        let len = run.len();
         let contents: Vec<u64> = remaining
             .iter()
             .map(|stored| stored.content_hash.0)
             .collect();
         let own_leaf = run_id != ROOT
-            && body.is_leaf()
+            && children == NONE
             && meta.splits.is_empty()
-            && run.covered_only_by(worker);
+            && covered_only_by(coverage, worker);
         let (target, first) = if own_leaf {
-            append(run, &body, &contents);
+            self.append(run, &contents);
             (run_id, len)
         } else {
-            let capacity = (contents.len() * 2).max(MIN_HASH_CAP);
-            let new_body =
-                RunBody::new(HashBlock::new(&contents, capacity), 0, contents.len(), None);
-            let new_id = self.slab.alloc(run.start() + len, run_id, new_body);
-            let chunks = self.slab.chunks.load();
-            slab_run(&chunks, new_id).set(worker);
-            let children = match &body.children {
-                Some(table) => table.with(head, new_id),
-                None => ChildTable::one(head, new_id),
+            let block = self.arena.alloc_hashes(&contents, contents.len() * 2);
+            let new_id = self.slab.alloc(
+                run.start() + len,
+                run_id,
+                Window {
+                    block,
+                    base: 0,
+                    len: contents.len() as u32,
+                    children: NONE,
+                },
+            );
+            set(self.slab.coverage(new_id), worker);
+            let table = if children == NONE {
+                self.arena.table_from(&[(head, new_id)])
+            } else {
+                self.arena.table_with(children, head, new_id)
             };
-            run.body.store(Arc::new(body.with_children(Some(children))));
+            run.children.store(table, Ordering::Release);
             (new_id, 0)
         };
         for (index, stored) in remaining.iter().enumerate() {
@@ -882,27 +963,68 @@ impl RunIndex {
         None
     }
 
+    /// Extend a leaf in place when its window ends the hash array and the array has room;
+    /// otherwise move it to a larger array.
+    fn append(&self, run: &Run, contents: &[u64]) {
+        let block = run.block.load(Ordering::Relaxed);
+        let base = run.base.load(Ordering::Relaxed) as usize;
+        let len = run.len();
+        let header = self.arena.word(block - 1);
+        let (used, capacity) = unpack(header.load(Ordering::Acquire));
+        let end = base + len;
+        let claimed = end == used as usize
+            && end + contents.len() <= capacity as usize
+            && header
+                .compare_exchange(
+                    pack(used, capacity),
+                    pack((end + contents.len()) as u32, capacity),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+        if claimed {
+            let slots = self.arena.words(block + end as u32, contents.len());
+            for (slot, &hash) in slots.iter().zip(contents) {
+                slot.store(hash, Ordering::Relaxed);
+            }
+            run.len
+                .store((len + contents.len()) as u32, Ordering::Release);
+            return;
+        }
+        let mut grown: Vec<u64> = self
+            .arena
+            .words(block + base as u32, len)
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .collect();
+        grown.extend_from_slice(contents);
+        let new_block = self.arena.alloc_hashes(&grown, grown.len() * 2);
+        run.begin_update();
+        run.block.store(new_block, Ordering::Relaxed);
+        run.base.store(0, Ordering::Relaxed);
+        run.len.store(grown.len() as u32, Ordering::Release);
+        run.end_update();
+    }
+
     /// Forget the named blocks of `worker`; unknown hashes are ignored.
     pub fn apply_removed(&self, worker: u32, hashes: &[SequenceHash], map: &mut RunBlockMap) {
-        let mut chunks = self.slab.chunks.load();
         let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         for hash in hashes {
             if let Some(at) = map.remove(hash) {
-                let at = self.resolve(&mut chunks, at);
                 groups.entry(at.run).or_default().push(at.offset);
             }
         }
         let mut work: Vec<(u32, Vec<u32>)> = groups.into_iter().collect();
         while let Some((run_id, offsets)) = work.pop() {
-            ensure(&self.slab, &mut chunks, run_id);
-            let run = slab_run(&chunks, run_id);
+            let run = self.slab.run(run_id);
+            let coverage = self.slab.coverage(run_id);
             let mut meta = run.meta.lock();
             let offsets = reforward(&meta, offsets, &mut work);
-            if offsets.is_empty() || !run.has(worker) {
+            if offsets.is_empty() || !has(coverage, worker) {
                 continue;
             }
-            self.remove_ranges(worker, run_id, run, &mut meta, offsets);
-            if run.coverage_is_empty() && run.body.load().is_leaf() {
+            self.remove_ranges(worker, run_id, &mut meta, offsets);
+            if coverage_is_empty(coverage) && run.children.load(Ordering::Relaxed) == NONE {
                 self.unlink_locked(run_id, &mut meta);
             }
         }
@@ -910,17 +1032,11 @@ impl RunIndex {
 
     /// Drop `worker` from the given offsets of a run it covers, splitting the run so that the
     /// pieces it still covers keep their offsets.
-    fn remove_ranges(
-        &self,
-        worker: u32,
-        run_id: u32,
-        run: &Run,
-        meta: &mut RunMeta,
-        mut offsets: Vec<u32>,
-    ) {
+    fn remove_ranges(&self, worker: u32, run_id: u32, meta: &mut RunMeta, mut offsets: Vec<u32>) {
+        let run = self.slab.run(run_id);
         offsets.sort_unstable();
         offsets.dedup();
-        let len = run.body.load().len();
+        let len = run.len();
         offsets.retain(|&offset| (offset as usize) < len);
         // Contiguous ranges, highest first, so earlier ranges keep their offsets after the splits
         // a later range causes.
@@ -933,8 +1049,7 @@ impl RunIndex {
             }
         }
         for (low, high) in ranges.into_iter().rev() {
-            let len = run.body.load().len();
-            if high + 1 < len {
+            if high + 1 < run.len() {
                 // The tail beyond the range keeps every worker, this one included.
                 self.split_locked(run_id, meta, high + 1, None);
             }
@@ -942,18 +1057,19 @@ impl RunIndex {
                 // The range becomes its own run without this worker.
                 self.split_locked(run_id, meta, low, Some(worker));
             } else {
-                self.clear_holder(run, worker);
+                self.clear_holder(run_id, worker);
             }
             self.debit(worker, high + 1 - low);
         }
     }
 
     /// Drop `worker` from a run it covers, keeping the distinct-block count in step.
-    fn clear_holder(&self, run: &Run, worker: u32) {
-        run.clear(worker);
-        if run.coverage_is_empty() {
+    fn clear_holder(&self, run_id: u32, worker: u32) {
+        let coverage = self.slab.coverage(run_id);
+        clear(coverage, worker);
+        if coverage_is_empty(coverage) {
             self.distinct_blocks
-                .fetch_sub(run.body.load().len(), Ordering::Relaxed);
+                .fetch_sub(self.slab.run(run_id).len(), Ordering::Relaxed);
         }
     }
 
@@ -971,29 +1087,27 @@ impl RunIndex {
     }
 
     fn drop_worker(&self, worker: u32, map: RunBlockMap) {
-        let mut chunks = self.slab.chunks.load();
         let mut seen: FxHashSet<u32> = FxHashSet::default();
         let mut work: Vec<u32> = Vec::new();
         for (_, at) in map {
-            let at = self.resolve(&mut chunks, at);
             if seen.insert(at.run) {
                 work.push(at.run);
             }
         }
         while let Some(run_id) = work.pop() {
-            ensure(&self.slab, &mut chunks, run_id);
-            let run = slab_run(&chunks, run_id);
+            let run = self.slab.run(run_id);
+            let coverage = self.slab.coverage(run_id);
             let mut meta = run.meta.lock();
-            // Blocks of this worker may have moved into suffixes since the map was resolved.
+            // Blocks of this worker may have moved into suffixes since the map was written.
             for &(_, suffix) in &meta.splits {
                 if seen.insert(suffix) {
                     work.push(suffix);
                 }
             }
-            if run.has(worker) {
-                self.clear_holder(run, worker);
-                self.debit(worker, run.body.load().len());
-                if run.coverage_is_empty() && run.body.load().is_leaf() {
+            if has(coverage, worker) {
+                self.clear_holder(run_id, worker);
+                self.debit(worker, run.len());
+                if coverage_is_empty(coverage) && run.children.load(Ordering::Relaxed) == NONE {
                     self.unlink_locked(run_id, &mut meta);
                 }
             }
@@ -1007,27 +1121,29 @@ impl RunIndex {
         let Some(&first) = content_hashes.first() else {
             return out;
         };
-        let mut chunks = self.slab.chunks.load();
-        let Some(mut run_id) = slab_run(&chunks, ROOT).body.load().child(first.0) else {
+        let root = self.slab.run(ROOT).snapshot();
+        let Some(mut run_id) = self.arena.table_find(root.children, first.0) else {
             return out;
         };
         let words = self.words;
         let mut alive = [0u64; MAX_WORDS];
         let mut position = 0usize;
         loop {
-            ensure(&self.slab, &mut chunks, run_id);
-            let run = slab_run(&chunks, run_id);
-            let body = run.body.load();
-            let len = body.len();
+            let window = self.slab.run(run_id).snapshot();
+            let coverage = self.slab.coverage(run_id);
+            let len = window.len as usize;
             let available = len.min(content_hashes.len() - position);
-            let matched = (0..available)
-                .take_while(|&index| content_hashes[position + index].0 == body.hash(index))
+            let hashes = self.arena.words(window.block + window.base, available);
+            let matched = content_hashes[position..position + available]
+                .iter()
+                .zip(hashes)
+                .take_while(|(content, slot)| content.0 == slot.load(Ordering::Relaxed))
                 .count();
             if matched == 0 {
                 break;
             }
             if position == 0 {
-                for (word, slot) in alive[..words].iter_mut().zip(run.coverage.iter()) {
+                for (word, slot) in alive[..words].iter_mut().zip(coverage) {
                     *word = slot.load(Ordering::Relaxed);
                 }
                 if early_exit {
@@ -1036,12 +1152,12 @@ impl RunIndex {
                 }
             } else {
                 for (index, word) in alive[..words].iter_mut().enumerate() {
-                    let coverage = run.coverage[index].load(Ordering::Relaxed);
-                    let dropped = *word & !coverage;
+                    let held = coverage[index].load(Ordering::Relaxed);
+                    let dropped = *word & !held;
                     if dropped != 0 {
                         emit_word(index, dropped, position as u32, &mut out);
                     }
-                    *word &= coverage;
+                    *word &= held;
                 }
             }
             if alive[..words].iter().all(|word| *word == 0) {
@@ -1051,7 +1167,10 @@ impl RunIndex {
             if matched < len || position == content_hashes.len() {
                 break;
             }
-            match body.child(content_hashes[position].0) {
+            match self
+                .arena
+                .table_find(window.children, content_hashes[position].0)
+            {
                 Some(child) => run_id = child,
                 None => break,
             }
@@ -1065,34 +1184,32 @@ impl RunIndex {
     #[doc(hidden)]
     pub fn debug_blocks(&self) -> BTreeSet<(u32, usize, ContentHash, SequenceHash)> {
         let mut out = BTreeSet::new();
-        let mut chunks = self.slab.chunks.load();
         let mut stack: Vec<(u32, Option<SequenceHash>)> = Vec::new();
-        if let Some(table) = &slab_run(&chunks, ROOT).body.load().children {
-            for &(_, child) in &table.entries {
-                stack.push((child, None));
-            }
+        let root = self.slab.run(ROOT).snapshot();
+        for (_, child) in self.arena.table_entries(root.children) {
+            stack.push((child, None));
         }
         while let Some((run_id, mut prefix)) = stack.pop() {
-            ensure(&self.slab, &mut chunks, run_id);
-            let run = slab_run(&chunks, run_id);
-            let body = run.body.load_full();
+            let run = self.slab.run(run_id);
+            let window = run.snapshot();
             let start = run.start();
-            let workers = run.workers();
-            for offset in 0..body.len() {
-                let content = ContentHash(body.hash(offset));
+            let holders = workers(self.slab.coverage(run_id));
+            let hashes = self
+                .arena
+                .words(window.block + window.base, window.len as usize);
+            for (offset, slot) in hashes.iter().enumerate() {
+                let content = ContentHash(slot.load(Ordering::Relaxed));
                 let next = match prefix {
                     Some(previous) => chain_prefix_hash(previous, content),
                     None => SequenceHash(content.0),
                 };
-                for &worker in &workers {
+                for &worker in &holders {
                     out.insert((worker, start + offset, content, next));
                 }
                 prefix = Some(next);
             }
-            if let Some(table) = &body.children {
-                for &(_, child) in &table.entries {
-                    stack.push((child, prefix));
-                }
+            for (_, child) in self.arena.table_entries(window.children) {
+                stack.push((child, prefix));
             }
         }
         out
@@ -1100,70 +1217,26 @@ impl RunIndex {
 
     /// Shape and memory counters.
     pub fn stats(&self) -> RunIndexStats {
-        // Ids below `allocated` may still be waiting for their chunk; count what is addressable.
         let allocated = self.slab.allocated();
-        let chunks = self.slab.chunks.load();
-        let allocated = allocated.min(chunks.len() * CHUNK_RUNS);
         let mut stats = RunIndexStats {
             runs_allocated: allocated,
-            header_bytes: allocated
-                * (size_of::<Run>() + size_of::<RunBody>() + self.words * size_of::<AtomicU64>()),
+            arena_bytes: self.arena.used() as usize * size_of::<AtomicU64>(),
+            header_bytes: allocated * (size_of::<Run>() + self.words * size_of::<AtomicU64>()),
             ..RunIndexStats::default()
         };
-        let mut arrays: FxHashSet<usize> = FxHashSet::default();
         for id in 1..allocated as u32 {
-            let run = slab_run(&chunks, id);
+            let run = self.slab.run(id);
             if run.meta.lock().dead {
                 continue;
             }
-            let body = run.body.load();
             stats.runs_live += 1;
-            stats.blocks_live += body.len();
-            if arrays.insert(Arc::as_ptr(&body.block) as usize) {
-                stats.hash_bytes += body.block.capacity() * size_of::<AtomicU64>();
-            }
+            stats.blocks_live += run.len();
         }
         stats
     }
 }
 
-/// Extend a leaf in place when its window ends the shared array and the array has room; otherwise
-/// move it to a larger array.
-fn append(run: &Run, body: &Arc<RunBody>, contents: &[u64]) {
-    let len = body.len();
-    let end = body.base as usize + len;
-    let fits = end + contents.len() <= body.block.capacity();
-    let claimed = fits
-        && body
-            .block
-            .used
-            .compare_exchange(
-                end as u32,
-                (end + contents.len()) as u32,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok();
-    if claimed {
-        for (index, &hash) in contents.iter().enumerate() {
-            body.block.data[end + index].store(hash, Ordering::Relaxed);
-        }
-        body.len
-            .store((len + contents.len()) as u32, Ordering::Release);
-        return;
-    }
-    let mut grown = body.contents(0, len);
-    grown.extend_from_slice(contents);
-    let capacity = grown.len() * 2;
-    run.body.store(Arc::new(RunBody::new(
-        HashBlock::new(&grown, capacity),
-        0,
-        grown.len(),
-        None,
-    )));
-}
-
-/// Offsets resolved without the lock may have moved into suffixes since: send those on.
+/// Offsets taken from the map may have moved into suffixes since they were written: send those on.
 fn reforward(meta: &RunMeta, mut offsets: Vec<u32>, work: &mut Vec<(u32, Vec<u32>)>) -> Vec<u32> {
     if meta.splits.is_empty() {
         return offsets;
@@ -1423,6 +1496,33 @@ mod tests {
             .expect("extend after join");
         assert_eq!(scores(&index, &long), vec![(w, 43), (v, 20)]);
         assert_eq!(index.stats().runs_live, 2, "the tail is still w's own leaf");
+    }
+
+    #[test]
+    fn many_children_are_found_by_binary_search() {
+        let index = RunIndex::with_max_workers(8);
+        let w = index.intern_worker("w").expect("id");
+        let mut map = RunBlockMap::default();
+        let prompt: Vec<ContentHash> = (0..3).map(|p| content(1, p)).collect();
+        index
+            .apply_stored(w, &blocks_of(&prompt), None, &mut map)
+            .expect("prompt");
+        let anchor = blocks_of(&prompt)[2].seq_hash;
+        let mut chains = Vec::new();
+        for branch in 0..40u64 {
+            let mut chain = prompt.clone();
+            chain.extend((0..2).map(|p| content(100 + branch, p)));
+            index
+                .apply_stored(w, &blocks_of(&chain)[3..], Some(anchor), &mut map)
+                .expect("branch");
+            chains.push(chain);
+        }
+        for chain in &chains {
+            assert_eq!(scores(&index, chain), vec![(w, 5)]);
+        }
+        let mut unknown = prompt.clone();
+        unknown.push(content(999, 0));
+        assert_eq!(scores(&index, &unknown), vec![(w, 3)]);
     }
 
     #[test]
